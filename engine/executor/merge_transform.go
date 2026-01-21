@@ -369,6 +369,11 @@ func (trans *MergeTransform) Merge(ctx context.Context, errs *errno.Errs) {
 					panic("MergeTransform trans.currItem is not *Item type")
 				}
 			})
+			if trans.isCurrItemEmpty() {
+				atomic.AddInt32(&trans.count, -1)
+				trans.NextChunk[trans.currItem.Input] <- signal
+				continue
+			}
 			if trans.IsNewMstName() {
 				if trans.NewChunk.Len() > 0 {
 					trans.SendChunk()
@@ -378,7 +383,11 @@ func (trans *MergeTransform) Merge(ctx context.Context, errs *errno.Errs) {
 				trans.UpdateWithSingleChunk()
 			} else {
 				trans.BreakPoint = trans.HeapItems.GetBreakPoint()
-				trans.updateWithBreakPoint()
+				if trans.BreakPoint == nil {
+					trans.UpdateWithSingleChunk()
+				} else {
+					trans.updateWithBreakPoint()
+				}
 			}
 
 			if trans.isCurrItemEmpty() {
@@ -700,6 +709,14 @@ func (h *HeapItems) Swap(i, j int) { h.Items[i], h.Items[j] = h.Items[j], h.Item
 func (h *HeapItems) Less(i, j int) bool {
 	x := h.Items[i]
 	y := h.Items[j]
+	xEmpty := x.IsEmpty()
+	yEmpty := y.IsEmpty()
+	if xEmpty || yEmpty {
+		if xEmpty && yEmpty {
+			return x.Input < y.Input
+		}
+		return !xEmpty
+	}
 
 	xt := x.ChunkBuf.Time()[x.ChunkBuf.IntervalIndex()[x.IntervalIndex]]
 	yt := y.ChunkBuf.Time()[y.ChunkBuf.IntervalIndex()[y.IntervalIndex]]
@@ -749,7 +766,16 @@ func (h *HeapItems) GetOption() *query.ProcessorOptions {
 
 // GetBreakPoint used to get the break point of the records
 func (h *HeapItems) GetBreakPoint() BaseBreakPoint {
-	tmp := h.Items[0]
+	var tmp *Item
+	for _, item := range h.Items {
+		if !item.IsEmpty() {
+			tmp = item
+			break
+		}
+	}
+	if tmp == nil {
+		return nil
+	}
 	b := &BreakPoint{
 		Tag:  tmp.ChunkBuf.Tags()[tmp.TagIndex],
 		Name: tmp.ChunkBuf.Name(),

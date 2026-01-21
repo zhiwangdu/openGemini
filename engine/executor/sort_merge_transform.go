@@ -299,6 +299,14 @@ func (h *SortedHeapItems) Swap(i, j int) { h.Items[i], h.Items[j] = h.Items[j], 
 func (h *SortedHeapItems) Less(i, j int) bool {
 	x := h.Items[i]
 	y := h.Items[j]
+	xEmpty := x.IsSortedEmpty()
+	yEmpty := y.IsSortedEmpty()
+	if xEmpty || yEmpty {
+		if xEmpty && yEmpty {
+			return x.Input < y.Input
+		}
+		return !xEmpty
+	}
 
 	xt := x.ChunkBuf.Time()[x.Index]
 	yt := y.ChunkBuf.Time()[y.Index]
@@ -386,14 +394,24 @@ func (h *SortedHeapItems) GetOption() *query.ProcessorOptions {
 
 // GetBreakPoint used to get the break point of the records
 func (h *SortedHeapItems) GetBreakPoint() BaseBreakPoint {
+	var tmp *Item
+	for _, item := range h.Items {
+		if !item.IsSortedEmpty() {
+			tmp = item
+			break
+		}
+	}
+	if tmp == nil {
+		return nil
+	}
 	b := &SortedBreakPoint{
-		Tag:               h.Items[0].ChunkBuf.Tags()[h.Items[0].TagIndex],
-		chunk:             h.Items[0].ChunkBuf,
-		ValuePosition:     h.Items[0].Index,
+		Tag:               tmp.ChunkBuf.Tags()[tmp.TagIndex],
+		chunk:             tmp.ChunkBuf,
+		ValuePosition:     tmp.Index,
 		AuxCompareHelpers: h.AuxCompareHelpers,
 	}
-	if h.Items[0].ChunkBuf.Time() != nil {
-		b.Time = h.Items[0].ChunkBuf.Time()[h.Items[0].Index]
+	if tmp.ChunkBuf.Time() != nil {
+		b.Time = tmp.ChunkBuf.Time()[tmp.Index]
 	}
 	return b
 }

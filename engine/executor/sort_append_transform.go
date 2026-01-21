@@ -208,6 +208,14 @@ func (h *AppendHeapItems) Less(i, j int) bool {
 	if y.ChunkBuf.GetGraph() != nil {
 		return false
 	}
+	xEmpty := x.IsSortedEmpty()
+	yEmpty := y.IsSortedEmpty()
+	if xEmpty || yEmpty {
+		if xEmpty && yEmpty {
+			return x.Input < y.Input
+		}
+		return !xEmpty
+	}
 	xt := x.ChunkBuf.Time()[x.Index]
 	yt := y.ChunkBuf.Time()[y.Index]
 	if h.opt.Ascending {
@@ -257,7 +265,16 @@ func (h *AppendHeapItems) GetOption() *query.ProcessorOptions {
 }
 
 func (h *AppendHeapItems) GetBreakPoint() BaseBreakPoint {
-	tmp := h.Items[0]
+	var tmp *Item
+	for _, item := range h.Items {
+		if !item.IsSortedEmpty() {
+			tmp = item
+			break
+		}
+	}
+	if tmp == nil {
+		return nil
+	}
 	return &SortedBreakPoint{
 		Tag:           tmp.ChunkBuf.Tags()[tmp.TagIndex],
 		Time:          tmp.ChunkBuf.Time()[tmp.Index],
