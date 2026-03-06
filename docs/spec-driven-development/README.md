@@ -18,6 +18,7 @@ SDD 的价值是：**先约束后实现**，让 AI 的改动严格落在规格�
 - `02-sdd-lifecycle.md`：从需求到发布复盘的标准生命周期。
 - `03-ai-coding-guardrails.md`：AI 编码边界、提示词契约、质量门禁。
 - `04-example-write-throttle.md`：端到端填写样例（从规格到任务与提示词）。
+- `05-architecture-deep-dive.md`：代码架构深潜（整体流程、关键对象与接口职责）。
 - `templates/`：四件套模板（Feature Spec / Technical Design / Task Plan / Acceptance）。
 
 ## 3. 使用方式（推荐）
