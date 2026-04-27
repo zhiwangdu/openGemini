@@ -1,349 +1,273 @@
-# openGemini TSSP Compaction 设计说明
+# openGemini TSSTORE TSSP Compaction 设计说明
 
-本文档面向希望理解 openGemini TSSP (Time Series Sortable Partition) compaction 执行原理和策略的开发者。更多细粒度的函数级 spec 见 `tssp_compact_spec.md`。
+本文档只讨论 TSSTORE 的 TSSP compaction。Parquet 转换、乱序合并到有序文件只在必要处作为边界条件提及，不展开其内部逻辑。函数级细节见 `tssp_compact_spec.md`。
 
 ## 1. 背景
 
-TSSP 是 openGemini 的核心存储格式，将时序数据分片存储在不可变的 TSSP 文件中。随着数据不断写入，TSSP 文件会积累到一定数量，需要通过 compaction 来：
+TSSTORE 将时序数据写入不可变 TSSP 文件。随着写入推进，同一 shard、同一 measurement 下会积累多个 ordered TSSP 文件。Compaction 的目标是：
 
-- 合并多个小文件，减少文件数量，降低查询时的文件打开开销
-- 清理已标记删除的数据
-- 按层级整理数据，提升查询性能
-- 支持数据分层（tier）管理
+- 合并多个 ordered 小文件，减少查询时的文件数量和归并成本。
+- 将低 level 文件逐步提升到更高 level，降低后续 compaction 频率。
+- 跳过已删除的 series 数据。
+- 在配置允许时纠正 record 内部时间乱序。
+- 通过 compact log 和临时文件 rename 保证替换过程可恢复。
 
-## 2. 总体结构
+本文中的 compaction 只处理 `MmsTables.Order` 文件集合；`MmsTables.OutOfOrder` 由乱序合并流程处理。
+
+## 2. 总体流程
 
 ```mermaid
 flowchart TD
-    A[shard.Compact] --> B{isDownsampled?}
-    B -- yes --> Z[返回]
-    B -- no --> C{CompactionEnabled?}
-    C -- no --> Z
-    C -- yes --> D{上次写入距今 >= fullCompColdDuration?}
-    D -- yes --> E[FullCompact]
-    D -- no --> F[LevelCompact 按层级执行]
-    E --> Z
-    F --> G[Level 0]
-    F --> H[Level 1]
-    F --> I[Level 2]
-    F --> J[...]
+    A[shard.Compact] --> B{downsample shard?}
+    B -- yes --> Z[return nil]
+    B -- no --> C{shard closed?}
+    C -- yes --> Z
+    C -- no --> D{CompactionEnabled?}
+    D -- no --> Z
+    D -- yes --> E{cold enough?}
+    E -- yes --> F[FullCompact]
+    E -- no --> G[LevelCompact by LevelCompactRule]
+    F --> Z
+    G --> Z
 ```
 
-关键对象：
-
-| 对象 | 职责 |
-| --- | --- |
-| `MmsTables` | 管理一个 shard 下所有 measurement 的 TSSP 文件集合 |
-| `CompactGroup` | 描述一次 compaction 任务：包含哪些文件、目标层级等 |
-| `CompactTask` | 具体的 compaction 任务执行单元 |
-| `MsBuilder` | 构建新的 TSSP 文件，按 chunk/segment 组织数据 |
-| `ChunkIterator` / `StreamIterator` | 读取源文件数据的迭代器 |
-
-## 3. Compaction 类型
-
-### 3.1 Level Compact（分层压缩）
-
-按层级顺序执行压缩，文件从低层级向高层级合并：
-
-```text
-Level 0 文件: [L0_1][L0_2][L0_3][L0_4][L0_5][L0_6][L0_7][L0_8]
-                      ↓ level 0 compact
-Level 1 文件:                                    [L1_1]
-```
-
-层级压缩规则 `LevelCompactRule`：
+TSSTORE 使用的 level 遍历顺序：
 
 ```go
 LevelCompactRule = []uint16{0, 1, 0, 2, 0, 3, 0, 1, 2, 3, 0, 4, 0, 5, 0, 1, 2, 6}
-```
-
-这定义了压缩的执行顺序，每层最小组文件数：
-
-```go
 LeveLMinGroupFiles = [CompactLevels]int{8, 4, 4, 4, 4, 4, 2}
-// Level:                 {0,  1,  2,  3,  4,  5,  6}
 ```
 
-### 3.2 Full Compact（全面压缩）
+## 3. 关键对象
 
-当 shard 长时间没有新写入时触发（默认 `fullCompColdDuration`），目的是将所有文件压缩成更少的、更大的高层级文件：
+| 对象 | 职责 |
+| --- | --- |
+| `MmsTables` | 管理 shard 下各 measurement 的 ordered / unordered TSSP 文件集合，并提供 compaction 调度入口。 |
+| `tsImmTableImpl` | TSSTORE 文件集合实现，负责生成 level plan、创建 file iterator、执行 TSSTORE compact。 |
+| `CompactGroup` | 一次 compaction 任务的文件路径列表、measurement 名、目标 level、shard id 等。 |
+| `CompactTask` | scheduler 中实际执行的任务，负责 acquire、引用保护、调用 compact、finish 清理。 |
+| `FilesInfo` | 已解析的 compaction 输入，包括旧文件、迭代器、估算大小、chunk 行数/列数统计。 |
+| `ChunkIterators` | 非流式 compact 的 chunk/record 级多路归并器。 |
+| `StreamIterators` | 流式 compact 的 segment 级处理器。 |
+| `MsBuilder` | 写出新的 TSSP 文件，可按文件大小拆出多个新文件。 |
+
+## 4. Level Compact
+
+Level compact 每次只选择某个 level 的 ordered 文件，并将一组文件合并到 `level + 1`。
 
 ```text
 before:
-  Level 0: [L0_1][L0_2]...
-  Level 1: [L1_1][L1_2]...
-  Level 2: [L2_1]...
+  level 0: [seq=1][seq=2][seq=3][seq=4][seq=5][seq=6][seq=7][seq=8]
 
-after:
-  所有数据 → [L6_1][L6_2]  (最高层)
+after level 0 compact:
+  level 1: [seq=1, level=1, extent=0...]
 ```
 
-Full compact 是资源密集型操作，通过 `maxFullCompactor` 限制并发数。
+实际新文件名以输入组第一个文件的 sequence 为基础，目标 level 为 `group.toLevel`。如果输出文件因大小拆分，会递增 extent。
 
-### 3.3 Merge Out of Order（乱序合并）
+### 4.1 plan 生成
 
-将 `OutOfOrder` 目录中的乱序数据合并到 `Order` 文件中，详见 `merge_out_of_order_design.md`。
-
-## 4. 核心流程
-
-### 4.1 入口：shard.Compact()
-
-```go
-func (s *shard) Compact() error {
-    if s.isDownsampled() {
-        return nil  // 下采样数据不压缩
-    }
-
-    // 根据引擎类型选择压缩规则
-    switch s.engineType {
-    case config.COLUMNSTORE:
-        rule = immutable.LevelCompactRuleForCs
-    case config.TSSTORE:
-        rule = immutable.LevelCompactRule
-    }
-
-    // 检查 compaction 是否启用
-    if !s.immTables.CompactionEnabled() {
-        return nil
-    }
-
-    nowTime := fasttime.UnixTimestamp()
-    lastWrite := s.LastWriteTime()
-    d := nowTime - lastWrite
-
-    // 冷数据触发 FullCompact
-    if d >= fullCompColdDuration {
-        return s.immTables.FullCompact(id)
-    }
-
-    // 否则按层级执行 LevelCompact
-    for _, level := range rule {
-        if err := s.immTables.LevelCompact(level, id); err != nil {
-            // 记录错误但继续其他层级
-        }
-    }
-    return nil
-}
-```
-
-### 4.2 LevelPlan：生成压缩计划
+`tsImmTableImpl.LevelPlan` 遍历 `m.Order` 中所有 measurement：
 
 ```mermaid
 flowchart TD
-    A[LevelPlan] --> B[遍历所有 Order measurement]
-    B --> C{文件数 >= LeveLMinGroupFiles[level]?}
-    C -- no --> D[跳过]
-    C -- yes --> E[按 sequence 分组]
-    E --> F{组内文件数 >= minGroupFileN?}
-    F -- yes --> G[生成 CompactGroup]
-    F -- no --> H[等待更多文件]
-    G --> I[加入压缩计划列表]
+    A[LevelPlan(level)] --> B{CompactionEnabled?}
+    B -- no --> Z[return nil]
+    B -- yes --> C[遍历 m.Order]
+    C --> D[getMmsPlan]
+    D --> E{文件数 >= LeveLMinGroupFiles[level]?}
+    E -- no --> C
+    E -- yes --> F[mmsPlan]
+    F --> G[CompactGroup list]
 ```
 
-关键逻辑在 `mms_tables.go` 的 `mmsPlan` 函数：
+`mmsPlan` 的核心规则：
+
+- 只收集当前目标 level 的文件。
+- 每个候选组中只保留唯一 sequence 的文件。
+- 如果遇到同一 `(level, sequence)` 的多个文件，说明存在同 sequence 的 split extent，本轮会跳过这一段并重置当前组，避免把这些 extent 混入普通 level compact 组。
+- 组内唯一 sequence 数达到 `LeveLMinGroupFiles[level]` 后生成 `CompactGroup`。
+- `genCompactGroup` 会检查文件是否已 busy 或正在 parquet process；busy 时不生成计划。
+
+```mermaid
+flowchart TD
+    A[mmsPlan] --> B[扫描排序后的 TSSPFiles]
+    B --> C{file.level == target level?}
+    C -- no --> D[flush current group; reset]
+    C -- yes --> E{sequence already in group?}
+    E -- no --> F[flush if group already full; add file]
+    E -- yes --> G[skip same level+sequence run; reset group]
+    F --> B
+    G --> B
+    D --> B
+```
+
+## 5. Full Compact
+
+Full compact 在 shard 足够冷时触发：
 
 ```go
-func (m *MmsTables) mmsPlan(name string, files *TSSPFiles, level uint16, minGroupFileN int, plans []*CompactGroup) []*CompactGroup {
-    seqMap := seqMapPool.Get().(*dictpool.Dict)
-    defer seqMapPool.Put(seqMap)
-
-    for idx < files.Len() {
-        f := files.files[idx]
-        lv, seq := f.LevelAndSequence()
-
-        if lv != level {
-            // 层级变化，生成当前计划
-            plans = m.genCompactPlan(seqMap, minGroupFileN, name, level, files, plans)
-            seqMap.Reset()
-            continue
-        }
-
-        // 按 sequence 分组
-        seqByte := record.Uint64ToBytesUnsafe(seq)
-        if !seqMap.HasBytes(seqByte) {
-            plans = m.genCompactPlan(seqMap, minGroupFileN, name, level, files, plans)
-            seqMap.SetBytes(seqByte, f)
-            idx++
-        } else {
-            // 同一 sequence 有多个文件（不同 extent）
-            i = idx + 1
-            for i < files.Len() && levelSequenceEqual(level, seq, files.files[i]) {
-                i++
-            }
-            idx = i
-            seqMap.Reset()
-        }
-    }
-    return plans
-}
+nowTime - shard.LastWriteTime() >= fullCompColdDuration
 ```
 
-### 4.3 任务执行：CompactTask
+它不是简单地强制合并到最高 level 6。当前 TSSTORE 实现由 `buildFullCompactPlan(n, toLevel)` 决定目标 level：
 
-```go
-func (t *CompactTask) Execute() {
-    group := t.plan
-    m := t.table
+- 普通 full compact：`toLevel == 0`，`CompactGroupBuilder.add` 根据输入文件 level 持续 `UpdateLevel(lv + 1)`，最终目标 level 是本组输入文件最大 level 加 1。
+- pre-level full compact：`config.PreFullCompactLevel() > 0` 时，先用 low-level mode，把低于指定 preLevel 的文件合并到该 preLevel。
 
-    // 单文件直接 rename 到目标层级
-    if group.Len() == 1 {
-        err := m.RenameFileToLevel(group)
-        return
-    }
-
-    // 获取文件迭代器
-    fi, err := m.ImmTable.NewFileIterators(m, group)
-    if err != nil {
-        return
-    }
-
-    // 执行压缩
-    err = m.ImmTable.compactToLevel(m, fi, t.full, NonStreamingCompaction(fi))
-}
+```mermaid
+flowchart TD
+    A[FullCompact] --> B[n = maxFullCompactor - fullCompactingCount]
+    B --> C{n < 1?}
+    C -- yes --> Z[return nil]
+    C -- no --> D{PreFullCompactLevel > 0?}
+    D -- yes --> E[buildFullCompactPlan n, preLevel]
+    E --> F{plans found?}
+    F -- yes --> G[ExecuteBatch full=true; return]
+    F -- no --> H[buildFullCompactPlan n, 0]
+    D -- no --> H
+    H --> I[ExecuteBatch full=true if plans found]
 ```
 
-### 4.4 压缩执行：compactToLevel
+Full compact 通过 `fullCompactingCount` 和 `maxFullCompactor` 控制并发。计数在 `CompactTask.Execute` 中仅对 `full == true` 的多文件 compact 增减。
 
-有两种压缩模式，由 `NonStreamingCompaction` 决定：
+## 6. CompactTask 执行
+
+```mermaid
+sequenceDiagram
+    participant S as scheduler
+    participant T as CompactTask
+    participant M as MmsTables
+    participant I as tsImmTableImpl
+
+    S->>T: BeforeExecute
+    T->>M: acquire(group.group)
+    M-->>T: ok / busy
+    S->>T: Execute
+    alt one file
+        T->>M: RenameFileToLevel
+    else multiple files
+        T->>I: refMmsTable
+        T->>I: NewFileIterators
+        T->>I: compactToLevel
+        T->>I: unrefMmsTable
+    end
+    S->>T: Finish callbacks
+    T->>M: CompactDone(group.group)
+```
+
+`BeforeExecute` 按文件路径调用 `MmsTables.acquire`。如果任一文件已经在 `inCompact` 中，本任务跳过。任务结束回调会调用 `CompactDone` 释放这些路径。
+
+单文件任务不重写数据，只通过 `RenameFileToLevel` 修改文件名中的 level，并更新内存中的文件 level。
+
+## 7. compactToLevel
+
+`tsImmTableImpl.compactToLevel` 是 TSSTORE 的实际压缩入口：
+
+1. 创建 `CompactStatItem`。
+2. 根据 `NonStreamingCompaction(fi)` 选择非流式或流式 compact。
+3. 非流式：创建 `ChunkIterators`，调用 `MmsTables.compact`。
+4. 流式：创建 `StreamIterators`，调用 `StreamIterators.compact`，并触发 replace-file event。
+5. 调用 `MmsTables.ReplaceFiles(group.name, oldFiles, newFiles, true)` 替换 ordered 文件集合。
+6. 流式 compact 成功后，将新文件加入 `HotFileManager`。
+
+## 8. 非流式与流式 compact
+
+选择逻辑：
 
 ```go
 func NonStreamingCompaction(fi FilesInfo) bool {
     if config.GetStoreConfig().Compact.CorrectTimeDisorder {
-        return true  // 纠正时间乱序
-    }
-
-    flag := GetMergeFlag4TsStore()
-    if flag == util.NonStreamingCompact {
         return true
-    } else if flag == util.StreamingCompact {
+    }
+    switch GetMergeFlag4TsStore() {
+    case util.NonStreamingCompact:
+        return true
+    case util.StreamingCompact:
         return false
     }
-
-    // 根据内存占用判断
-    n := fi.avgChunkRows * fi.maxColumns * 8 * len(fi.compIts)
-    if n >= streamCompactMemThreshold {
+    if fi.avgChunkRows * fi.maxColumns * 8 * len(fi.compIts) >= 128MB {
         return false
     }
-    if fi.maxChunkRows > GetMaxRowsPerSegment4TsStore() * streamCompactSegmentThreshold {
+    if fi.maxChunkRows > maxRowsPerSegment * 500 {
         return false
     }
     return true
 }
 ```
 
-**非流式压缩** (`compact` 函数)：
-- 读取所有源文件数据到内存
-- 使用堆归并排序
-- 一次性写入新文件
+### 8.1 非流式 compact
 
-**流式压缩** (`StreamIterators.compact`)：
-- 按 segment 流式处理
-- 内存占用更可控
-- 支持更大的数据量
+`MmsTables.compact` 以 `ChunkIterators` 为输入，按 series id 归并 chunk record：
 
-### 4.5 文件替换
+- `ChunkIterators.Next()` 每次返回一个 series id 和合并后的 `record.Record`。
+- 如果启用 `CorrectTimeDisorder`，对 record 调用 `record.SortRecordIfNeeded`。
+- 如果 `indexMergeSet` 标记该 TSID 已删除，则跳过该 record。
+- 调用 `MsBuilder.WriteRecord` 写入新文件；输出过大时 builder 可以拆出多个 extent 文件。
+
+它不是一次性把所有源文件加载进内存，而是按 chunk/record 粒度归并；相对 stream compact，它的处理粒度更粗，内存估算超过阈值时会切到 stream compact。
+
+### 8.2 流式 compact
+
+`StreamIterators.compact` 按 segment/column 流式处理，适合大 chunk 或高内存压力场景。它会在替换文件前触发 stream compact events，并在失败时清理临时文件。
+
+## 9. 文件替换与恢复
 
 ```mermaid
 flowchart TD
-    A[compact 完成] --> B[写 compact log]
+    A[compact produces tmp newFiles] --> B[write compact log]
     B --> C[RenameTmpFiles]
-    C --> D[删除旧文件引用]
-    D --> E[删除旧物理文件]
-    E --> F[加入新文件引用]
-    F --> G[排序新文件列表]
-    G --> H[删除 compact log]
+    C --> D[lock TSSPFiles]
+    D --> E[delete old files from memory set]
+    E --> F[delete or tmp-rename old physical files]
+    F --> G[append new files]
+    G --> H[sort TSSPFiles]
+    H --> I[remove compact log]
 ```
 
-compact log 用于异常恢复，确保崩溃后能恢复到一致状态。
+`MmsTables.ReplaceFiles` 负责替换：
 
-## 5. 并发控制
+- 新文件先以临时文件形式写出。
+- 替换前写 compact log。
+- `RenameTmpFiles` 将新文件改为正式名。
+- 删除旧文件时，如果旧文件仍在使用，会先 rename 为 tmp 后放入 GC。
+- 新文件加入 ordered 文件集合后重新排序。
+- 删除 compact log。
 
-### 5.1 全局并发限制
+`CompactTask.Execute` 的 defer 会在 `CompactRecovery` 配置打开时调用 `CompactRecovery(m.path, group)`，用于任务异常后的恢复检查；panic recover 不在 `CompactTask.Execute` 中完成。
 
-```go
-maxFullCompactor = cpu.GetCpuNum() / 2  // Full compact 最大并发
-maxCompactor = cpu.GetCpuNum()           // Level compact 最大并发
-compLimiter = limiter.NewFixed(maxCompactor)
-```
+## 10. 并发控制
 
-### 5.2 Measurement 级别并发控制
+### 10.1 全局并发
 
-```go
-func (m *MmsTables) acquire(files []string) bool {
-    m.inCompLock.Lock()
-    defer m.inCompLock.Unlock()
+- `maxCompactor` 控制普通 compaction scheduler limiter，默认 CPU 数，配置后被限制在 `[2, 32]`。
+- `maxFullCompactor` 控制 full compact 计数，默认 CPU/2，配置后被限制在 `[1, 32]`，且不会大于等于 `maxCompactor`。
+- `compLimiter` 是 scheduler 的全局并发 limiter。
 
-    for _, name := range files {
-        if _, ok := m.inCompact[name]; ok {
-            return false  // 已被其他 compaction 占用
-        }
-    }
+### 10.2 measurement / 文件路径级并发
 
-    for _, name := range files {
-        m.inCompact[name] = struct{}{}
-    }
-    return true
-}
-```
+- scheduler 任务组以 measurement 名作为 key。
+- `MmsTables.acquire(group.group)` 以文件路径为粒度写入 `inCompact`。
+- `genCompactGroup` 阶段也会调用 `busy(group.group)` 避免生成已占用文件的计划。
 
-同一 measurement 的多个文件必须作为整体被调度，避免并发修改同一文件集合。
+因此同一 measurement 的任务会被 scheduler 分组串行化，同一批文件路径也会被 `inCompact` 防止重入。
 
-## 6. 配置参数
+## 11. 设计不变量
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `CompactLevels` | 7 | 层级数量（0-6） |
-| `maxFullCompactor` | cpu/2 | Full compact 最大并发 |
-| `maxCompactor` | cpu | Level compact 最大并发 |
-| `fullCompColdDuration` | - | 触发 Full compact 的写入间隔 |
-| `LeveLMinGroupFiles` | {8,4,4,4,4,4,2} | 每层最小组文件数 |
+- TSSTORE compaction 只替换 ordered 文件集合。
+- 参与 compact 的旧文件必须在替换前保持引用保护。
+- 输出文件中的 record 时间必须有序；未启用乱序纠正时会检查时间顺序，启用时会排序。
+- 已删除 TSID 不应写入新 compact 文件。
+- 新旧文件替换必须经过 compact log 和 tmp rename。
+- output 为空时不会替换旧文件；`ReplaceFiles` 对空 newFiles 直接返回。
+- 同一文件路径不能同时参与多个 compaction/merge。
 
-## 7. 设计不变量
+## 12. 阅读代码建议
 
-### 7.1 时间有序
-
-输出文件的 time 列必须严格升序。
-
-### 7.2 数据不丢失
-
- compaction 前后总数据量不变（删除标记的数据除外）。
-
-### 7.3 文件原子替换
-
-通过 compact log + tmp 文件名保证替换的原子性。
-
-### 7.4 单 measurement 串行
-
-同一 measurement 的 compaction 不能并发，但不同 measurement 可并行。
-
-## 8. 阅读代码建议
-
-建议按以下顺序阅读：
-
-1. `shard.go:Compact()` - 入口，了解整体流程
-2. `compact.go:LevelCompact()` / `FullCompact()` - 计划生成
-3. `mms_tables.go:LevelPlan()` / `mmsPlan()` - 计划构建细节
-4. `task.go:CompactTask.Execute()` - 任务执行
-5. `ts_mms_tables.go:compactToLevel()` - 实际压缩逻辑
-6. `compact.go:compact()` - 非流式压缩实现
-7. `stream_compact.go` - 流式压缩实现
-8. `compaction_file_info.go` - 日志与恢复
-
-## 9. 常见问题
-
-### 为什么需要分层？
-
-分层设计让 compaction 可以增量进行。低层级文件多、小，压缩开销小；高层级文件少、大，压缩收益高。LevelCompactRule 确保系统在不同阶段都有合适的 compaction 任务在运行。
-
-### Full compact 和 Level compact 有什么区别？
-
-- **Level compact**：只压缩特定层级的文件，开销较小
-- **Full compact**：尝试将所有文件压缩到最高层级，开销大但效果最好
-
-Full compact 只在 shard 冷（长时间无写入）时触发，避免影响写入性能。
-
-### 如何避免 compaction 影响查询？
-
-1. 通过 `compLimiter` 限制并发 compaction 数量
-2. 文件引用计数确保正在读取的文件不会被删除
-3. 同一 measurement 的 compaction 串行执行
+1. `engine/shard.go:Compact`：shard 级入口。
+2. `engine/immutable/compact.go:LevelCompact` / `FullCompact` / `compact`。
+3. `engine/immutable/ts_mms_tables.go:LevelPlan` / `compactToLevel`。
+4. `engine/immutable/mms_tables.go:mmsPlan` / `genCompactGroup` / `ReplaceFiles`。
+5. `engine/immutable/task.go:CompactTask.Execute`。
+6. `engine/immutable/stream_compact.go:NonStreamingCompaction` / `StreamIterators.compact`。
+7. `engine/immutable/compaction_file_info.go`：compact log 和恢复。
