@@ -495,6 +495,37 @@ func (s *MockRPCMessageSender) SendRPCMsg(currentServer int, msg *message.MetaMe
 	return nil
 }
 
+type mockMetaClientRPCMessageSender struct {
+	client *Client
+	apply  bool
+}
+
+func (s *mockMetaClientRPCMessageSender) SendRPCMsg(currentServer int, msg *message.MetaMessage, callback transport.Callback) error {
+	if req, ok := msg.Data().(*message.ExecuteRequest); ok && s.client != nil && s.apply {
+		cmd := &proto2.Command{}
+		if err := proto.Unmarshal(req.Body, cmd); err != nil {
+			return err
+		}
+		if apply, ok := applyFunc[cmd.GetType()]; ok {
+			if err := apply(s.client, cmd); err != nil {
+				return err
+			}
+		}
+	}
+
+	return callback.Handle(message.NewMetaMessage(message.ExecuteResponseMessage, &message.ExecuteResponse{}))
+}
+
+func mockSuccessfulRPC(c *Client) {
+	c.changed = make(chan chan struct{}, 128)
+	c.SendRPCMessage = &mockMetaClientRPCMessageSender{client: c, apply: true}
+}
+
+func mockSuccessfulRPCWithoutApply(c *Client) {
+	c.changed = make(chan chan struct{}, 128)
+	c.SendRPCMessage = &mockMetaClientRPCMessageSender{client: c}
+}
+
 func TestClient_CreateShardGroup1(t *testing.T) {
 	ts := time.Now()
 	sgInfo1 := meta2.ShardGroupInfo{
@@ -627,49 +658,49 @@ func TestClient_CreateMeasurement(t *testing.T) {
 				}},
 			},
 		},
-		metaServers:    []string{"127.0.0.1"},
-		logger:         logger.NewLogger(errno.ModuleMetaClient),
-		SendRPCMessage: &RPCMessageSender{},
+		metaServers: []string{"127.0.0.1"},
+		logger:      logger.NewLogger(errno.ModuleMetaClient),
 	}
+	mockSuccessfulRPC(c)
 	colStoreInfo := meta2.NewColStoreInfo(nil, nil, nil, 0, "")
 	schemaInfo := meta2.NewSchemaInfo(map[string]int32{"a": influx.Field_Type_Tag}, map[string]int32{"b": influx.Field_Type_Float})
 
 	options := &meta2.Options{Ttl: 1}
 	_, err := c.CreateMeasurement("db0", "rp0", "measurement", nil, 0, nil, config.COLUMNSTORE, colStoreInfo, nil, options)
-	require.EqualError(t, err, "execute command timeout")
+	require.NoError(t, err)
 
-	_, err = c.CreateMeasurement("db0", "rp0", "measurement", nil, 0, nil, config.COLUMNSTORE, colStoreInfo, schemaInfo, options)
-	require.EqualError(t, err, "execute command timeout")
+	_, err = c.CreateMeasurement("db0", "rp0", "measurement_with_schema", nil, 0, nil, config.COLUMNSTORE, colStoreInfo, schemaInfo, options)
+	require.NoError(t, err)
 
-	_, err = c.SimpleCreateMeasurement("db0", "rp0", "measurement", config.COLUMNSTORE)
-	require.EqualError(t, err, "execute command timeout")
+	_, err = c.SimpleCreateMeasurement("db0", "rp0", "simple_measurement", config.COLUMNSTORE)
+	require.NoError(t, err)
 }
 
 func TestClient_CreateDatabase(t *testing.T) {
 	defer initEnv()()
 	c := &Client{
-		cacheData:      &meta2.Data{},
-		metaServers:    []string{"127.0.0.1"},
-		logger:         logger.NewLogger(errno.ModuleMetaClient),
-		SendRPCMessage: &RPCMessageSender{},
+		cacheData:   &meta2.Data{ClusterPtNum: 1},
+		metaServers: []string{"127.0.0.1"},
+		logger:      logger.NewLogger(errno.ModuleMetaClient),
 	}
+	mockSuccessfulRPC(c)
 	options := &obs.ObsOptions{Enabled: true}
 	_, err := c.CreateDatabase("db0", false, 1, options)
-	require.EqualError(t, err, "execute command timeout")
+	require.NoError(t, err)
 }
 
 func TestClient_CreateDatabaseWithRetentionPolicy(t *testing.T) {
 	defer initEnv()()
 	c := &Client{
-		cacheData:      &meta2.Data{},
-		metaServers:    []string{"127.0.0.1"},
-		logger:         logger.NewLogger(errno.ModuleMetaClient),
-		SendRPCMessage: &RPCMessageSender{},
+		cacheData:   &meta2.Data{ClusterPtNum: 1},
+		metaServers: []string{"127.0.0.1"},
+		logger:      logger.NewLogger(errno.ModuleMetaClient),
 	}
+	mockSuccessfulRPC(c)
 	spec := &meta2.RetentionPolicySpec{Name: "testRp"}
 	ski := &meta2.ShardKeyInfo{ShardKey: []string{"tag1", "tag2"}}
 	_, err := c.CreateDatabaseWithRetentionPolicy("db0", spec, ski, false, 1)
-	require.EqualError(t, err, "execute command timeout")
+	require.NoError(t, err)
 }
 
 func TestClient_CreateDatabaseWithRetentionPolicy2(t *testing.T) {
@@ -713,10 +744,10 @@ func TestClient_Stream(t *testing.T) {
 				},
 			},
 		},
-		metaServers:    []string{"127.0.0.1:8092"},
-		logger:         logger.NewLogger(errno.ModuleMetaClient).With(zap.String("service", "metaclient")),
-		SendRPCMessage: &RPCMessageSender{},
+		metaServers: []string{"127.0.0.1:8092"},
+		logger:      logger.NewLogger(errno.ModuleMetaClient).With(zap.String("service", "metaclient")),
 	}
+	mockSuccessfulRPC(c)
 	patch1 := gomonkey.ApplyMethod(c, "UpdateSchema", func(_ *Client, database string, retentionPolicy string, mst string, fieldToCreate []*proto2.FieldSchema) error {
 		return nil
 	})
@@ -762,7 +793,7 @@ func TestClient_Stream(t *testing.T) {
 		Delay: time.Second,
 	}
 	err := c.CreateStreamPolicy(info)
-	require.EqualError(t, err, "execute command timeout")
+	require.NoError(t, err)
 	err = c.DropStream("test")
 
 	c.cacheData.Streams = map[string]*meta2.StreamInfo{"test": info}
@@ -1131,14 +1162,14 @@ func TestClient_CreateDownSamplePolicy(t *testing.T) {
 					},
 				}}},
 		},
-		metaServers:    []string{"127.0.0.1:8092"},
-		logger:         logger.NewLogger(errno.ModuleMetaClient).With(zap.String("service", "metaclient")),
-		SendRPCMessage: &RPCMessageSender{},
+		metaServers: []string{"127.0.0.1:8092"},
+		logger:      logger.NewLogger(errno.ModuleMetaClient).With(zap.String("service", "metaclient")),
 	}
+	mockSuccessfulRPC(c)
 	err := c.NewDownSamplePolicy("test", "rp0", info)
-	require.EqualError(t, err, "execute command timeout")
+	require.NoError(t, err)
 	err = c.DropDownSamplePolicy("test", "rp0", true)
-	require.EqualError(t, err, "execute command timeout")
+	require.NoError(t, err)
 
 	c.cacheData.Databases["test"].RetentionPolicies["rp0"].DownSamplePolicyInfo = info
 	row, _ := c.ShowDownSamplePolicies("test")
@@ -1604,13 +1635,13 @@ func TestClient_CreateSubscription(t *testing.T) {
 					},
 				}}},
 		},
-		metaServers:    []string{"127.0.0.1:8092"},
-		logger:         logger.NewLogger(errno.ModuleMetaClient).With(zap.String("service", "metaclient")),
-		SendRPCMessage: &RPCMessageSender{},
+		metaServers: []string{"127.0.0.1:8092"},
+		logger:      logger.NewLogger(errno.ModuleMetaClient).With(zap.String("service", "metaclient")),
 	}
+	mockSuccessfulRPC(c)
 	destinations := []string{server1.URL, server2.URL}
 	err := c.CreateSubscription("db0", "rp0", "subs1", "ALL", destinations)
-	require.EqualError(t, err, "execute command timeout")
+	require.NoError(t, err)
 }
 
 func TestClient_GetNodePtsMap(t *testing.T) {
@@ -2064,13 +2095,13 @@ func TestClient_UpdateMeasurement(t *testing.T) {
 				},
 			},
 		},
-		metaServers:    []string{"127.0.0.1"},
-		logger:         logger.NewLogger(errno.ModuleMetaClient),
-		SendRPCMessage: &RPCMessageSender{},
+		metaServers: []string{"127.0.0.1"},
+		logger:      logger.NewLogger(errno.ModuleMetaClient),
 	}
+	mockSuccessfulRPC(c)
 	options := &meta2.Options{Ttl: 1}
 	err := c.UpdateMeasurement("db0", "rp0", "cpu", options)
-	require.EqualError(t, err, "execute command timeout")
+	require.NoError(t, err)
 }
 
 func TestGetAliveReadNode(t *testing.T) {
@@ -3390,17 +3421,16 @@ func TestClient_InsertFiles(t *testing.T) {
 					},
 				}}},
 		},
-		metaServers:    []string{"127.0.0.1"},
-		logger:         logger.NewLogger(errno.ModuleMetaClient).With(zap.String("service", "metaclient")),
-		SendRPCMessage: &RPCMessageSender{},
+		metaServers: []string{"127.0.0.1"},
+		logger:      logger.NewLogger(errno.ModuleMetaClient).With(zap.String("service", "metaclient")),
 	}
+	mockSuccessfulRPCWithoutApply(client)
 	type args struct {
 		fileInfos []meta2.FileInfo
 	}
 	tests := []struct {
-		name    string
-		args    args
-		wantErr bool
+		name string
+		args args
 	}{
 		{
 			name: "test1",
@@ -3422,13 +3452,12 @@ func TestClient_InsertFiles(t *testing.T) {
 					},
 				},
 			},
-			wantErr: true,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := client.InsertFiles(tt.args.fileInfos)
-			require.EqualError(t, err, "execute command timeout")
+			require.NoError(t, err)
 		})
 	}
 }
@@ -3516,13 +3545,15 @@ func TestClient_ShowCluster_Err(t *testing.T) {
 func TestClient_CreateRetentionPolicy(t *testing.T) {
 	defer initEnv()()
 	client := &Client{
-		cacheData:      &meta2.Data{},
-		metaServers:    []string{"127.0.0.1"},
-		logger:         logger.NewLogger(errno.ModuleMetaClient).With(zap.String("service", "metaclient")),
-		SendRPCMessage: &RPCMessageSender{},
+		cacheData: &meta2.Data{
+			Databases: map[string]*meta2.DatabaseInfo{"db0": {Name: "db0"}},
+		},
+		metaServers: []string{"127.0.0.1"},
+		logger:      logger.NewLogger(errno.ModuleMetaClient).With(zap.String("service", "metaclient")),
 	}
+	mockSuccessfulRPC(client)
 	_, err := client.CreateRetentionPolicy("db0", &meta2.RetentionPolicySpec{}, false)
-	assert.Equal(t, err.Error(), "execute command timeout")
+	assert.NoError(t, err)
 }
 
 func TestGetAliveShardsForHardWrite(t *testing.T) {
@@ -4297,13 +4328,13 @@ func TestGetNoIndex1(t *testing.T) {
 func TestClient_UpdateIndexInfoTier(t *testing.T) {
 	defer initEnv()()
 	client := &Client{
-		cacheData:      &meta2.Data{},
-		metaServers:    []string{"127.0.0.1"},
-		logger:         logger.NewLogger(errno.ModuleMetaClient).With(zap.String("service", "metaclient")),
-		SendRPCMessage: &RPCMessageSender{},
+		cacheData:   &meta2.Data{},
+		metaServers: []string{"127.0.0.1"},
+		logger:      logger.NewLogger(errno.ModuleMetaClient).With(zap.String("service", "metaclient")),
 	}
+	mockSuccessfulRPCWithoutApply(client)
 	err := client.UpdateIndexInfoTier(1, 1, "db1", "rp1")
-	assert.Equal(t, err.Error(), "execute command timeout")
+	assert.NoError(t, err)
 }
 
 func TestClient_GetTimeRange(t *testing.T) {
@@ -4352,15 +4383,15 @@ func TestClient_GetTimeRange(t *testing.T) {
 
 func TestClient_ReplaceMergeShards(t *testing.T) {
 	c := &Client{
-		cacheData:      &meta2.Data{},
-		metaServers:    []string{"127.0.0.1"},
-		logger:         logger.NewLogger(errno.ModuleMetaClient),
-		SendRPCMessage: &RPCMessageSender{},
+		cacheData:   &meta2.Data{},
+		metaServers: []string{"127.0.0.1"},
+		logger:      logger.NewLogger(errno.ModuleMetaClient),
 	}
+	mockSuccessfulRPCWithoutApply(c)
 
 	shards := meta2.MergeShards{DbName: "db1", RpName: "rp1", PtId: 1, ShardIds: []uint64{1}, ShardEndTimes: []int64{1}}
 	err := c.ReplaceMergeShards(shards)
-	require.EqualError(t, err, "execute command timeout")
+	require.NoError(t, err)
 }
 
 func TestClient_GetMergeShardsList(t *testing.T) {
