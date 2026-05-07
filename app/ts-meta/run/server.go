@@ -117,30 +117,34 @@ func (s *Server) Err() <-chan error { return nil }
 
 // Open opens the meta and data store and all services.
 func (s *Server) Open() error {
-	// Mark start-up in log.
 	app.LogStarting("TSMeta", &s.info)
 
-	// Open shared TCP connection.
-	ln, err := net.Listen("tcp", s.BindAddress)
-	if err != nil {
-		return fmt.Errorf("listen: %s", err)
-	}
-	s.Listener = ln
+	var err error
 
-	if s.config.Common.PprofEnabled {
-		port := s.config.Common.MetaPprofPort
-		if port == "" {
-			port = util.MetaPprofPort
+	// If Listener is pre-set (e.g. in tests), reuse it and skip net.Listen /
+	// pprof. Otherwise create a real TCP listener from BindAddress.
+	if s.Listener == nil {
+		ln, err := net.Listen("tcp", s.BindAddress)
+		if err != nil {
+			return fmt.Errorf("listen: %s", err)
 		}
-		go util.OpenPprofServer(s.config.Common.PprofBindAddress, port)
+		s.Listener = ln
+
+		if s.config.Common.PprofEnabled {
+			port := s.config.Common.MetaPprofPort
+			if port == "" {
+				port = util.MetaPprofPort
+			}
+			go util.OpenPprofServer(s.config.Common.PprofBindAddress, port)
+		}
 	}
 
-	// Multiplex listener.
+	// Multiplex listener — always required by MetaService.
 	mux := tcp.NewMux(tcp.MuxLogger(os.Stdout))
 	go func() {
-		if err := mux.Serve(ln); err != nil {
+		if err := mux.Serve(s.Listener); err != nil {
 			s.Logger.Error("listen failed",
-				zap.String("addr", ln.Addr().String()),
+				zap.String("addr", s.Listener.Addr().String()),
 				zap.Error(err))
 		}
 	}()
@@ -148,7 +152,6 @@ func (s *Server) Open() error {
 	if s.MetaService != nil {
 		s.MetaService.RaftListener = mux.Listen(meta.MuxHeader)
 		s.MetaService.SetStatisticsPusher(s.statisticsPusher)
-		// Open meta service.
 		if err := s.MetaService.Open(); err != nil {
 			return fmt.Errorf("open meta service: %s", err)
 		}

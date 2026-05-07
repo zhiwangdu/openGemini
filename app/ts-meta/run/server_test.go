@@ -15,11 +15,10 @@
 package run
 
 import (
+	"net"
 	"path"
 	"strings"
 	"testing"
-	"time"
-
 	"github.com/influxdata/influxdb/pkg/tlsconfig"
 	"github.com/openGemini/openGemini/app"
 	"github.com/openGemini/openGemini/app/ts-meta/meta"
@@ -68,9 +67,15 @@ func Test_NewServer_Open_Close(t *testing.T) {
 		conf.Common.MetaJoin = append(conf.Common.MetaJoin, []string{"127.0.0.1:9192"}...)
 	}
 	conf.Common.ReportEnable = false
+	conf.Common.PprofEnabled = false
+	conf.Gossip.Enabled = false
 
-	conf.Meta.BindAddress = "127.0.0.1:9099"
-	conf.Meta.HTTPBindAddress = "127.0.0.1:9191"
+	// RPCBindAddress must use a specific port (not :0) because the raft
+	// configuration derives LocalID and peer addresses from it. Using :0
+	// causes the AddrRewriter to replace it with the mux listener address,
+	// which breaks raft peer/LocalID matching.
+	conf.Meta.BindAddress = "127.0.0.1:0"
+	conf.Meta.HTTPBindAddress = "127.0.0.1:0"
 	conf.Meta.RPCBindAddress = "127.0.0.1:8092"
 	conf.Meta.Dir = path.Join(tmpDir, "meta")
 
@@ -78,12 +83,17 @@ func Test_NewServer_Open_Close(t *testing.T) {
 	conf.Data.MetaDir = path.Join(tmpDir, "meta")
 	conf.Data.WALDir = path.Join(tmpDir, "wal")
 	conf.Sherlock.DumpPath = path.Join(tmpDir, "sherlock")
-	conf.Common.PprofEnabled = true
 
 	server, err = NewServer(conf, app.ServerInfo{}, log)
 	require.NoError(t, err)
-	require.NotNil(t, server.(*Server).MetaService)
-	require.NotNil(t, server.(*Server).sherlockService)
+	s := server.(*Server)
+	require.NotNil(t, s.MetaService)
+	require.NotNil(t, s.sherlockService)
+
+	// Pre-set a mock listener to avoid binding BindAddress to a hardcoded port.
+	// The mux and RaftListener are still created normally from this listener.
+	s.Listener = newMockListener(t)
+
 	err = server.Open()
 	require.NoError(t, err)
 
@@ -106,9 +116,15 @@ func Test_NewServer_Open_Close_IncSyncMetaData(t *testing.T) {
 		conf.Common.MetaJoin = append(conf.Common.MetaJoin, []string{"127.0.0.1:9192"}...)
 	}
 	conf.Common.ReportEnable = false
+	conf.Common.PprofEnabled = false
+	conf.Gossip.Enabled = false
 
-	conf.Meta.BindAddress = "127.0.0.1:9099"
-	conf.Meta.HTTPBindAddress = "127.0.0.1:9191"
+	// RPCBindAddress must use a specific port (not :0) because the raft
+	// configuration derives LocalID and peer addresses from it. Using :0
+	// causes the AddrRewriter to replace it with the mux listener address,
+	// which breaks raft peer/LocalID matching.
+	conf.Meta.BindAddress = "127.0.0.1:0"
+	conf.Meta.HTTPBindAddress = "127.0.0.1:0"
 	conf.Meta.RPCBindAddress = "127.0.0.1:8092"
 	conf.Meta.Dir = path.Join(tmpDir, "meta")
 	conf.Meta.UseIncSyncData = true
@@ -120,12 +136,17 @@ func Test_NewServer_Open_Close_IncSyncMetaData(t *testing.T) {
 
 	server, err = NewServer(conf, app.ServerInfo{}, log)
 	require.NoError(t, err)
-	require.NotNil(t, server.(*Server).MetaService)
-	require.NotNil(t, server.(*Server).sherlockService)
+	s := server.(*Server)
+	require.NotNil(t, s.MetaService)
+	require.NotNil(t, s.sherlockService)
+
+	// Pre-set a mock listener to avoid binding BindAddress to a hardcoded port.
+	// The mux and RaftListener are still created normally from this listener.
+	s.Listener = newMockListener(t)
 
 	err = server.Open()
 	require.NoError(t, err)
-	time.Sleep(3 * time.Second)
+
 	err = server.Close()
 	require.NoError(t, err)
 }
@@ -232,4 +253,14 @@ func TestNewServerWithTlsUseCase(t *testing.T) {
 	require.Error(t, err)
 	require.EqualValues(t, true, strings.HasPrefix(err.Error(),
 		"parse tls config failed"))
+}
+
+// newMockListener creates a TCP listener on a random port (127.0.0.1:0).
+// Tests use this to inject pre-set listeners before Open(), so the server
+// never binds to hardcoded ports.
+func newMockListener(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	return ln
 }
