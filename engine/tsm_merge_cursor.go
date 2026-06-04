@@ -540,8 +540,8 @@ func (c *tsmMergeCursor) FirstTimeInit() error {
 		c.span.Count(tsmIterCount, 1)
 		tm = time.Now()
 	}
-	isFirst := true
 	var outRec *record.Record
+	outOfOrderRecords := make([]*record.Record, 0, c.outOfOrderLocations.FragmentCount())
 	for {
 		dst := record.NewRecordBuilder(c.ctx.schema)
 		oriRowsBeforeRead := c.outOfOrderLocations.RowCount()
@@ -562,28 +562,26 @@ func (c *tsmMergeCursor) FirstTimeInit() error {
 		if rec == nil {
 			break
 		}
-		if isFirst {
-			outRec = rec
-		} else {
-			var mergeRecord record.Record
-			mergeStart := time.Now()
-			if c.ctx.decs.Ascending {
-				mergeRecord.MergeRecord(rec, outRec)
-			} else {
-				mergeRecord.MergeRecordDescend(rec, outRec)
-			}
-			if c.span != nil {
-				c.span.Count(unorderMergeCount, 1)
-				c.span.Count(unorderMergeDuration, int64(time.Since(mergeStart)))
-			}
+		outOfOrderRecords = append(outOfOrderRecords, rec)
+	}
 
-			outRec = &mergeRecord
+	if len(outOfOrderRecords) == 1 {
+		outRec = outOfOrderRecords[0]
+	} else if len(outOfOrderRecords) > 1 {
+		var mergeRecord record.Record
+		mergeStart := time.Now()
+		mergeRecord.MergeRecordHeap(outOfOrderRecords, c.ctx.decs.Ascending)
+		if c.span != nil {
+			c.span.Count(unorderMergeCount, int64(len(outOfOrderRecords)-1))
+			c.span.Count(unorderMergeDuration, int64(time.Since(mergeStart)))
 		}
-		isFirst = false
+		outRec = &mergeRecord
 	}
 
 	if c.span != nil {
-		c.span.Count(unorderRowCount, int64(outRec.RowNums()))
+		if outRec != nil {
+			c.span.Count(unorderRowCount, int64(outRec.RowNums()))
+		}
 		duration = time.Since(tm)
 		c.span.Count(unorderDuration, int64(duration))
 	}

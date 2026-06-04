@@ -16,6 +16,7 @@
 package record
 
 import (
+	"container/heap"
 	"fmt"
 	"sort"
 	"strings"
@@ -806,6 +807,151 @@ func (rec *Record) MergeRecord(newRec, oldRec *Record) {
 
 func (rec *Record) MergeRecordDescend(newRec, oldRec *Record) {
 	rec.MergeRecordLimitRowsDescend(newRec, oldRec, 0, 0, newRec.RowNums()+oldRec.RowNums())
+}
+
+type mergeRecordHeapItem struct {
+	rec      *Record
+	timeVals []int64
+	pos      int
+	idx      int
+}
+
+type mergeRecordHeap struct {
+	items     []*mergeRecordHeapItem
+	ascending bool
+}
+
+func (h mergeRecordHeap) Len() int {
+	return len(h.items)
+}
+
+func (h mergeRecordHeap) Less(i, j int) bool {
+	ti := h.items[i].timeVals[h.items[i].pos]
+	tj := h.items[j].timeVals[h.items[j].pos]
+	if ti == tj {
+		return h.items[i].idx < h.items[j].idx
+	}
+	if h.ascending {
+		return ti < tj
+	}
+	return ti > tj
+}
+
+func (h mergeRecordHeap) Swap(i, j int) {
+	h.items[i], h.items[j] = h.items[j], h.items[i]
+}
+
+func (h *mergeRecordHeap) Push(x interface{}) {
+	h.items = append(h.items, x.(*mergeRecordHeapItem))
+}
+
+func (h *mergeRecordHeap) Pop() interface{} {
+	old := h.items
+	n := len(old)
+	item := old[n-1]
+	h.items = old[:n-1]
+	return item
+}
+
+type mergeRecordHeapCandidate struct {
+	rec *Record
+	pos int
+	idx int
+}
+
+func appendHeapMergedRow(dst *Record, candidates []mergeRecordHeapCandidate) {
+	if len(candidates) == 1 {
+		candidate := candidates[0]
+		dst.AppendRec(candidate.rec, candidate.pos, candidate.pos+1)
+		return
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].idx < candidates[j].idx
+	})
+
+	var oldRec Record
+	first := candidates[0]
+	oldRec.SliceFromRecord(candidates[0].rec, first.pos, first.pos+1)
+	for i := 1; i < len(candidates); i++ {
+		candidate := candidates[i]
+		var mergeRec Record
+		mergeRec.mergeRecordSchema(candidate.rec, &oldRec)
+		mergeRec.ColVals = make([]ColVal, len(mergeRec.Schema))
+		mergeRec.mergeRecRow(candidate.rec, &oldRec, candidate.pos, 0)
+		oldRec = mergeRec
+	}
+	dst.AppendRec(&oldRec, 0, 1)
+}
+
+func (rec *Record) MergeRecordHeap(records []*Record, ascending bool) {
+	records = compactMergeRecords(records)
+	if len(records) == 0 {
+		return
+	}
+	if len(records) == 1 {
+		rec.Schema = records[0].Schema.Copy()
+		rec.ColVals = make([]ColVal, len(rec.Schema))
+		rec.AppendRec(records[0], 0, records[0].RowNums())
+		return
+	}
+
+	rec.Schema = records[0].Schema.Copy()
+	for i := 1; i < len(records); i++ {
+		var mergedSchemaRec Record
+		mergedSchemaRec.mergeRecordSchema(records[i], rec)
+		rec.Schema = mergedSchemaRec.Schema
+	}
+	rec.ColVals = make([]ColVal, len(rec.Schema))
+
+	h := &mergeRecordHeap{ascending: ascending}
+	for i, r := range records {
+		heap.Push(h, &mergeRecordHeapItem{
+			rec:      r,
+			timeVals: r.ColVals[len(r.ColVals)-1].IntegerValues(),
+			pos:      0,
+			idx:      i,
+		})
+	}
+	heap.Init(h)
+
+	var candidates []mergeRecordHeapCandidate
+	for h.Len() > 0 {
+		item := heap.Pop(h).(*mergeRecordHeapItem)
+		tm := item.timeVals[item.pos]
+		candidates = candidates[:0]
+		candidates = append(candidates, mergeRecordHeapCandidate{rec: item.rec, pos: item.pos, idx: item.idx})
+		item.pos++
+		if item.pos < item.rec.RowNums() {
+			heap.Push(h, item)
+		}
+
+		for h.Len() > 0 {
+			next := h.items[0]
+			if next.timeVals[next.pos] != tm {
+				break
+			}
+			next = heap.Pop(h).(*mergeRecordHeapItem)
+			candidates = append(candidates, mergeRecordHeapCandidate{rec: next.rec, pos: next.pos, idx: next.idx})
+			next.pos++
+			if next.pos < next.rec.RowNums() {
+				heap.Push(h, next)
+			}
+		}
+		appendHeapMergedRow(rec, candidates)
+	}
+}
+
+func compactMergeRecords(records []*Record) []*Record {
+	n := 0
+	for _, rec := range records {
+		if rec == nil || rec.RowNums() == 0 {
+			continue
+		}
+		records[n] = rec
+		n++
+	}
+	return records[:n]
 }
 
 func (rec *Record) MergeRecordLimitRows(newRec, oldRec *Record, newPos, oldPos, limitRows int) (int, int) {

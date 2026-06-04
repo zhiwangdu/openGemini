@@ -166,6 +166,74 @@ func TestMergeRecordWithSameSchemaAndOneRowCase1(t *testing.T) {
 	}
 }
 
+func TestMergeRecordHeapAscending(t *testing.T) {
+	rec1 := genRowRec(testSchema,
+		[]int{1, 1, 1}, []int64{10, 40, 70},
+		[]int{1, 1, 1}, []float64{1.0, 4.0, 7.0},
+		[]int{1, 1, 1}, []string{"old1", "old4", "old7"},
+		[]int{1, 1, 1}, []bool{true, false, true},
+		[]int64{1, 4, 7})
+	rec2 := genRowRec(testSchema,
+		[]int{1, 0, 1}, []int64{20, 0, 80},
+		[]int{1, 1, 1}, []float64{2.0, 4.2, 8.0},
+		[]int{1, 1, 1}, []string{"new2", "new4", "new8"},
+		[]int{1, 1, 1}, []bool{false, true, false},
+		[]int64{2, 4, 8})
+	rec3 := genRowRec(testSchema,
+		[]int{1, 1}, []int64{30, 90},
+		[]int{1, 1}, []float64{3.0, 9.0},
+		[]int{1, 1}, []string{"new3", "new9"},
+		[]int{1, 1}, []bool{true, true},
+		[]int64{3, 9})
+
+	var cumulative record.Record
+	cumulative.MergeRecord(rec2, rec1)
+	var expected record.Record
+	expected.MergeRecord(rec3, &cumulative)
+
+	var heapMerged record.Record
+	heapMerged.MergeRecordHeap([]*record.Record{rec1, rec2, rec3}, true)
+
+	if !testRecsEqual(&heapMerged, &expected) {
+		t.Fatal("error result")
+	}
+	record.CheckRecord(&heapMerged)
+}
+
+func TestMergeRecordHeapDescending(t *testing.T) {
+	rec1 := genRowRec(testSchema,
+		[]int{1, 1, 1}, []int64{70, 40, 10},
+		[]int{1, 1, 1}, []float64{7.0, 4.0, 1.0},
+		[]int{1, 1, 1}, []string{"old7", "old4", "old1"},
+		[]int{1, 1, 1}, []bool{true, false, true},
+		[]int64{7, 4, 1})
+	rec2 := genRowRec(testSchema,
+		[]int{1, 0, 1}, []int64{80, 0, 20},
+		[]int{1, 1, 1}, []float64{8.0, 4.2, 2.0},
+		[]int{1, 1, 1}, []string{"new8", "new4", "new2"},
+		[]int{1, 1, 1}, []bool{false, true, false},
+		[]int64{8, 4, 2})
+	rec3 := genRowRec(testSchema,
+		[]int{1, 1}, []int64{90, 30},
+		[]int{1, 1}, []float64{9.0, 3.0},
+		[]int{1, 1}, []string{"new9", "new3"},
+		[]int{1, 1}, []bool{true, true},
+		[]int64{9, 3})
+
+	var cumulative record.Record
+	cumulative.MergeRecordDescend(rec2, rec1)
+	var expected record.Record
+	expected.MergeRecordDescend(rec3, &cumulative)
+
+	var heapMerged record.Record
+	heapMerged.MergeRecordHeap([]*record.Record{rec1, rec2, rec3}, false)
+
+	if !testRecsEqual(&heapMerged, &expected) {
+		t.Fatal("error result")
+	}
+	record.CheckRecord(&heapMerged)
+}
+
 // merge with oldRec.time[0] == newRec.time[0]
 func TestMergeRecordWithSameSchemaAndOneRowCase1Descend(t *testing.T) {
 	oldRec := genRowRec(testSchema,
