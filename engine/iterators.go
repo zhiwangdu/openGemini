@@ -47,13 +47,21 @@ import (
 )
 
 const (
-	tsmIterCount     = "tsm_iter"
-	tsmIterDuration  = "tsm_duration"
-	memTableDuration = "memtable_duration"
-	memTableRowCount = "memtable_row_count"
-	unorderRowCount  = "unorder_row_count"
-	unorderDuration  = "unorder_duration"
-	aggIterCount     = "agg_iter"
+	tsmIterCount         = "tsm_iter"
+	tsmIterDuration      = "tsm_duration"
+	memTableDuration     = "memtable_duration"
+	memTableRowCount     = "memtable_row_count"
+	unorderRowCount      = "unorder_row_count"
+	unorderDuration      = "unorder_duration"
+	unorderReadCount     = "unorder_read_count"
+	unorderReadRows      = "unorder_read_row_count"
+	unorderReadOriRows   = "unorder_read_origin_row_count"
+	unorderReadDuration  = "unorder_read_duration"
+	unorderMergeCount    = "unorder_merge_count"
+	unorderMergeDuration = "unorder_merge_duration"
+	unorderLocationCount = "unorder_location_count"
+	unorderFragmentCount = "unorder_fragment_count"
+	aggIterCount         = "agg_iter"
 
 	createTagSetCursorDuration = "create_lazy_tagset_cursor"
 )
@@ -585,6 +593,16 @@ func (s *shard) createGroupCursors(ctx context.Context, span *tracing.Span, sche
 			subGroupSpan := groupSpan.StartSpan(fmt.Sprintf("group%d", i)).StartPP()
 			subGroupSpan.CreateCounter(memTableDuration, "ns")
 			subGroupSpan.CreateCounter(memTableRowCount, "")
+			subGroupSpan.CreateCounter(unorderRowCount, "")
+			subGroupSpan.CreateCounter(unorderDuration, "ns")
+			subGroupSpan.CreateCounter(unorderReadCount, "")
+			subGroupSpan.CreateCounter(unorderReadRows, "")
+			subGroupSpan.CreateCounter(unorderReadOriRows, "")
+			subGroupSpan.CreateCounter(unorderReadDuration, "ns")
+			subGroupSpan.CreateCounter(unorderMergeCount, "")
+			subGroupSpan.CreateCounter(unorderMergeDuration, "ns")
+			subGroupSpan.CreateCounter(unorderLocationCount, "")
+			subGroupSpan.CreateCounter(unorderFragmentCount, "")
 			cursors[i].(*groupCursor).span = subGroupSpan
 		}
 	}

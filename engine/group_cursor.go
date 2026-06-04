@@ -218,6 +218,14 @@ func (c *groupCursor) StartSpan(span *tracing.Span) {
 		}
 		c.span.CreateCounter(unorderRowCount, "")
 		c.span.CreateCounter(unorderDuration, "ns")
+		c.span.CreateCounter(unorderReadCount, "")
+		c.span.CreateCounter(unorderReadRows, "")
+		c.span.CreateCounter(unorderReadOriRows, "")
+		c.span.CreateCounter(unorderReadDuration, "ns")
+		c.span.CreateCounter(unorderMergeCount, "")
+		c.span.CreateCounter(unorderMergeDuration, "ns")
+		c.span.CreateCounter(unorderLocationCount, "")
+		c.span.CreateCounter(unorderFragmentCount, "")
 		enableFileCursor := executor.GetEnableFileCursor() && c.querySchema.HasOptimizeAgg()
 		if enableFileCursor {
 			if c.querySchema.Options().IsPromQuery() {

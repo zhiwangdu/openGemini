@@ -466,6 +466,10 @@ func (c *tsmMergeCursor) FirstTimeOutOfOrderInit() error {
 	if c.outOfOrderLocations.Len() > 1 {
 		sort.Sort(c.outOfOrderLocations)
 	}
+	if c.span != nil {
+		c.span.Count(unorderLocationCount, int64(c.outOfOrderLocations.Len()))
+		c.span.Count(unorderFragmentCount, int64(c.outOfOrderLocations.FragmentCount()))
+	}
 	var tm time.Time
 	var duration time.Duration
 
@@ -478,9 +482,17 @@ func (c *tsmMergeCursor) FirstTimeOutOfOrderInit() error {
 	c.ctx.decs.Set(c.ctx.decs.Ascending, c.ctx.tr, c.onlyFirstOrLast, c.ops)
 	filterOpts := immutable.NewFilterOpts(c.filter, &c.ctx.filterOption, c.tags, c.rowFilters)
 	dst := record.NewRecordBuilder(c.ctx.schema)
+	readStart := time.Now()
 	rec, err := c.outOfOrderLocations.ReadOutOfOrderMeta(filterOpts, dst)
 	if err != nil {
 		return err
+	}
+	if c.span != nil {
+		c.span.Count(unorderReadCount, 1)
+		c.span.Count(unorderReadDuration, int64(time.Since(readStart)))
+		if rec != nil {
+			c.span.Count(unorderReadRows, int64(rec.RowNums()))
+		}
 	}
 	outRec = rec
 
@@ -517,6 +529,10 @@ func (c *tsmMergeCursor) FirstTimeInit() error {
 	if c.outOfOrderLocations.Len() > 1 {
 		sort.Sort(c.outOfOrderLocations)
 	}
+	if c.span != nil {
+		c.span.Count(unorderLocationCount, int64(c.outOfOrderLocations.Len()))
+		c.span.Count(unorderFragmentCount, int64(c.outOfOrderLocations.FragmentCount()))
+	}
 	var tm time.Time
 	var duration time.Duration
 
@@ -528,9 +544,19 @@ func (c *tsmMergeCursor) FirstTimeInit() error {
 	var outRec *record.Record
 	for {
 		dst := record.NewRecordBuilder(c.ctx.schema)
+		oriRowsBeforeRead := c.outOfOrderLocations.RowCount()
+		readStart := time.Now()
 		rec, err := c.readData(false, dst)
 		if err != nil {
 			return err
+		}
+		if c.span != nil {
+			c.span.Count(unorderReadCount, 1)
+			c.span.Count(unorderReadDuration, int64(time.Since(readStart)))
+			c.span.Count(unorderReadOriRows, int64(c.outOfOrderLocations.RowCount()-oriRowsBeforeRead))
+			if rec != nil {
+				c.span.Count(unorderReadRows, int64(rec.RowNums()))
+			}
 		}
 		// end of cursor
 		if rec == nil {
@@ -540,10 +566,15 @@ func (c *tsmMergeCursor) FirstTimeInit() error {
 			outRec = rec
 		} else {
 			var mergeRecord record.Record
+			mergeStart := time.Now()
 			if c.ctx.decs.Ascending {
 				mergeRecord.MergeRecord(rec, outRec)
 			} else {
 				mergeRecord.MergeRecordDescend(rec, outRec)
+			}
+			if c.span != nil {
+				c.span.Count(unorderMergeCount, 1)
+				c.span.Count(unorderMergeDuration, int64(time.Since(mergeStart)))
 			}
 
 			outRec = &mergeRecord
