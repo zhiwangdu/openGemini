@@ -1,7 +1,7 @@
 pipeline {
   agent {
     docker {
-      image 'golang:1.9.2'
+      image 'golang:1.26'
     }
   }
 
@@ -23,7 +23,7 @@ pipeline {
         always {
           sh """
           if [ -e test-results.log ]; then
-            go get github.com/jstemmer/go-junit-report
+            go install github.com/jstemmer/go-junit-report@latest
             go-junit-report < $WORKSPACE/test-results.log > test-results.xml
           fi
           """

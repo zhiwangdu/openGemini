@@ -1,6 +1,6 @@
 module github.com/influxdata/influxdb
 
-go 1.24
+go 1.26
 
 require (
 	github.com/apache/arrow/go/v13 v13.0.0-20230630125530-5a06b2ec2a8e
