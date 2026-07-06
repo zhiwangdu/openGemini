@@ -150,6 +150,13 @@ func (l *Location) GetChunkMeta() *ChunkMeta {
 	return l.meta
 }
 
+// Sequence returns the underlying file's level and sequence. The sequence encodes write
+// recency for out-of-order files (higher = newer) and is used by the lazy unordered merger to
+// resolve same-timestamp precedence.
+func (l *Location) Sequence() (uint16, uint64) {
+	return l.r.LevelAndSequence()
+}
+
 func (d *Location) SetClosedSignal(s *bool) {
 	d.ctx.SetClosedSignal(s)
 }
@@ -256,6 +263,65 @@ func (l *Location) overlapsForRowFilter(rowFilters *[]clv.RowFilter) bool {
 func (l *Location) ReadData(filterOpts *FilterOptions, dst *record.Record, filterDst *record.Record) (*record.Record, error) {
 	rec, _, err := l.readData(filterOpts, dst, filterDst, nil, nil)
 	return rec, err
+}
+
+// HasNext reports whether the location has more segments to read.
+func (l *Location) HasNext() bool {
+	return l.hasNext()
+}
+
+// CurrentSegMinMax returns the time range of the current segment. It is read-only and does not
+// advance the segment cursor.
+func (l *Location) CurrentSegMinMax() (int64, int64) {
+	return l.getCurSegMinMax()
+}
+
+// ReadDataBeforeWatermark reads the next segment whose time range falls at or before watermark
+// (ascending) and overlaps the query time range, applying the same FilterByTime/FilterByField
+// as ReadData. Segments that do not overlap the query time range are skipped (advanced past);
+// the first segment strictly beyond the watermark is left in place and nil is returned so the
+// caller can defer it until the watermark advances. This bounds how much out-of-order data the
+// lazy unordered merge reads before the first packet.
+func (l *Location) ReadDataBeforeWatermark(filterOpts *FilterOptions, dst *record.Record, watermark int64) (*record.Record, error) {
+	if l.meta == nil || !l.ctx.Ascending {
+		// lazy unordered merge only supports ascending reads; fall back elsewhere.
+		return l.ReadData(filterOpts, dst, nil)
+	}
+	if !l.ctx.tr.Overlaps(l.meta.MinMaxTime()) {
+		l.nextSegment(true)
+		return nil, nil
+	}
+	var rec *record.Record
+	var err error
+	for rec == nil && l.hasNext() {
+		if l.ctx.IsAborted() {
+			return nil, nil
+		}
+		minT, maxT := l.getCurSegMinMax()
+		// Defer segments that start beyond the watermark; they may affect later batches only.
+		if minT > watermark {
+			return nil, nil
+		}
+		if (!l.ctx.tr.Overlaps(minT, maxT)) || (!l.overlapsForRowFilter(filterOpts.rowFilters)) {
+			l.nextSegment(false)
+			continue
+		}
+		rec, err = l.r.ReadAt(l.meta, l.segPos, dst, l.ctx, fileops.IO_PRIORITY_ULTRA_HIGH)
+		if err != nil {
+			return nil, err
+		}
+		l.nextSegment(false)
+		if l.isPreAggRead() {
+			return rec, nil
+		}
+		if rec != nil {
+			rec = FilterByTime(rec, l.ctx.tr)
+			if rec != nil {
+				rec = FilterByField(rec, nil, filterOpts.options, filterOpts.cond, filterOpts.rowFilters, filterOpts.pointTags, nil, &filterOpts.colAux)
+			}
+		}
+	}
+	return rec, nil
 }
 
 func (l *Location) readData(filterOpts *FilterOptions, dst, filterRec *record.Record, filterBitmap *bitmap.FilterBitmap,

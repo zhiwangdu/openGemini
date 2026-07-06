@@ -54,6 +54,12 @@ func (l *LocationCursor) AddLocation(loc *Location) {
 	l.lcs = append(l.lcs, loc)
 }
 
+// LocationAt returns the i-th location. Used by the lazy unordered merger to access the
+// matched out-of-order locations directly.
+func (l *LocationCursor) LocationAt(i int) *Location {
+	return l.lcs[i]
+}
+
 func (l *LocationCursor) Len() int {
 	return len(l.lcs)
 }
