@@ -467,7 +467,6 @@ func (c *tsmMergeCursor) FirstTimeOutOfOrderInit() error {
 		sort.Sort(c.outOfOrderLocations)
 	}
 	var tm time.Time
-	var duration time.Duration
 
 	if c.span != nil {
 		c.span.Count(tsmIterCount, 1)
@@ -484,11 +483,7 @@ func (c *tsmMergeCursor) FirstTimeOutOfOrderInit() error {
 	}
 	outRec = rec
 
-	if c.span != nil {
-		c.span.Count(unorderRowCount, int64(outRec.RowNums()))
-		duration = time.Since(tm)
-		c.span.Count(unorderDuration, int64(duration))
-	}
+	c.countUnorderedRows(outRec, tm)
 
 	c.outOrderRecIter.init(outRec)
 	return nil
@@ -518,7 +513,6 @@ func (c *tsmMergeCursor) FirstTimeInit() error {
 		sort.Sort(c.outOfOrderLocations)
 	}
 	var tm time.Time
-	var duration time.Duration
 
 	if c.span != nil {
 		c.span.Count(tsmIterCount, 1)
@@ -551,13 +545,25 @@ func (c *tsmMergeCursor) FirstTimeInit() error {
 		isFirst = false
 	}
 
-	if c.span != nil {
-		c.span.Count(unorderRowCount, int64(outRec.RowNums()))
-		duration = time.Since(tm)
-		c.span.Count(unorderDuration, int64(duration))
-	}
+	c.countUnorderedRows(outRec, tm)
 
 	c.outOrderRecIter.init(outRec)
 
 	return nil
+}
+
+// countUnorderedRows records unordered row count and read duration on the cursor span.
+// outRec may be nil when every matched out-of-order location is filtered away (e.g. segment
+// time range not overlapping the query window or FilterByField keeping no rows), so the nil
+// case must be guarded to avoid a nil-pointer panic on outRec.RowNums().
+func (c *tsmMergeCursor) countUnorderedRows(outRec *record.Record, tm time.Time) {
+	if c.span == nil {
+		return
+	}
+	if outRec != nil {
+		c.span.Count(unorderRowCount, int64(outRec.RowNums()))
+	} else {
+		c.span.Count(unorderRowCount, 0)
+	}
+	c.span.Count(unorderDuration, int64(time.Since(tm)))
 }
