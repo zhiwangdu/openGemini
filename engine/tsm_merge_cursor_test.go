@@ -15,6 +15,9 @@
 package engine
 
 import (
+	"math/rand"
+	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/openGemini/openGemini/engine/executor"
@@ -185,14 +188,23 @@ func TestFirstTimeInitMergeWithPool(t *testing.T) {
 }
 
 type mocRow struct {
-	t, v int64
+	t    int64
+	v    int64
+	nilV bool
 }
 
 // mocTsspFileWithData returns a single-segment chunk whose ReadAt fills dst with the given rows.
+// order distinguishes ordered vs out-of-order files; seq is the file sequence used for
+// same-timestamp precedence (higher = newer = wins).
 type mocTsspFileWithData struct {
 	MocTsspFile
-	rows []mocRow
+	rows  []mocRow
+	order bool
+	seq   uint64
 }
+
+func (m mocTsspFileWithData) IsOrder() bool                      { return m.order }
+func (m mocTsspFileWithData) LevelAndSequence() (uint16, uint64) { return 0, m.seq }
 
 func (m mocTsspFileWithData) ChunkMeta(id uint64, offset int64, size, itemCount uint32, metaIdx int, ctx *immutable.ChunkMetaContext, ioPriority int) (*immutable.ChunkMeta, error) {
 	if id == 0527 {
@@ -204,8 +216,208 @@ func (m mocTsspFileWithData) ChunkMeta(id uint64, offset int64, size, itemCount 
 
 func (m mocTsspFileWithData) ReadAt(cm *immutable.ChunkMeta, segment int, dst *record.Record, decs *immutable.ReadContext, ioPriority int) (*record.Record, error) {
 	for _, r := range m.rows {
-		dst.ColVals[0].AppendInteger(r.v) // value column
-		dst.AppendTime(r.t)               // time column (last)
+		if r.nilV {
+			dst.ColVals[0].AppendIntegerNull() // value column
+		} else {
+			dst.ColVals[0].AppendInteger(r.v)
+		}
+		dst.AppendTime(r.t) // time column (last)
 	}
 	return dst, nil
+}
+
+// mergeRow is a (time, value, isNil) tuple collected from cursor output for differential
+// comparison between the eager and lazy paths.
+type mergeRow struct {
+	t     int64
+	v     int64
+	isNil bool
+}
+
+// runMergeCursorForTest builds a fresh tsmMergeCursor over the given ordered/unordered files and
+// drains it to exhaustion, collecting (time, value, isNil) rows. maxRowCnt is intentionally
+// configurable so callers can force small batches to exercise ready-buffer ownership.
+func runMergeCursorForTest(t *testing.T, schema record.Schemas, ordered, unordered []immutable.TSSPFile, maxRowCnt int) []mergeRow {
+	t.Helper()
+	opt := &query.ProcessorOptions{Ascending: true, StartTime: 0, EndTime: 1 << 30}
+	qs := &executor.QuerySchema{}
+	qs.SetOpt(opt)
+	closedSignal := false
+	ctx := &idKeyCursorContext{
+		schema:       schema,
+		querySchema:  qs,
+		decs:         immutable.NewReadContext(true),
+		tr:           util.TimeRange{Min: 0, Max: 1 << 30},
+		tmsMergePool: TsmMergePool,
+		maxRowCnt:    maxRowCnt,
+		readers:      &immutable.MmsReaders{Orders: ordered, OutOfOrders: unordered},
+		closedSignal: &closedSignal,
+	}
+	cursor, err := newTsmMergeCursor(ctx, 0527, nil, nil, nil, false, nil)
+	if err != nil {
+		t.Fatalf("newTsmMergeCursor: %v", err)
+	}
+	if cursor == nil {
+		return nil
+	}
+	var out []mergeRow
+	for {
+		rec, err := cursor.Next()
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if rec == nil {
+			break
+		}
+		times := rec.Times()
+		for i := 0; i < rec.RowNums(); i++ {
+			v, isNil := rec.ColVals[0].IntegerValue(i)
+			out = append(out, mergeRow{t: times[i], v: v, isNil: isNil})
+		}
+	}
+	cursor.Close()
+	return out
+}
+
+func buildFiles(files [][]mocRow, order bool) []immutable.TSSPFile {
+	out := make([]immutable.TSSPFile, 0, len(files))
+	for i, rows := range files {
+		out = append(out, mocTsspFileWithData{rows: rows, order: order, seq: uint64(i + 1)})
+	}
+	return out
+}
+
+// TestLazyUnorderedMergeDifferential compares the lazy out-of-order merge path against the eager
+// path (the oracle) across fixed edge cases and randomized scenarios. The lazy path is gated by
+// the package flag; the eager path runs with the flag off.
+func TestLazyUnorderedMergeDifferential(t *testing.T) {
+	schema := record.Schemas{
+		{Type: influx.Field_Type_Int, Name: "value"},
+		{Type: influx.Field_Type_Int, Name: record.TimeField},
+	}
+
+	// Fixed edge cases. Each defines ordered and unordered row sets; both paths must produce the
+	// same merged output.
+	type tc struct {
+		name      string
+		ordered   [][]mocRow
+		unordered [][]mocRow
+		maxRows   int
+	}
+	cases := []tc{
+		{
+			name:      "ordered_only",
+			ordered:   [][]mocRow{{{t: 1, v: 1}, {t: 2, v: 2}}},
+			unordered: [][]mocRow{},
+			maxRows:   100,
+		},
+		{
+			name:      "unordered_only",
+			ordered:   [][]mocRow{},
+			unordered: [][]mocRow{{{t: 1, v: 1}, {t: 3, v: 3}}},
+			maxRows:   100,
+		},
+		{
+			name:    "overlap_higher_seq_wins",
+			ordered: [][]mocRow{{{t: 1, v: 1}, {t: 5, v: 5}}},
+			unordered: [][]mocRow{
+				{{t: 2, v: 2}, {t: 4, v: 4}}, // seq 1
+				{{t: 2, v: 99}},              // seq 2, higher -> wins at t=2
+			},
+			maxRows: 100,
+		},
+		{
+			name:    "nil_column_fills_from_older",
+			ordered: [][]mocRow{{{t: 1, v: 1}}},
+			unordered: [][]mocRow{
+				{{t: 1, v: 10}},      // seq 1
+				{{t: 1, nilV: true}}, // seq 2, nil -> older (seq 1) value 10 retained
+			},
+			maxRows: 100,
+		},
+		{
+			name:      "no_overlap",
+			ordered:   [][]mocRow{{{t: 1, v: 1}, {t: 2, v: 2}}},
+			unordered: [][]mocRow{{{t: 10, v: 10}, {t: 11, v: 11}}},
+			maxRows:   100,
+		},
+		{
+			name:    "small_batch_ready_buffer_ownership",
+			ordered: [][]mocRow{{{t: 1, v: 1}, {t: 2, v: 2}, {t: 3, v: 3}, {t: 4, v: 4}}},
+			unordered: [][]mocRow{
+				{{t: 1, v: 100}, {t: 3, v: 300}},
+				{{t: 2, v: 200}, {t: 4, v: 400}},
+			},
+			maxRows: 2, // force mergeData to split batches
+		},
+		{
+			name:    "unordered_spans_multiple_ordered_batches",
+			ordered: [][]mocRow{{{t: 1, v: 1}}, {{t: 5, v: 5}}},
+			unordered: [][]mocRow{
+				{{t: 1, v: 11}, {t: 3, v: 33}, {t: 5, v: 55}, {t: 7, v: 77}},
+			},
+			maxRows: 100,
+		},
+	}
+
+	runOne := func(c tc, lazy bool) []mergeRow {
+		if lazy {
+			SetLazyUnorderedMergeEnabled(true)
+			defer SetLazyUnorderedMergeEnabled(false)
+		}
+		ordered := buildFiles(c.ordered, true)
+		unordered := buildFiles(c.unordered, false)
+		return runMergeCursorForTest(t, schema, ordered, unordered, c.maxRows)
+	}
+
+	for _, c := range cases {
+		eager := runOne(c, false)
+		lazy := runOne(c, true)
+		if !reflect.DeepEqual(eager, lazy) {
+			t.Errorf("case %q mismatch\neager: %v\nlazy:  %v", c.name, eager, lazy)
+		}
+	}
+
+	// Randomized differential testing.
+	rng := rand.New(rand.NewSource(20240706))
+	for iter := 0; iter < 3000; iter++ {
+		c := tc{maxRows: 1 + rng.Intn(4)}
+		nOrd := rng.Intn(3)
+		for i := 0; i < nOrd; i++ {
+			c.ordered = append(c.ordered, randomRows(rng, 1+rng.Intn(4)))
+		}
+		nUnord := 1 + rng.Intn(4)
+		for i := 0; i < nUnord; i++ {
+			c.unordered = append(c.unordered, randomRows(rng, 1+rng.Intn(4)))
+		}
+		eager := runOne(c, false)
+		lazy := runOne(c, true)
+		if !reflect.DeepEqual(eager, lazy) {
+			t.Errorf("random case %d mismatch (ordered=%v unordered=%v maxRows=%d)\neager: %v\nlazy:  %v",
+				iter, c.ordered, c.unordered, c.maxRows, eager, lazy)
+		}
+	}
+}
+
+// randomRows generates n rows with distinct ascending times in [1,20], mimicking a real TSSP
+// segment (which is time-sorted with distinct timestamps within a file). Some values are nil to
+// exercise column-level nil merge. Out-of-order behavior comes from overlapping times across
+// files, not duplicate times within a file.
+func randomRows(rng *rand.Rand, n int) []mocRow {
+	used := make(map[int64]bool, n)
+	times := make([]int64, 0, n)
+	for len(times) < n {
+		t := int64(1 + rng.Intn(20))
+		if used[t] {
+			continue
+		}
+		used[t] = true
+		times = append(times, t)
+	}
+	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
+	rows := make([]mocRow, 0, n)
+	for _, t := range times {
+		rows = append(rows, mocRow{t: t, v: int64(rng.Intn(100)), nilV: rng.Intn(4) == 0})
+	}
+	return rows
 }
