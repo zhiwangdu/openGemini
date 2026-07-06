@@ -73,6 +73,11 @@ const (
 	groupCursorRecordNum      = 4 // groupCursorRecordNum must be the same as the  CircularChunkNum of ChunkReader
 	memtableInitMapSize       = 32
 	filterCursorRecordNum     = 4
+	// unorderRecordNum is the ring size for the out-of-order dst builder pool used by
+	// tsmMergeCursor.FirstTimeInit. dst is only held within a single loop iteration (it becomes
+	// the newRec/oldRec argument to MergeRecord, never the receiver), so two slots suffice:
+	// each iteration's dst is consumed by the merge before the slot is reused on the next Get.
+	unorderRecordNum = 2
 )
 
 var (

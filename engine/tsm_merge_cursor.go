@@ -60,9 +60,13 @@ type tsmMergeCursor struct {
 	orderRecIter    recordIter
 	outOrderRecIter recordIter
 	recordPool      *record.CircularRecordPool
-	limitFirstTime  int64
-	init            bool
-	lazyInit        bool
+	// unorderPool reuses the per-iteration dst builder in the non-aggregate FirstTimeInit
+	// out-of-order read loop, avoiding a NewRecordBuilder allocation on every iteration.
+	// See unorderRecordNum for the ring size and the merge-scratch exclusion rationale.
+	unorderPool    *record.CircularRecordPool
+	limitFirstTime int64
+	init           bool
+	lazyInit       bool
 }
 
 func newTsmMergeCursor(ctx *idKeyCursorContext, sid uint64, filter influxql.Expr, rowFilters *[]clv.RowFilter,
@@ -437,11 +441,17 @@ func (c *tsmMergeCursor) reset() {
 	c.rowFilters = nil
 
 	c.orderRecIter.reset()
+	// Reset the iters first so they drop references to any pool-held records (outRec may be a
+	// unorderPool slot), then release the pool.
 	c.outOrderRecIter.reset()
 
 	if c.recordPool != nil {
 		c.recordPool.Put()
 		c.recordPool = nil
+	}
+	if c.unorderPool != nil {
+		c.unorderPool.Put()
+		c.unorderPool = nil
 	}
 }
 
@@ -525,8 +535,15 @@ func (c *tsmMergeCursor) FirstTimeInit() error {
 	}
 	isFirst := true
 	var outRec *record.Record
+	if c.unorderPool == nil {
+		c.unorderPool = record.NewCircularRecordPool(c.ctx.tmsMergePool, unorderRecordNum, c.ctx.schema, false)
+	}
 	for {
-		dst := record.NewRecordBuilder(c.ctx.schema)
+		// dst is reused from the pool instead of allocating a NewRecordBuilder every iteration.
+		// dst is only ever used as the read buffer and then as the newRec/oldRec argument to
+		// MergeRecord (read-only); it is never used as the MergeRecord receiver, whose schema
+		// mergeRecordSchema appends to (so a pre-populated pool record must not be a receiver).
+		dst := c.unorderPool.Get()
 		rec, err := c.readData(false, dst)
 		if err != nil {
 			return err

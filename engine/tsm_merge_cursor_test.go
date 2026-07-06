@@ -128,3 +128,84 @@ func (m mocTsspFileNilReadAt) ChunkMeta(id uint64, offset int64, size, itemCount
 func (m mocTsspFileNilReadAt) ReadAt(cm *immutable.ChunkMeta, segment int, dst *record.Record, decs *immutable.ReadContext, ioPriority int) (*record.Record, error) {
 	return nil, nil
 }
+
+// TestFirstTimeInitMergeWithPool verifies the non-aggregate FirstTimeInit merge loop produces
+// the same outRec as a direct MergeRecord reference, while reusing the dst builder from
+// unorderPool. Two out-of-order files with an overlapping timestamp (t=2) exercise the merge
+// and dedup path; the second-read file wins at the duplicate timestamp.
+func TestFirstTimeInitMergeWithPool(t *testing.T) {
+	// schema: [value:Int, time:Int] (time field is always last, see NewRecordSchema).
+	schema := record.Schemas{
+		{Type: influx.Field_Type_Int, Name: "value"},
+		{Type: influx.Field_Type_Int, Name: record.TimeField},
+	}
+	files := []immutable.TSSPFile{
+		mocTsspFileWithData{rows: []mocRow{{t: 2, v: 20}, {t: 3, v: 30}}},
+		mocTsspFileWithData{rows: []mocRow{{t: 1, v: 10}, {t: 2, v: 99}}},
+	}
+	opt := &query.ProcessorOptions{Ascending: true, Limit: 100, StartTime: 0, EndTime: 10}
+	qs := &executor.QuerySchema{}
+	qs.SetOpt(opt)
+	closedSignal := false
+	ctx := &idKeyCursorContext{
+		schema:       schema,
+		querySchema:  qs,
+		decs:         immutable.NewReadContext(qs.Options().IsAscending()),
+		tr:           util.TimeRange{Min: 0, Max: 10},
+		tmsMergePool: TsmMergePool,
+		maxRowCnt:    100,
+		readers:      &immutable.MmsReaders{OutOfOrders: files},
+		closedSignal: &closedSignal,
+	}
+
+	cursor, err := newTsmMergeCursor(ctx, 0527, nil, nil, nil, false, nil)
+	assert2.NoError(t, err)
+	assert2.NotNil(t, cursor)
+
+	rec, err := cursor.Next()
+	assert2.NoError(t, err)
+	assert2.NotNil(t, rec)
+
+	// Reference: replicate the old merge with fresh records. Files are read in LocationCursor
+	// order (file0 first as cumulative outRec, file1 second as newRec), matching FirstTimeInit.
+	refDst0 := record.NewRecordBuilder(schema)
+	rec0, _ := files[0].(mocTsspFileWithData).ReadAt(nil, 0, refDst0, nil, 0)
+	refDst1 := record.NewRecordBuilder(schema)
+	rec1, _ := files[1].(mocTsspFileWithData).ReadAt(nil, 0, refDst1, nil, 0)
+	var ref record.Record
+	ref.MergeRecord(rec1, rec0)
+
+	assert2.Equal(t, ref.Times(), rec.Times())
+	assert2.Equal(t, ref.ColVals[0].IntegerValues(), rec.ColVals[0].IntegerValues())
+	// Sanity: the reference is the expected dedup (t=2 keeps the second file's value 99).
+	assert2.Equal(t, []int64{1, 2, 3}, ref.Times())
+	assert2.Equal(t, []int64{10, 99, 30}, ref.ColVals[0].IntegerValues())
+
+	cursor.Close()
+}
+
+type mocRow struct {
+	t, v int64
+}
+
+// mocTsspFileWithData returns a single-segment chunk whose ReadAt fills dst with the given rows.
+type mocTsspFileWithData struct {
+	MocTsspFile
+	rows []mocRow
+}
+
+func (m mocTsspFileWithData) ChunkMeta(id uint64, offset int64, size, itemCount uint32, metaIdx int, ctx *immutable.ChunkMetaContext, ioPriority int) (*immutable.ChunkMeta, error) {
+	if id == 0527 {
+		minT, maxT := m.rows[0].t, m.rows[len(m.rows)-1].t
+		return immutable.NewChunkMeta(0527, minT, maxT, 1), nil
+	}
+	return nil, nil
+}
+
+func (m mocTsspFileWithData) ReadAt(cm *immutable.ChunkMeta, segment int, dst *record.Record, decs *immutable.ReadContext, ioPriority int) (*record.Record, error) {
+	for _, r := range m.rows {
+		dst.ColVals[0].AppendInteger(r.v) // value column
+		dst.AppendTime(r.t)               // time column (last)
+	}
+	return dst, nil
+}
