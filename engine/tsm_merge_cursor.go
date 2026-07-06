@@ -470,6 +470,8 @@ func (c *tsmMergeCursor) FirstTimeOutOfOrderInit() error {
 
 	if c.span != nil {
 		c.span.Count(tsmIterCount, 1)
+		c.span.CreateCounter(unorderedLocationCount, "")
+		c.span.Count(unorderedLocationCount, int64(c.outOfOrderLocations.Len()))
 		tm = time.Now()
 	}
 	//isFirst := true
@@ -516,6 +518,9 @@ func (c *tsmMergeCursor) FirstTimeInit() error {
 
 	if c.span != nil {
 		c.span.Count(tsmIterCount, 1)
+		c.span.CreateCounter(unorderedLocationCount, "")
+		c.span.Count(unorderedLocationCount, int64(c.outOfOrderLocations.Len()))
+		c.span.CreateCounter(unorderedMergeCount, "")
 		tm = time.Now()
 	}
 	isFirst := true
@@ -533,6 +538,9 @@ func (c *tsmMergeCursor) FirstTimeInit() error {
 		if isFirst {
 			outRec = rec
 		} else {
+			if c.span != nil {
+				c.span.Count(unorderedMergeCount, 1)
+			}
 			var mergeRecord record.Record
 			if c.ctx.decs.Ascending {
 				mergeRecord.MergeRecord(rec, outRec)

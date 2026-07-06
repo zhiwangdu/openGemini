@@ -104,6 +104,10 @@ func TestFirstTimeInitNilOutRecNoPanic(t *testing.T) {
 	rec, err := cursor.Next()
 	assert2.NoError(t, err)
 	assert2.Nil(t, rec)
+
+	// Observability: the matched out-of-order location count and merge count are recorded.
+	assert2.Equal(t, "1", span.CreateCounter(unorderedLocationCount, "").Value())
+	assert2.Equal(t, "0", span.CreateCounter(unorderedMergeCount, "").Value())
 	cursor.Close()
 }
 

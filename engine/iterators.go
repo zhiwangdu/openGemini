@@ -54,6 +54,12 @@ const (
 	unorderRowCount  = "unorder_row_count"
 	unorderDuration  = "unorder_duration"
 	aggIterCount     = "agg_iter"
+	// unorderedLocationCount records how many out-of-order locations were matched for a
+	// series (the K amplification factor in the analysis). unorderedMergeCount records how
+	// many chain-merge iterations the non-aggregate FirstTimeInit performed. Both surface the
+	// unordered-read cost that dominates first-packet latency.
+	unorderedLocationCount = "unordered_location_count"
+	unorderedMergeCount    = "unordered_merge_count"
 
 	createTagSetCursorDuration = "create_lazy_tagset_cursor"
 )
