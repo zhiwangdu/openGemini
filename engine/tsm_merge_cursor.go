@@ -30,6 +30,18 @@ import (
 
 var tsmCursorPool = &sync.Pool{}
 
+// lazyUnorderedMergeEnabled gates the lazy out-of-order merge path (Phase 3 of
+// tsmMergeCursor_FirstTimeInit_unordered_analysis.md). Default off: the eager FirstTimeInit
+// full-read path is used. Enable to defer reading out-of-order data until the ordered
+// watermark advances, reducing first-packet latency and the chain-merge cost.
+var lazyUnorderedMergeEnabled bool
+
+// SetLazyUnorderedMergeEnabled toggles the lazy out-of-order merge path at runtime.
+func SetLazyUnorderedMergeEnabled(en bool) { lazyUnorderedMergeEnabled = en }
+
+// GetLazyUnorderedMergeEnabled reports whether the lazy out-of-order merge path is enabled.
+func GetLazyUnorderedMergeEnabled() bool { return lazyUnorderedMergeEnabled }
+
 func getTsmCursor() *tsmMergeCursor {
 	v := tsmCursorPool.Get()
 	if v != nil {
@@ -67,6 +79,34 @@ type tsmMergeCursor struct {
 	limitFirstTime int64
 	init           bool
 	lazyInit       bool
+	// lazyMerger, when non-nil, drives the lazy out-of-order merge path: out-of-order data is
+	// read and merged in watermark-bounded batches instead of all up front in FirstTimeInit.
+	lazyMerger *lazyUnorderedMerger
+}
+
+// lazyUnorderedEnabled reports whether the lazy out-of-order merge path should be used for the
+// current cursor. It is restricted to ascending non-aggregate reads without limit-cut or Prom
+// semantics; every other shape falls back to the eager path.
+func (c *tsmMergeCursor) lazyUnorderedEnabled() bool {
+	if !lazyUnorderedMergeEnabled {
+		return false
+	}
+	if len(c.ops) > 0 || !c.ctx.decs.Ascending {
+		return false
+	}
+	if c.ctx.querySchema.CanLimitCut() {
+		return false
+	}
+	opt := c.ctx.querySchema.Options()
+	if opt.IsPromQuery() || opt.IsPromRemoteRead() {
+		return false
+	}
+	return true
+}
+
+// newFilterOpts builds the FilterOptions used by both the eager and lazy read paths.
+func (c *tsmMergeCursor) newFilterOpts() *immutable.FilterOptions {
+	return immutable.NewFilterOpts(c.filter, &c.ctx.filterOption, c.tags, c.rowFilters)
 }
 
 func newTsmMergeCursor(ctx *idKeyCursorContext, sid uint64, filter influxql.Expr, rowFilters *[]clv.RowFilter,
@@ -399,6 +439,12 @@ func (c *tsmMergeCursor) Next() (*record.Record, error) {
 		c.locationInit = true
 	}
 
+	// Lazy out-of-order merge path: defer reading out-of-order data until the ordered watermark
+	// advances. Falls back to the eager path below when not active.
+	if c.lazyMerger != nil {
+		return c.nextLazy()
+	}
+
 	if c.orderRecIter.hasRemainData() {
 		rec := mergeData(&c.outOrderRecIter, &c.orderRecIter, c.ctx.maxRowCnt, c.ctx.decs.Ascending)
 		return rec, nil
@@ -423,6 +469,92 @@ func (c *tsmMergeCursor) Next() (*record.Record, error) {
 	return rec, nil
 }
 
+// nextLazy drives the lazy out-of-order merge path. Before merging the current ordered batch,
+// it admits out-of-order rows at or before the batch's watermark into outOrderRecIter, then
+// reuses the existing mergeData to combine unordered (newer) with ordered (older). When the
+// ordered stream is exhausted, it drains the remaining out-of-order data via nextUnorderedOnlyLazy.
+func (c *tsmMergeCursor) nextLazy() (*record.Record, error) {
+	if c.ctx.IsAborted() {
+		return nil, nil
+	}
+
+	// If the current ordered batch still has rows, admit out-of-order data up to its watermark
+	// before merging. Skip admission while the ready buffer still has rows (ownership: never
+	// overwrite a partially consumed outOrderRecIter).
+	if c.orderRecIter.hasRemainData() && !c.outOrderRecIter.hasRemainData() {
+		watermark := c.orderRecIter.record.MaxTime(c.ctx.decs.Ascending)
+		if err := c.ensureUnorderedReadyUntil(watermark); err != nil {
+			return nil, err
+		}
+	}
+	if c.orderRecIter.hasRemainData() || c.outOrderRecIter.hasRemainData() {
+		return mergeData(&c.outOrderRecIter, &c.orderRecIter, c.ctx.maxRowCnt, c.ctx.decs.Ascending), nil
+	}
+
+	// Read the next ordered batch.
+	orderRec := c.recordPool.Get()
+	newRec, err := c.readData(true, orderRec)
+	if err != nil {
+		return nil, err
+	}
+	c.orderRecIter.init(newRec)
+
+	if c.orderRecIter.record == nil {
+		// Ordered stream exhausted: drain remaining out-of-order data in batches.
+		return c.nextUnorderedOnlyLazy()
+	}
+	watermark := c.orderRecIter.record.MaxTime(c.ctx.decs.Ascending)
+	if err := c.ensureUnorderedReadyUntil(watermark); err != nil {
+		return nil, err
+	}
+	return mergeData(&c.outOrderRecIter, &c.orderRecIter, c.ctx.maxRowCnt, c.ctx.decs.Ascending), nil
+}
+
+// ensureUnorderedReadyUntil admits all out-of-order rows with time <= watermark into
+// outOrderRecIter as a single merged batch. It is a no-op if the ready buffer still has rows.
+// All rows at or before the watermark must be admitted before mergeData runs, otherwise a later
+// out-of-order row could miss merging with an ordered row at the same timestamp.
+func (c *tsmMergeCursor) ensureUnorderedReadyUntil(watermark int64) error {
+	if c.lazyMerger == nil || c.outOrderRecIter.hasRemainData() {
+		return nil
+	}
+	c.ctx.decs.Set(c.ctx.decs.Ascending, c.ctx.tr, c.onlyFirstOrLast, c.ops)
+	c.ctx.decs.SetClosedSignal(c.ctx.closedSignal)
+	rec, err := c.lazyMerger.nextBatchUntil(watermark)
+	if err != nil {
+		return err
+	}
+	if rec != nil {
+		c.outOrderRecIter.init(rec)
+	}
+	return nil
+}
+
+// nextUnorderedOnlyLazy drains the remaining out-of-order data once the ordered stream is
+// exhausted, emitting it in maxRowCnt-sized batches.
+func (c *tsmMergeCursor) nextUnorderedOnlyLazy() (*record.Record, error) {
+	if c.lazyMerger == nil {
+		return nil, nil
+	}
+	if c.outOrderRecIter.hasRemainData() {
+		return mergeData(&c.outOrderRecIter, &c.orderRecIter, c.ctx.maxRowCnt, c.ctx.decs.Ascending), nil
+	}
+	if c.lazyMerger.allDone() {
+		return nil, nil
+	}
+	c.ctx.decs.Set(c.ctx.decs.Ascending, c.ctx.tr, c.onlyFirstOrLast, c.ops)
+	c.ctx.decs.SetClosedSignal(c.ctx.closedSignal)
+	rec, err := c.lazyMerger.nextBatch(nil, c.ctx.maxRowCnt)
+	if err != nil {
+		return nil, err
+	}
+	if rec == nil {
+		return nil, nil
+	}
+	c.outOrderRecIter.init(rec)
+	return mergeData(&c.outOrderRecIter, &c.orderRecIter, c.ctx.maxRowCnt, c.ctx.decs.Ascending), nil
+}
+
 func (c *tsmMergeCursor) reset() {
 	c.ctx = nil
 	c.span = nil
@@ -439,6 +571,8 @@ func (c *tsmMergeCursor) reset() {
 	c.lazyInit = false
 
 	c.rowFilters = nil
+
+	c.lazyMerger = nil
 
 	c.orderRecIter.reset()
 	// Reset the iters first so they drop references to any pool-held records (outRec may be a
@@ -518,6 +652,23 @@ func (c *tsmMergeCursor) FirstTimeInit() error {
 	}
 
 	if c.outOfOrderLocations.Len() == 0 {
+		return nil
+	}
+
+	// Lazy path: prepare the merger but do not read out-of-order data up front. Data is read in
+	// watermark-bounded batches from Next(). Falls back to the eager path below for any query
+	// shape not supported by the lazy merger.
+	if c.lazyUnorderedEnabled() {
+		if c.outOfOrderLocations.Len() > 1 {
+			sort.Sort(c.outOfOrderLocations)
+		}
+		c.ctx.decs.Set(c.ctx.decs.Ascending, c.ctx.tr, c.onlyFirstOrLast, c.ops)
+		c.lazyMerger = newLazyUnorderedMerger(c.ctx.schema, c.newFilterOpts(), c.outOfOrderLocations)
+		if c.span != nil {
+			c.span.Count(tsmIterCount, 1)
+			c.span.CreateCounter(unorderedLocationCount, "")
+			c.span.Count(unorderedLocationCount, int64(c.outOfOrderLocations.Len()))
+		}
 		return nil
 	}
 
