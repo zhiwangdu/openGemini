@@ -98,7 +98,14 @@ func benchCtx(ordered, unordered []immutable.TSSPFile) *idKeyCursorContext {
 // (AddLoc) is excluded via StopTimer so the measurement isolates the first-packet cost.
 func benchFirstPacket(b *testing.B, ordered, unordered []immutable.TSSPFile, lazy bool) {
 	SetLazyUnorderedMergeEnabled(lazy)
-	defer SetLazyUnorderedMergeEnabled(false)
+	prevThr := lazyUnorderedMergeMinLocations
+	if lazy {
+		lazyUnorderedMergeMinLocations = 0 // bypass the small-N threshold to measure the lazy path itself
+	}
+	defer func() {
+		SetLazyUnorderedMergeEnabled(false)
+		lazyUnorderedMergeMinLocations = prevThr
+	}()
 	b.ReportAllocs()
 	ctx := benchCtx(ordered, unordered)
 	for i := 0; i < b.N; i++ {
@@ -123,7 +130,14 @@ func benchFirstPacket(b *testing.B, ordered, unordered []immutable.TSSPFile, laz
 // benchTotal times draining the cursor to exhaustion (total query cost, not just first packet).
 func benchTotal(b *testing.B, ordered, unordered []immutable.TSSPFile, lazy bool) {
 	SetLazyUnorderedMergeEnabled(lazy)
-	defer SetLazyUnorderedMergeEnabled(false)
+	prevThr := lazyUnorderedMergeMinLocations
+	if lazy {
+		lazyUnorderedMergeMinLocations = 0 // bypass the small-N threshold to measure the lazy path itself
+	}
+	defer func() {
+		SetLazyUnorderedMergeEnabled(false)
+		lazyUnorderedMergeMinLocations = prevThr
+	}()
 	b.ReportAllocs()
 	ctx := benchCtx(ordered, unordered)
 	for i := 0; i < b.N; i++ {
@@ -178,7 +192,7 @@ func BenchmarkFirstPacket_FullOverlap(b *testing.B) {
 // no-overlap scenario. Both paths read all out-of-order data; the lazy path spreads the work
 // across batches. Shows the end-to-end cost including lazy planner overhead.
 func BenchmarkTotal_NoOverlap(b *testing.B) {
-	for _, n := range []int{10, 100} {
+	for _, n := range []int{10, 100, 1000} {
 		ordered, unordered := makeBenchFiles(n, 20, 1000)
 		b.Run(fmt.Sprintf("Eager_N%d", n), func(b *testing.B) { benchTotal(b, ordered, unordered, false) })
 		b.Run(fmt.Sprintf("Lazy_N%d", n), func(b *testing.B) { benchTotal(b, ordered, unordered, true) })

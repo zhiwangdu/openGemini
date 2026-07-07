@@ -363,7 +363,12 @@ func TestLazyUnorderedMergeDifferential(t *testing.T) {
 	runOne := func(c tc, lazy bool) []mergeRow {
 		if lazy {
 			SetLazyUnorderedMergeEnabled(true)
-			defer SetLazyUnorderedMergeEnabled(false)
+			prevThr := lazyUnorderedMergeMinLocations
+			lazyUnorderedMergeMinLocations = 0 // bypass the small-N threshold to exercise lazy
+			defer func() {
+				SetLazyUnorderedMergeEnabled(false)
+				lazyUnorderedMergeMinLocations = prevThr
+			}()
 		}
 		ordered := buildFiles(c.ordered, true)
 		unordered := buildFiles(c.unordered, false)
@@ -513,6 +518,9 @@ func TestLazyUnorderedMergeMultiSegment(t *testing.T) {
 		},
 	}
 
+	prevThr := lazyUnorderedMergeMinLocations
+	lazyUnorderedMergeMinLocations = 0 // bypass the small-N threshold to exercise lazy
+	defer func() { lazyUnorderedMergeMinLocations = prevThr }()
 	for _, c := range cases {
 		SetLazyUnorderedMergeEnabled(false)
 		eager := runMergeCursorForTest(t, schema, c.ordered, c.unordered, c.maxRows)

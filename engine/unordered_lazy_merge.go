@@ -15,7 +15,7 @@
 package engine
 
 import (
-	"sort"
+	"container/heap"
 
 	"github.com/openGemini/openGemini/engine/immutable"
 	"github.com/openGemini/openGemini/lib/record"
@@ -25,8 +25,9 @@ import (
 // single time-sorted, deduplicated stream, producing batches bounded by an ordered watermark.
 //
 // It replaces the eager chain merge in FirstTimeInit (which reads every matched out-of-order
-// location up front and folds them with repeated MergeRecord calls, O((K*B)^2) worst case) with
-// an O(rows*log-or-K) merge that only reads segments at or before the current watermark.
+// location up front and folds them with repeated MergeRecord calls, O(N^2 * R) for N files of R
+// rows) with a heap K-way merge that is O(M * log K) in the row count M = N*R, and that only
+// reads segments at or before the current watermark.
 //
 // Same-timestamp precedence matches the eager path: out-of-order files are sorted by sequence,
 // and at a duplicate timestamp the higher-sequence (newer) record's non-nil column wins, with
@@ -40,15 +41,41 @@ type lazyUnorderedMerger struct {
 	schema     record.Schemas
 	filterOpts *immutable.FilterOptions
 	sources    []*unorderedSource
+	heap       lazyMergerHeap
 	isAborted  func() bool
+	group      []*unorderedSource // reused scratch for same-time groups
 }
 
 type unorderedSource struct {
-	loc  *immutable.Location
-	seq  uint64
-	rec  *record.Record
-	pos  int
-	done bool
+	loc    *immutable.Location
+	seq    uint64
+	rec    *record.Record
+	pos    int
+	done   bool
+	inHeap bool
+}
+
+// lazyMergerHeap is a min-heap of sources by current row time, tie-broken by sequence descending
+// so that within a same-timestamp group the newest (highest-sequence) source is popped first.
+type lazyMergerHeap []*unorderedSource
+
+func (h lazyMergerHeap) Len() int { return len(h) }
+func (h lazyMergerHeap) Less(i, j int) bool {
+	ti := h[i].curTime()
+	tj := h[j].curTime()
+	if ti != tj {
+		return ti < tj
+	}
+	return h[i].seq > h[j].seq
+}
+func (h lazyMergerHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *lazyMergerHeap) Push(x any)   { *h = append(*h, x.(*unorderedSource)) }
+func (h *lazyMergerHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
 }
 
 func newLazyUnorderedMerger(schema record.Schemas, filterOpts *immutable.FilterOptions, locations *immutable.LocationCursor, isAborted func() bool) *lazyUnorderedMerger {
@@ -92,67 +119,59 @@ func (m *lazyUnorderedMerger) nextBatchUntil(watermark int64) (*record.Record, e
 // are emitted; if nil, all available rows are emitted (unordered-only fallback path).
 func (m *lazyUnorderedMerger) nextBatch(watermark *int64, maxRows int) (*record.Record, error) {
 	out := record.NewRecordBuilder(m.schema)
+	wm := m.watermarkOrMax(watermark)
+
+	// Admit once per call: read the next qualifying segment for every source that is idle (not in
+	// the heap, not done) and whose next segment is at or before the watermark. This is O(K) per
+	// call, not per row; per-row work below is O(log K) via the heap.
+	for _, s := range m.sources {
+		if s.inHeap || s.done || s.rec != nil {
+			continue
+		}
+		if err := m.admit(s, wm); err != nil {
+			return nil, err
+		}
+	}
+
 	for out.RowNums() < maxRows {
 		// If the query is aborted, stop merging and discard any partial batch so aborted rows
-		// are never returned to the caller. Source positions already advanced past appended
-		// rows are lost, which is fine: an aborted cursor is not consumed further and is reset
-		// (lazyMerger is nil'd) before reuse.
+		// are never returned to the caller. An aborted cursor is not consumed further and is
+		// reset (lazyMerger is nil'd) before reuse.
 		if m.isAborted != nil && m.isAborted() {
 			return nil, nil
 		}
-		// Admit/refill: read the next qualifying segment for every source that needs one.
-		for _, s := range m.sources {
-			if s.rec != nil || s.done {
-				continue
-			}
-			rec, err := s.readNext(m.filterOpts, m.schema, m.watermarkOrMax(watermark))
-			if err != nil {
-				return nil, err
-			}
-			if rec != nil {
-				s.rec = rec
-				s.pos = 0
-			} else if !s.loc.HasNext() {
-				s.done = true
-			}
+		if m.heap.Len() == 0 {
+			break // all sources done or deferred beyond the watermark
+		}
+		top := m.heap[0]
+		t := top.curTime()
+		if watermark != nil && t > *watermark {
+			break // remaining rows are beyond the watermark; defer to a later batch
 		}
 
-		// Find the minimum current time across live sources.
-		var minT int64
-		hasAny := false
-		for _, s := range m.sources {
-			if s.rec == nil {
-				continue
-			}
-			t := s.curTime()
-			if !hasAny || t < minT {
-				minT = t
-				hasAny = true
-			}
+		// Pop the same-time group (all heap-top sources whose current row == t). The heap's
+		// seq-desc tie-break makes group[0] the newest, matching mergeRecRow folded newest-to-oldest.
+		group := m.group[:0]
+		for m.heap.Len() > 0 && m.heap[0].curTime() == t {
+			s := heap.Pop(&m.heap).(*unorderedSource)
+			s.inHeap = false
+			group = append(group, s)
 		}
-		if !hasAny {
-			break // all sources done or deferred
-		}
-		if watermark != nil && minT > *watermark {
-			break // remaining rows are beyond the watermark; defer
-		}
+		appendMergedSameTimeRow(out, group, t)
+		m.group = group // keep the scratch slice for reuse
 
-		// Collect the same-time group (all live sources whose current row == minT), newest
-		// sequence first so column-level nil fill matches mergeRecRow folded newest-to-oldest.
-		group := make([]*unorderedSource, 0)
-		for _, s := range m.sources {
-			if s.rec != nil && s.curTime() == minT {
-				group = append(group, s)
-			}
-		}
-		sort.Slice(group, func(i, j int) bool { return group[i].seq > group[j].seq })
-		appendMergedSameTimeRow(out, group, minT)
-
-		// Advance each grouped source; exhausted records are refilled on the next loop pass.
+		// Advance each grouped source; exhausted sources are refilled inline (O(log K) per source)
+		// so the per-row cost stays logarithmic in K rather than scanning all sources.
 		for _, s := range group {
 			s.pos++
 			if s.pos >= s.rec.RowNums() {
 				s.rec = nil
+				if err := m.admit(s, wm); err != nil {
+					return nil, err
+				}
+			} else {
+				s.inHeap = true
+				heap.Push(&m.heap, s)
 			}
 		}
 	}
@@ -160,6 +179,26 @@ func (m *lazyUnorderedMerger) nextBatch(watermark *int64, maxRows int) (*record.
 		return nil, nil
 	}
 	return out, nil
+}
+
+// admit reads the next qualifying segment for a source and pushes it into the heap. If the
+// source is deferred (next segment beyond the watermark) it is left idle for a later call; if
+// exhausted it is marked done.
+func (m *lazyUnorderedMerger) admit(s *unorderedSource, watermark int64) error {
+	rec, err := s.readNext(m.filterOpts, m.schema, watermark)
+	if err != nil {
+		return err
+	}
+	if rec != nil {
+		s.rec = rec
+		s.pos = 0
+		s.inHeap = true
+		heap.Push(&m.heap, s)
+	} else if !s.loc.HasNext() {
+		s.done = true
+	}
+	// else: deferred beyond the watermark; leave idle (inHeap=false, rec=nil).
+	return nil
 }
 
 func (m *lazyUnorderedMerger) watermarkOrMax(watermark *int64) int64 {
@@ -173,7 +212,7 @@ func (m *lazyUnorderedMerger) watermarkOrMax(watermark *int64) int64 {
 // allDone reports whether every source is exhausted (no more data to admit).
 func (m *lazyUnorderedMerger) allDone() bool {
 	for _, s := range m.sources {
-		if s.rec != nil || !s.done {
+		if s.rec != nil || s.inHeap || !s.done {
 			return false
 		}
 	}

@@ -88,6 +88,21 @@ type tsmMergeCursor struct {
 	lazyMerger *lazyUnorderedMerger
 }
 
+// lazyUnorderedMergeMinLocations is the minimum number of matched out-of-order locations for the
+// lazy path to be worth using. Below this, the eager chain merge is cheaper (its O(N^2*R) cost
+// is small for small N) and the lazy heap/merge overhead would regress total query time. The
+// threshold is conservative so the lazy path never regresses the small-N common case; it wins
+// on both time and memory once out-of-order files are numerous (the scenario the optimization
+// targets). 0 disables the threshold (always use lazy when the flag is on) - intended for tests.
+// See BenchmarkTotal_NoOverlap for the crossover.
+var lazyUnorderedMergeMinLocations int32 = 64
+
+// SetLazyUnorderedMergeMinLocations tunes the minimum out-of-order location count for the lazy
+// path. Intended to be set once at startup.
+func SetLazyUnorderedMergeMinLocations(n int32) {
+	atomic.StoreInt32(&lazyUnorderedMergeMinLocations, n)
+}
+
 // lazyUnorderedEnabled reports whether the lazy out-of-order merge path should be used for the
 // current cursor. It is restricted to ascending non-aggregate reads without limit-cut or Prom
 // semantics; every other shape falls back to the eager path.
@@ -103,6 +118,11 @@ func (c *tsmMergeCursor) lazyUnorderedEnabled() bool {
 	}
 	opt := c.ctx.querySchema.Options()
 	if opt.IsPromQuery() || opt.IsPromRemoteRead() {
+		return false
+	}
+	// Only worth the lazy heap merge when there are enough out-of-order locations; otherwise the
+	// eager path is faster and the memory saving is negligible.
+	if min := atomic.LoadInt32(&lazyUnorderedMergeMinLocations); min > 0 && int32(c.outOfOrderLocations.Len()) < min {
 		return false
 	}
 	return true
