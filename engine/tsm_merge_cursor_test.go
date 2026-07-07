@@ -421,3 +421,106 @@ func randomRows(rng *rand.Rand, n int) []mocRow {
 	}
 	return rows
 }
+
+// mocTsspFileMultiSeg models a file with multiple segments, each with its own rows and time
+// range, so ReadDataBeforeWatermark's per-segment skip/defer logic can be exercised.
+type mocTsspFileMultiSeg struct {
+	MocTsspFile
+	segs  [][]mocRow
+	order bool
+	seq   uint64
+}
+
+func (m mocTsspFileMultiSeg) IsOrder() bool                      { return m.order }
+func (m mocTsspFileMultiSeg) LevelAndSequence() (uint16, uint64) { return 0, m.seq }
+
+func (m mocTsspFileMultiSeg) ChunkMeta(id uint64, offset int64, size, itemCount uint32, metaIdx int, ctx *immutable.ChunkMetaContext, ioPriority int) (*immutable.ChunkMeta, error) {
+	if id == 0527 {
+		ranges := make([]immutable.SegmentRange, len(m.segs))
+		for i, seg := range m.segs {
+			ranges[i] = immutable.SegmentRange{seg[0].t, seg[len(seg)-1].t}
+		}
+		return immutable.NewChunkMetaWithSegs(0527, ranges), nil
+	}
+	return nil, nil
+}
+
+func (m mocTsspFileMultiSeg) ReadAt(cm *immutable.ChunkMeta, segment int, dst *record.Record, decs *immutable.ReadContext, ioPriority int) (*record.Record, error) {
+	if segment < 0 || segment >= len(m.segs) {
+		return nil, nil
+	}
+	for _, r := range m.segs[segment] {
+		if r.nilV {
+			dst.ColVals[0].AppendIntegerNull()
+		} else {
+			dst.ColVals[0].AppendInteger(r.v)
+		}
+		dst.AppendTime(r.t)
+	}
+	return dst, nil
+}
+
+// TestLazyUnorderedMergeMultiSegment exercises ReadDataBeforeWatermark's per-segment skip/defer
+// behavior with multi-segment files, where some segments fall at or before the ordered
+// watermark and later segments must be deferred until the watermark advances. The eager path
+// (oracle) reads every segment up front; the lazy path must produce identical output.
+func TestLazyUnorderedMergeMultiSegment(t *testing.T) {
+	schema := record.Schemas{
+		{Type: influx.Field_Type_Int, Name: "value"},
+		{Type: influx.Field_Type_Int, Name: record.TimeField},
+	}
+
+	cases := []struct {
+		name      string
+		ordered   []immutable.TSSPFile
+		unordered []immutable.TSSPFile
+		maxRows   int
+	}{
+		{
+			name:    "multiseg_deferred_per_watermark",
+			ordered: []immutable.TSSPFile{mocTsspFileWithData{rows: []mocRow{{t: 1, v: 1}, {t: 6, v: 6}, {t: 11, v: 11}}, order: true, seq: 1}},
+			unordered: []immutable.TSSPFile{
+				mocTsspFileMultiSeg{segs: [][]mocRow{
+					{{t: 2, v: 20}, {t: 3, v: 30}},
+					{{t: 5, v: 50}, {t: 7, v: 70}},
+					{{t: 10, v: 100}, {t: 12, v: 120}},
+				}, seq: 2},
+			},
+			maxRows: 100,
+		},
+		{
+			name:    "multiseg_small_batch",
+			ordered: []immutable.TSSPFile{mocTsspFileWithData{rows: []mocRow{{t: 1, v: 1}, {t: 8, v: 8}}, order: true, seq: 1}},
+			unordered: []immutable.TSSPFile{
+				mocTsspFileMultiSeg{segs: [][]mocRow{
+					{{t: 2, v: 2}},
+					{{t: 4, v: 4}},
+					{{t: 6, v: 6}},
+				}, seq: 2},
+			},
+			maxRows: 2,
+		},
+		{
+			name:    "multiseg_overlap_at_boundary",
+			ordered: []immutable.TSSPFile{mocTsspFileWithData{rows: []mocRow{{t: 5, v: 5}}, order: true, seq: 1}},
+			unordered: []immutable.TSSPFile{
+				mocTsspFileMultiSeg{segs: [][]mocRow{
+					{{t: 1, v: 1}, {t: 5, v: 99}}, // t=5 overlaps ordered; unordered wins
+					{{t: 9, v: 9}},
+				}, seq: 2},
+			},
+			maxRows: 100,
+		},
+	}
+
+	for _, c := range cases {
+		SetLazyUnorderedMergeEnabled(false)
+		eager := runMergeCursorForTest(t, schema, c.ordered, c.unordered, c.maxRows)
+		SetLazyUnorderedMergeEnabled(true)
+		lazy := runMergeCursorForTest(t, schema, c.ordered, c.unordered, c.maxRows)
+		SetLazyUnorderedMergeEnabled(false)
+		if !reflect.DeepEqual(eager, lazy) {
+			t.Errorf("case %q mismatch\neager: %v\nlazy:  %v", c.name, eager, lazy)
+		}
+	}
+}

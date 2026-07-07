@@ -40,6 +40,7 @@ type lazyUnorderedMerger struct {
 	schema     record.Schemas
 	filterOpts *immutable.FilterOptions
 	sources    []*unorderedSource
+	isAborted  func() bool
 }
 
 type unorderedSource struct {
@@ -50,8 +51,8 @@ type unorderedSource struct {
 	done bool
 }
 
-func newLazyUnorderedMerger(schema record.Schemas, filterOpts *immutable.FilterOptions, locations *immutable.LocationCursor) *lazyUnorderedMerger {
-	m := &lazyUnorderedMerger{schema: schema, filterOpts: filterOpts}
+func newLazyUnorderedMerger(schema record.Schemas, filterOpts *immutable.FilterOptions, locations *immutable.LocationCursor, isAborted func() bool) *lazyUnorderedMerger {
+	m := &lazyUnorderedMerger{schema: schema, filterOpts: filterOpts, isAborted: isAborted}
 	for i := 0; i < locations.Len(); i++ {
 		loc := locations.LocationAt(i)
 		_, seq := loc.Sequence()
@@ -92,6 +93,11 @@ func (m *lazyUnorderedMerger) nextBatchUntil(watermark int64) (*record.Record, e
 func (m *lazyUnorderedMerger) nextBatch(watermark *int64, maxRows int) (*record.Record, error) {
 	out := record.NewRecordBuilder(m.schema)
 	for out.RowNums() < maxRows {
+		// Stop merging if the query has been aborted; partial output is discarded by the caller
+		// when it observes the abort.
+		if m.isAborted != nil && m.isAborted() {
+			break
+		}
 		// Admit/refill: read the next qualifying segment for every source that needs one.
 		for _, s := range m.sources {
 			if s.rec != nil || s.done {
