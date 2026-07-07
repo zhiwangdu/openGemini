@@ -72,10 +72,11 @@ func TestNotAddLocationsWithLimit(t *testing.T) {
 	assert2.Equal(t, 2, l.Len())
 }
 
-// TestFirstTimeInitNilOutRecNoPanic verifies that FirstTimeInit does not panic when every
-// matched out-of-order location yields a nil record (here the mock ReadAt returns nil).
-// Previously the span-count path called outRec.RowNums() on a nil outRec and panicked.
-func TestFirstTimeInitNilOutRecNoPanic(t *testing.T) {
+// TestFirstTimeInitEmptyOutOfOrder exercises the path where every matched out-of-order location
+// yields a nil record (here the mock ReadAt returns nil), so outRec stays nil. record.RowNums is
+// nil-safe, so the span-count path returns 0 rows without error; Next returns nil. Also verifies
+// the unordered location/merge counters are recorded.
+func TestFirstTimeInitEmptyOutOfOrder(t *testing.T) {
 	files := []immutable.TSSPFile{mocTsspFileNilReadAt{MocTsspFile{}}}
 	opt := &query.ProcessorOptions{Ascending: true, Limit: 100, StartTime: 0, EndTime: 10}
 	qs := &executor.QuerySchema{}
@@ -103,7 +104,7 @@ func TestFirstTimeInitNilOutRecNoPanic(t *testing.T) {
 	cursor.StartSpan(span)
 
 	// FirstTimeInit reads the matched out-of-order location, but the mock ReadAt returns nil,
-	// so outRec stays nil. The span-count path must not panic and Next must return nil.
+	// so outRec stays nil. RowNums is nil-safe, so no error; Next returns nil.
 	rec, err := cursor.Next()
 	assert2.NoError(t, err)
 	assert2.Nil(t, rec)
