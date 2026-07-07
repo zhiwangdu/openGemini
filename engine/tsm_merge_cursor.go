@@ -17,6 +17,7 @@ package engine
 import (
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/openGemini/openGemini/engine/comm"
@@ -34,13 +35,16 @@ var tsmCursorPool = &sync.Pool{}
 // tsmMergeCursor_FirstTimeInit_unordered_analysis.md). Default off: the eager FirstTimeInit
 // full-read path is used. Enable to defer reading out-of-order data until the ordered
 // watermark advances, reducing first-packet latency and the chain-merge cost.
-var lazyUnorderedMergeEnabled bool
+//
+// It is an atomic because the setter may be called from a config/admin goroutine while query
+// goroutines read it in lazyUnorderedEnabled; prefer setting it once at startup.
+var lazyUnorderedMergeEnabled atomic.Bool
 
 // SetLazyUnorderedMergeEnabled toggles the lazy out-of-order merge path at runtime.
-func SetLazyUnorderedMergeEnabled(en bool) { lazyUnorderedMergeEnabled = en }
+func SetLazyUnorderedMergeEnabled(en bool) { lazyUnorderedMergeEnabled.Store(en) }
 
 // GetLazyUnorderedMergeEnabled reports whether the lazy out-of-order merge path is enabled.
-func GetLazyUnorderedMergeEnabled() bool { return lazyUnorderedMergeEnabled }
+func GetLazyUnorderedMergeEnabled() bool { return lazyUnorderedMergeEnabled.Load() }
 
 func getTsmCursor() *tsmMergeCursor {
 	v := tsmCursorPool.Get()
@@ -88,7 +92,7 @@ type tsmMergeCursor struct {
 // current cursor. It is restricted to ascending non-aggregate reads without limit-cut or Prom
 // semantics; every other shape falls back to the eager path.
 func (c *tsmMergeCursor) lazyUnorderedEnabled() bool {
-	if !lazyUnorderedMergeEnabled {
+	if !lazyUnorderedMergeEnabled.Load() {
 		return false
 	}
 	if len(c.ops) > 0 || !c.ctx.decs.Ascending {
@@ -288,6 +292,11 @@ func (c *tsmMergeCursor) ReInit(
 	c.outOrderRecIter.reset()
 	c.locations.Reset()
 	c.outOfOrderLocations.Reset()
+	// Reusing the cursor for a new series: the new series must re-initialize its own out-of-order
+	// data. Reset locationInit (so FirstTimeInit re-runs) and drop any stale lazyMerger, whose
+	// sources still reference the previous series' (now orphaned) locations.
+	c.locationInit = false
+	c.lazyMerger = nil
 	if err := c.AddLoc(); err != nil {
 		return false, err
 	}
@@ -314,6 +323,9 @@ func (c *tsmMergeCursor) ReInitWithShard(
 	c.outOrderRecIter.reset()
 	c.locations.Reset()
 	c.outOfOrderLocations.Reset()
+	// See ReInit: re-initialize out-of-order state for the new series.
+	c.locationInit = false
+	c.lazyMerger = nil
 	if !crossShard {
 		if err := c.AddLoc(); err != nil {
 			return false, err
@@ -663,7 +675,7 @@ func (c *tsmMergeCursor) FirstTimeInit() error {
 			sort.Sort(c.outOfOrderLocations)
 		}
 		c.ctx.decs.Set(c.ctx.decs.Ascending, c.ctx.tr, c.onlyFirstOrLast, c.ops)
-		c.lazyMerger = newLazyUnorderedMerger(c.ctx.schema, c.newFilterOpts(), c.outOfOrderLocations)
+		c.lazyMerger = newLazyUnorderedMerger(c.ctx.schema, c.newFilterOpts(), c.outOfOrderLocations, c.ctx.IsAborted)
 		if c.span != nil {
 			c.span.Count(tsmIterCount, 1)
 			c.span.CreateCounter(unorderedLocationCount, "")
