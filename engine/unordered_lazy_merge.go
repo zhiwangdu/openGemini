@@ -93,10 +93,12 @@ func (m *lazyUnorderedMerger) nextBatchUntil(watermark int64) (*record.Record, e
 func (m *lazyUnorderedMerger) nextBatch(watermark *int64, maxRows int) (*record.Record, error) {
 	out := record.NewRecordBuilder(m.schema)
 	for out.RowNums() < maxRows {
-		// Stop merging if the query has been aborted; partial output is discarded by the caller
-		// when it observes the abort.
+		// If the query is aborted, stop merging and discard any partial batch so aborted rows
+		// are never returned to the caller. Source positions already advanced past appended
+		// rows are lost, which is fine: an aborted cursor is not consumed further and is reset
+		// (lazyMerger is nil'd) before reuse.
 		if m.isAborted != nil && m.isAborted() {
-			break
+			return nil, nil
 		}
 		// Admit/refill: read the next qualifying segment for every source that needs one.
 		for _, s := range m.sources {
