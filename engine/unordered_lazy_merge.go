@@ -35,14 +35,15 @@ import (
 // same-time group from newest to oldest. All input records share ctx.schema, so column indices
 // align directly.
 //
-// Only ascending non-aggregate reads are supported; other query shapes fall back to the eager
-// path. Correctness is validated by differential testing against the eager path.
+// Non-aggregate reads (ascending and descending) are supported; other query shapes fall back
+// to the eager path. Correctness is validated by differential testing against the eager path.
 type lazyUnorderedMerger struct {
 	schema     record.Schemas
 	filterOpts *immutable.FilterOptions
 	sources    []*unorderedSource
 	heap       lazyMergerHeap
 	isAborted  func() bool
+	ascending  bool
 	group      []*unorderedSource // reused scratch for same-time groups
 }
 
@@ -55,31 +56,45 @@ type unorderedSource struct {
 	inHeap bool
 }
 
-// lazyMergerHeap is a min-heap of sources by current row time, tie-broken by sequence descending
+// lazyMergerHeap is a heap of sources by current row time, tie-broken by sequence descending
 // so that within a same-timestamp group the newest (highest-sequence) source is popped first.
-type lazyMergerHeap []*unorderedSource
-
-func (h lazyMergerHeap) Len() int { return len(h) }
-func (h lazyMergerHeap) Less(i, j int) bool {
-	ti := h[i].curTime()
-	tj := h[j].curTime()
-	if ti != tj {
-		return ti < tj
-	}
-	return h[i].seq > h[j].seq
+// For ascending it is a min-heap (smallest time pops first); for descending a max-heap
+// (largest time pops first).
+type lazyMergerHeap struct {
+	items     []*unorderedSource
+	ascending bool
 }
-func (h lazyMergerHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
-func (h *lazyMergerHeap) Push(x any)   { *h = append(*h, x.(*unorderedSource)) }
+
+func (h lazyMergerHeap) Len() int { return len(h.items) }
+func (h lazyMergerHeap) Less(i, j int) bool {
+	ti := h.items[i].curTime()
+	tj := h.items[j].curTime()
+	if ti != tj {
+		if h.ascending {
+			return ti < tj
+		}
+		return ti > tj
+	}
+	return h.items[i].seq > h.items[j].seq
+}
+func (h *lazyMergerHeap) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
+func (h *lazyMergerHeap) Push(x any)    { h.items = append(h.items, x.(*unorderedSource)) }
 func (h *lazyMergerHeap) Pop() any {
-	old := *h
+	old := h.items
 	n := len(old)
 	x := old[n-1]
-	*h = old[:n-1]
+	h.items = old[:n-1]
 	return x
 }
 
-func newLazyUnorderedMerger(schema record.Schemas, filterOpts *immutable.FilterOptions, locations *immutable.LocationCursor, isAborted func() bool) *lazyUnorderedMerger {
-	m := &lazyUnorderedMerger{schema: schema, filterOpts: filterOpts, isAborted: isAborted}
+func newLazyUnorderedMerger(schema record.Schemas, filterOpts *immutable.FilterOptions, locations *immutable.LocationCursor, isAborted func() bool, ascending bool) *lazyUnorderedMerger {
+	m := &lazyUnorderedMerger{
+		schema:     schema,
+		filterOpts: filterOpts,
+		isAborted:  isAborted,
+		ascending:  ascending,
+		heap:       lazyMergerHeap{ascending: ascending},
+	}
 	for i := 0; i < locations.Len(); i++ {
 		loc := locations.LocationAt(i)
 		_, seq := loc.Sequence()
@@ -132,7 +147,7 @@ func (m *lazyUnorderedMerger) nextBatch(watermark *int64, maxRows int) (*record.
 		if m.heap.Len() == 0 {
 			break // all sources done or deferred beyond the watermark
 		}
-		top := m.heap[0]
+		top := m.heap.items[0]
 		t := top.curTime()
 		if watermark != nil && t > *watermark {
 			break // remaining rows are beyond the watermark; defer to a later batch
@@ -141,7 +156,7 @@ func (m *lazyUnorderedMerger) nextBatch(watermark *int64, maxRows int) (*record.
 		// Pop the same-time group (all heap-top sources whose current row == t). The heap's
 		// seq-desc tie-break makes group[0] the newest, matching mergeRecRow folded newest-to-oldest.
 		group := m.group[:0]
-		for m.heap.Len() > 0 && m.heap[0].curTime() == t {
+		for m.heap.Len() > 0 && m.heap.items[0].curTime() == t {
 			s := heap.Pop(&m.heap).(*unorderedSource)
 			s.inHeap = false
 			group = append(group, s)

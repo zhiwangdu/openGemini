@@ -216,13 +216,26 @@ func (m mocTsspFileWithData) ChunkMeta(id uint64, offset int64, size, itemCount 
 }
 
 func (m mocTsspFileWithData) ReadAt(cm *immutable.ChunkMeta, segment int, dst *record.Record, decs *immutable.ReadContext, ioPriority int) (*record.Record, error) {
+	// Real TSSP ReadAt reverses column data for descending queries (reader.go reverseValues).
+	if decs != nil && !decs.Ascending {
+		for i := len(m.rows) - 1; i >= 0; i-- {
+			r := m.rows[i]
+			if r.nilV {
+				dst.ColVals[0].AppendIntegerNull()
+			} else {
+				dst.ColVals[0].AppendInteger(r.v)
+			}
+			dst.AppendTime(r.t)
+		}
+		return dst, nil
+	}
 	for _, r := range m.rows {
 		if r.nilV {
-			dst.ColVals[0].AppendIntegerNull() // value column
+			dst.ColVals[0].AppendIntegerNull()
 		} else {
 			dst.ColVals[0].AppendInteger(r.v)
 		}
-		dst.AppendTime(r.t) // time column (last)
+		dst.AppendTime(r.t)
 	}
 	return dst, nil
 }
@@ -239,15 +252,19 @@ type mergeRow struct {
 // drains it to exhaustion, collecting (time, value, isNil) rows. maxRowCnt is intentionally
 // configurable so callers can force small batches to exercise ready-buffer ownership.
 func runMergeCursorForTest(t *testing.T, schema record.Schemas, ordered, unordered []immutable.TSSPFile, maxRowCnt int) []mergeRow {
+	return runMergeCursorForTestDir(t, schema, ordered, unordered, maxRowCnt, true)
+}
+
+func runMergeCursorForTestDir(t *testing.T, schema record.Schemas, ordered, unordered []immutable.TSSPFile, maxRowCnt int, ascending bool) []mergeRow {
 	t.Helper()
-	opt := &query.ProcessorOptions{Ascending: true, StartTime: 0, EndTime: 1 << 30}
+	opt := &query.ProcessorOptions{Ascending: ascending, StartTime: 0, EndTime: 1 << 30}
 	qs := &executor.QuerySchema{}
 	qs.SetOpt(opt)
 	closedSignal := false
 	ctx := &idKeyCursorContext{
 		schema:       schema,
 		querySchema:  qs,
-		decs:         immutable.NewReadContext(true),
+		decs:         immutable.NewReadContext(ascending),
 		tr:           util.TimeRange{Min: 0, Max: 1 << 30},
 		tmsMergePool: TsmMergePool,
 		maxRowCnt:    maxRowCnt,
@@ -362,11 +379,11 @@ func TestLazyUnorderedMergeDifferential(t *testing.T) {
 		},
 	}
 
-	runOne := func(c tc, lazy bool) []mergeRow {
+	runOne := func(c tc, lazy, ascending bool) []mergeRow {
 		if lazy {
 			SetLazyUnorderedMergeEnabled(true)
 			prevThr := lazyUnorderedMergeMinLocations
-			lazyUnorderedMergeMinLocations = 0 // bypass the small-N threshold to exercise lazy
+			lazyUnorderedMergeMinLocations = 0
 			defer func() {
 				SetLazyUnorderedMergeEnabled(false)
 				lazyUnorderedMergeMinLocations = prevThr
@@ -374,36 +391,45 @@ func TestLazyUnorderedMergeDifferential(t *testing.T) {
 		}
 		ordered := buildFiles(c.ordered, true)
 		unordered := buildFiles(c.unordered, false)
-		return runMergeCursorForTest(t, schema, ordered, unordered, c.maxRows)
+		return runMergeCursorForTestDir(t, schema, ordered, unordered, c.maxRows, ascending)
 	}
 
-	for _, c := range cases {
-		eager := runOne(c, false)
-		lazy := runOne(c, true)
-		if !reflect.DeepEqual(eager, lazy) {
-			t.Errorf("case %q mismatch\neager: %v\nlazy:  %v", c.name, eager, lazy)
+	for _, dir := range []struct {
+		name string
+		asc  bool
+	}{{"asc", true}, {"desc", false}} {
+		for _, c := range cases {
+			eager := runOne(c, false, dir.asc)
+			lazy := runOne(c, true, dir.asc)
+			if !reflect.DeepEqual(eager, lazy) {
+				t.Errorf("[%s] case %q mismatch\neager: %v\nlazy:  %v", dir.name, c.name, eager, lazy)
+			}
 		}
 	}
 
 	// Randomized differential testing on the real (disjoint) layout: unordered times in [1,20],
-	// ordered times in [21,40]. Unordered files may overlap each other (dedup tested); ordered
-	// and unordered never overlap (matches SplitRecordByTime's flush boundary).
-	rng := rand.New(rand.NewSource(20240706))
-	for iter := 0; iter < 3000; iter++ {
-		c := tc{maxRows: 1 + rng.Intn(4)}
-		nOrd := rng.Intn(3)
-		for i := 0; i < nOrd; i++ {
-			c.ordered = append(c.ordered, randomRows(rng, 1+rng.Intn(4), 21, 40))
-		}
-		nUnord := 1 + rng.Intn(4)
-		for i := 0; i < nUnord; i++ {
-			c.unordered = append(c.unordered, randomRows(rng, 1+rng.Intn(4), 1, 20))
-		}
-		eager := runOne(c, false)
-		lazy := runOne(c, true)
-		if !reflect.DeepEqual(eager, lazy) {
-			t.Errorf("random case %d mismatch (ordered=%v unordered=%v maxRows=%d)\neager: %v\nlazy:  %v",
-				iter, c.ordered, c.unordered, c.maxRows, eager, lazy)
+	// ordered times in [21,40]. Both ascending and descending.
+	for _, dir := range []struct {
+		name string
+		asc  bool
+	}{{"asc", true}, {"desc", false}} {
+		rng := rand.New(rand.NewSource(20240706))
+		for iter := 0; iter < 3000; iter++ {
+			c := tc{maxRows: 1 + rng.Intn(4)}
+			nOrd := rng.Intn(3)
+			for i := 0; i < nOrd; i++ {
+				c.ordered = append(c.ordered, randomRows(rng, 1+rng.Intn(4), 21, 40))
+			}
+			nUnord := 1 + rng.Intn(4)
+			for i := 0; i < nUnord; i++ {
+				c.unordered = append(c.unordered, randomRows(rng, 1+rng.Intn(4), 1, 20))
+			}
+			eager := runOne(c, false, dir.asc)
+			lazy := runOne(c, true, dir.asc)
+			if !reflect.DeepEqual(eager, lazy) {
+				t.Errorf("[%s] random case %d mismatch (ordered=%v unordered=%v maxRows=%d)\neager: %v\nlazy:  %v",
+					dir.name, iter, c.ordered, c.unordered, c.maxRows, eager, lazy)
+			}
 		}
 	}
 }
@@ -459,7 +485,20 @@ func (m mocTsspFileMultiSeg) ReadAt(cm *immutable.ChunkMeta, segment int, dst *r
 	if segment < 0 || segment >= len(m.segs) {
 		return nil, nil
 	}
-	for _, r := range m.segs[segment] {
+	rows := m.segs[segment]
+	if decs != nil && !decs.Ascending {
+		for i := len(rows) - 1; i >= 0; i-- {
+			r := rows[i]
+			if r.nilV {
+				dst.ColVals[0].AppendIntegerNull()
+			} else {
+				dst.ColVals[0].AppendInteger(r.v)
+			}
+			dst.AppendTime(r.t)
+		}
+		return dst, nil
+	}
+	for _, r := range rows {
 		if r.nilV {
 			dst.ColVals[0].AppendIntegerNull()
 		} else {

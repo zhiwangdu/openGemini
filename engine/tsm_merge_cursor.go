@@ -110,7 +110,7 @@ func (c *tsmMergeCursor) lazyUnorderedEnabled() bool {
 	if !lazyUnorderedMergeEnabled.Load() {
 		return false
 	}
-	if len(c.ops) > 0 || !c.ctx.decs.Ascending {
+	if len(c.ops) > 0 {
 		return false
 	}
 	if c.ctx.querySchema.CanLimitCut() {
@@ -504,41 +504,61 @@ func (c *tsmMergeCursor) Next() (*record.Record, error) {
 // nextLazy drives the lazy out-of-order merge path: heap K-way merge of the out-of-order
 // locations, streamed in maxRowCnt-sized batches, with no watermark.
 //
-// openGemini's out-of-order data is older than the ordered data (SplitRecordByTime at flush splits
-// at the persisted ordered max; unordered = time <= that max). The two are time-disjoint, so an
-// ascending query's output is simply unordered(older) -> ordered(newer). nextLazy therefore emits
-// all out-of-order data first (in maxRowCnt batches via the heap merger) and only then reads and
-// emits the ordered data. No watermark/deferral is needed (or possible) for ascending; the win is
-// the heap merge (O(M logK) vs eager chain O(N^2 R)) plus a bounded output batch.
+// openGemini's out-of-order data is older than the ordered data (SplitRecordByTime at flush).
+// The two are time-disjoint. For ascending, output = unordered(older) -> ordered(newer), so
+// Phase 1 streams unordered then Phase 2 reads ordered. For descending the order is reversed:
+// Phase 1 reads ordered (newer, output first), Phase 2 streams unordered (older).
 //
-// Correctness relies on the disjoint layout. If unordered and ordered ever overlap in time this
-// ordering would be wrong; lazyUnorderedEnabled keeps this path off for non-ascending/aggregate/
-// limit-cut/Prom shapes, and the disjoint property holds for normal writes.
+// The underlying data scanning (segment reads, filtering) is direction-agnostic — Location's
+// internal !Ascending branches handle segment iteration direction and FilterByTime(Descend).
+// The heap's Less flips time comparison by the ascending flag. appendMergedSameTimeRow is
+// direction-independent (same-time merge by seq precedence).
 func (c *tsmMergeCursor) nextLazy() (*record.Record, error) {
 	if c.ctx.IsAborted() {
 		return nil, nil
 	}
 
-	// Phase 1: stream out-of-order data (older) in maxRowCnt-sized batches. The heap merger holds
-	// only one segment per source at a time, so peak live memory is K*segmentSize + maxRowCnt
-	// rather than eager's full outRec.
-	if c.lazyMerger != nil && !c.lazyMerger.allDone() {
-		if c.outOrderRecIter.hasRemainData() {
-			return mergeData(&c.outOrderRecIter, &c.orderRecIter, c.ctx.maxRowCnt, c.ctx.decs.Ascending), nil
+	if c.ctx.decs.Ascending {
+		// Ascending: unordered (older) first, then ordered (newer).
+		if c.lazyMerger != nil && !c.lazyMerger.allDone() {
+			if rec, err := c.nextLazyUnorderedBatch(); err != nil || rec != nil {
+				return rec, err
+			}
 		}
-		c.ctx.decs.Set(c.ctx.decs.Ascending, c.ctx.tr, c.onlyFirstOrLast, c.ops)
-		c.ctx.decs.SetClosedSignal(c.ctx.closedSignal)
-		rec, err := c.lazyMerger.nextBatch(nil, c.ctx.maxRowCnt)
-		if err != nil {
-			return nil, err
-		}
-		if rec != nil {
-			c.outOrderRecIter.init(rec)
-			return mergeData(&c.outOrderRecIter, &c.orderRecIter, c.ctx.maxRowCnt, c.ctx.decs.Ascending), nil
-		}
+		return c.nextLazyOrdered()
 	}
 
-	// Phase 2: out-of-order exhausted, read and emit the ordered data (newer).
+	// Descending: ordered (newer) first, then unordered (older).
+	if rec, err := c.nextLazyOrdered(); err != nil || rec != nil {
+		return rec, err
+	}
+	if c.lazyMerger != nil && !c.lazyMerger.allDone() {
+		return c.nextLazyUnorderedBatch()
+	}
+	return nil, nil
+}
+
+// nextLazyUnorderedBatch streams one maxRowCnt-sized batch of out-of-order data via the heap
+// merger into outOrderRecIter, then merges it via mergeData.
+func (c *tsmMergeCursor) nextLazyUnorderedBatch() (*record.Record, error) {
+	if c.outOrderRecIter.hasRemainData() {
+		return mergeData(&c.outOrderRecIter, &c.orderRecIter, c.ctx.maxRowCnt, c.ctx.decs.Ascending), nil
+	}
+	c.ctx.decs.Set(c.ctx.decs.Ascending, c.ctx.tr, c.onlyFirstOrLast, c.ops)
+	c.ctx.decs.SetClosedSignal(c.ctx.closedSignal)
+	rec, err := c.lazyMerger.nextBatch(nil, c.ctx.maxRowCnt)
+	if err != nil {
+		return nil, err
+	}
+	if rec != nil {
+		c.outOrderRecIter.init(rec)
+		return mergeData(&c.outOrderRecIter, &c.orderRecIter, c.ctx.maxRowCnt, c.ctx.decs.Ascending), nil
+	}
+	return nil, nil
+}
+
+// nextLazyOrdered reads the next ordered batch and merges it via mergeData.
+func (c *tsmMergeCursor) nextLazyOrdered() (*record.Record, error) {
 	if !c.orderRecIter.hasRemainData() {
 		orderRec := c.recordPool.Get()
 		newRec, err := c.readData(true, orderRec)
@@ -664,7 +684,7 @@ func (c *tsmMergeCursor) FirstTimeInit() error {
 			sort.Sort(c.outOfOrderLocations)
 		}
 		c.ctx.decs.Set(c.ctx.decs.Ascending, c.ctx.tr, c.onlyFirstOrLast, c.ops)
-		c.lazyMerger = newLazyUnorderedMerger(c.ctx.schema, c.newFilterOpts(), c.outOfOrderLocations, c.ctx.IsAborted)
+		c.lazyMerger = newLazyUnorderedMerger(c.ctx.schema, c.newFilterOpts(), c.outOfOrderLocations, c.ctx.IsAborted, c.ctx.decs.Ascending)
 		if c.span != nil {
 			c.span.Count(tsmIterCount, 1)
 			c.span.CreateCounter(unorderedLocationCount, "")

@@ -277,14 +277,12 @@ func (l *Location) CurrentSegMinMax() (int64, int64) {
 }
 
 // ReadDataBeforeWatermark reads the next segment whose time range falls at or before watermark
-// (ascending) and overlaps the query time range, applying the same FilterByTime/FilterByField
-// as ReadData. Segments that do not overlap the query time range are skipped (advanced past);
-// the first segment strictly beyond the watermark is left in place and nil is returned so the
-// caller can defer it until the watermark advances. This bounds how much out-of-order data the
-// lazy unordered merge reads before the first packet.
+// and overlaps the query time range, applying the same FilterByTime/FilterByField as ReadData.
+// For ascending, segments with minT > watermark are deferred (left in place). For descending,
+// falls back to ReadData (which handles direction internally). The lazy merge path passes
+// watermark=maxInt64 (no deferral), so this is effectively a segment-by-segment ReadData.
 func (l *Location) ReadDataBeforeWatermark(filterOpts *FilterOptions, dst *record.Record, watermark int64) (*record.Record, error) {
 	if l.meta == nil || !l.ctx.Ascending {
-		// lazy unordered merge only supports ascending reads; fall back elsewhere.
 		return l.ReadData(filterOpts, dst, nil)
 	}
 	if !l.ctx.tr.Overlaps(l.meta.MinMaxTime()) {
