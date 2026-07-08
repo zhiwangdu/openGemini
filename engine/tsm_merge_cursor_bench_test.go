@@ -191,10 +191,62 @@ func BenchmarkFirstPacket_FullOverlap(b *testing.B) {
 // BenchmarkTotal_NoOverlap measures total drain time (all data eventually read) for the
 // no-overlap scenario. Both paths read all out-of-order data; the lazy path spreads the work
 // across batches. Shows the end-to-end cost including lazy planner overhead.
+//
+// NOTE: makeBenchFiles puts ordered EARLY (t=1..) and unordered LATE (t=1000+), which is the
+// OPPOSITE of openGemini's real layout (unordered is older, ordered is newer). It is kept only
+// as an algorithmic micro-bench. For the real-layout numbers see BenchmarkRealLayout_*.
 func BenchmarkTotal_NoOverlap(b *testing.B) {
 	for _, n := range []int{10, 100, 1000} {
 		ordered, unordered := makeBenchFiles(n, 20, 1000)
 		b.Run(fmt.Sprintf("Eager_N%d", n), func(b *testing.B) { benchTotal(b, ordered, unordered, false) })
 		b.Run(fmt.Sprintf("Lazy_N%d", n), func(b *testing.B) { benchTotal(b, ordered, unordered, true) })
+	}
+}
+
+// makeRealLayoutBenchFiles models openGemini's actual layout: ordered data is NEWER, unordered
+// data is OLDER (out-of-order writes carry older timestamps; SplitRecordByTime at flush splits at
+// the persisted ordered max). Ordered file covers [orderedStart, orderedStart+R); the N unordered
+// files cover the older range [1, N*R] < orderedStart.
+func makeRealLayoutBenchFiles(nUnordered, rowsPerFile int, orderedStart int64) ([]immutable.TSSPFile, []immutable.TSSPFile) {
+	orderedRows := make([]mocRow, rowsPerFile)
+	for i := 0; i < rowsPerFile; i++ {
+		orderedRows[i] = mocRow{t: orderedStart + int64(i), v: int64(i + 1)}
+	}
+	ordered := []immutable.TSSPFile{mocTsspFileWithData{rows: orderedRows, order: true, seq: 1}}
+
+	unordered := make([]immutable.TSSPFile, nUnordered)
+	for i := 0; i < nUnordered; i++ {
+		rows := make([]mocRow, rowsPerFile)
+		for j := 0; j < rowsPerFile; j++ {
+			// file i covers [i*R+1, (i+1)*R], all < orderedStart (older)
+			t := int64(i*rowsPerFile + j + 1)
+			rows[j] = mocRow{t: t, v: int64(i*1000 + j)}
+		}
+		unordered[i] = mocTsspFileWithData{rows: rows, order: false, seq: uint64(i + 1)}
+	}
+	return ordered, unordered
+}
+
+// BenchmarkRealLayout_Total measures total drain time under openGemini's real layout (unordered
+// older, ordered newer). For an ascending query the output is unordered(older) -> ordered(newer);
+// the lazy watermark = ordered batch max covers ALL older unordered, so lazy admits everything in
+// the first batch -> no deferral. Expected: lazy ~= eager (no 5x win; possibly worse from heap
+// overhead), confirming the ascending watermark design is broken for the real layout.
+func BenchmarkRealLayout_Total(b *testing.B) {
+	for _, n := range []int{10, 100, 1000} {
+		ordered, unordered := makeRealLayoutBenchFiles(n, 20, 1<<20) // ordered far in the future
+		b.Run(fmt.Sprintf("Eager_N%d", n), func(b *testing.B) { benchTotal(b, ordered, unordered, false) })
+		b.Run(fmt.Sprintf("Lazy_N%d", n), func(b *testing.B) { benchTotal(b, ordered, unordered, true) })
+	}
+}
+
+// BenchmarkRealLayout_FirstPacket measures the first Next() under the real layout. The lazy path
+// reads the ordered batch first (watermark = its max, which is the newest time), admits all older
+// unordered, and merges -> first packet cost ~= eager (reads all unordered up front).
+func BenchmarkRealLayout_FirstPacket(b *testing.B) {
+	for _, n := range []int{10, 100, 1000} {
+		ordered, unordered := makeRealLayoutBenchFiles(n, 20, 1<<20)
+		b.Run(fmt.Sprintf("Eager_N%d", n), func(b *testing.B) { benchFirstPacket(b, ordered, unordered, false) })
+		b.Run(fmt.Sprintf("Lazy_N%d", n), func(b *testing.B) { benchFirstPacket(b, ordered, unordered, true) })
 	}
 }
