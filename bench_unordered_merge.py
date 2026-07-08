@@ -288,17 +288,38 @@ class DataWriter:
         self.session = cluster.session
 
     def _ensure_db(self):
-        """Create database and retention policy."""
+        """Create database with a single-shard-group retention policy.
+
+        Uses SHARD DURATION 365d so all data (spanning a few hours) lands in one shard group,
+        avoiding cross-shard merge complexity that would contaminate the benchmark.
+        """
+        # Drop if exists
+        self.session.post(f"{SQL_URL}/query", data={"q": f"DROP DATABASE {DB_NAME}"}, timeout=30)
+        time.sleep(2)
+
+        # Create with explicit shard duration
+        create_sql = (f"CREATE DATABASE {DB_NAME} WITH DURATION 365d SHARD DURATION 365d "
+                      f"REPLICATION 1 NAME {RP_NAME}")
         for attempt in range(5):
-            resp = self.session.post(f"{SQL_URL}/query", data={"q": f"CREATE DATABASE {DB_NAME}"})
+            resp = self.session.post(f"{SQL_URL}/query", data={"q": create_sql}, timeout=10)
             if resp.status_code == 200:
-                # Verify the database exists
-                check = self.session.post(f"{SQL_URL}/query", data={"q": f"SHOW DATABASES"})
-                dbs = check.json().get("results", [{}])[0].get("series", [{}])[0].get("values", [])
-                if any(DB_NAME in (v if isinstance(v, list) else [v]) for v in dbs):
-                    print(f"[data] database {DB_NAME} ready")
+                # Wait for meta to propagate to store nodes
+                time.sleep(3)
+                # Verify by writing a test point with current timestamp
+                test_ts = int(time.time()) * 1_000_000_000
+                test_resp = self.session.post(
+                    f"{SQL_URL}/write?db={DB_NAME}&rp={RP_NAME}",
+                    data=f"_test,foo=bar v=1 {test_ts}",
+                    timeout=5,
+                )
+                if test_resp.status_code in (200, 204):
+                    print(f"[data] database {DB_NAME} ready (RP={RP_NAME}, shard duration=365d)")
                     return
-            time.sleep(1)
+                else:
+                    print(f"  [db] attempt {attempt+1}: write test failed: {test_resp.status_code} {test_resp.text}")
+            else:
+                print(f"  [db] attempt {attempt+1}: create failed: {resp.status_code} {resp.text[:100]}")
+            time.sleep(2)
         raise RuntimeError(f"failed to create database {DB_NAME}")
 
     def _write_batch(self, lines: List[str]):
@@ -320,48 +341,62 @@ class DataWriter:
         return f"{MST_NAME},{tags} {fields} {timestamp_ns}"
 
     def write_ordered(self):
-        """Write ordered data (newer timestamps). Each series gets rows_per_file rows."""
+        """Write ordered data (newer timestamps, AFTER all unordered)."""
         cfg = self.config
-        # Ordered: timestamps in [T_order_start, T_order_start + R)
-        # Placed AFTER unordered (newer), matching real layout.
-        t_order_start = 10_000_000_000  # far future relative to unordered (10s in ns)
+        # Use current time as base. Ordered starts right after unordered ends.
+        # Unordered occupies [now - N*R - 1, now - 1] seconds.
+        # Ordered occupies [now, now + R] seconds.
+        now_ns = int(time.time()) * 1_000_000_000
+        t_order_start_ns = now_ns
         lines = []
         for s in range(cfg.n_series):
             for r in range(cfg.rows_per_file):
-                ts = t_order_start + r * 1_000_000_000  # ns, increment 1s per row
+                ts = t_order_start_ns + r * 1_000_000_000  # ns, 1s per row
                 vals = [s * 1000 + r + 1] * cfg.n_fields
                 lines.append(self._make_line(s, ts, vals))
         self._write_batch(lines)
         self.cluster.flush_memtable()
-        print(f"[data] ordered: {len(lines)} rows ({cfg.n_series} series × {cfg.rows_per_file} rows)")
+        t_start_s = t_order_start_ns // 1_000_000_000
+        t_end_s = (t_order_start_ns + cfg.rows_per_file * 1_000_000_000) // 1_000_000_000
+        print(f"[data] ordered: {len(lines)} rows, timestamps [{t_start_s}, {t_end_s}] "
+              f"({cfg.n_series} series × {cfg.rows_per_file} rows)")
 
     def write_unordered(self):
         """Write N unordered batches (older timestamps), each flush = 1 unordered file."""
         cfg = self.config
-        t_base = 1_000_000_000  # unordered starts at 1s, ordered at 10000s → disjoint
+        # Unordered: timestamps go backwards from now-1. Each file gets R consecutive seconds.
+        # File 0: [now - R, now - 1], File 1: [now - 2R, now - R - 1], etc.
+        now_s = int(time.time())
+        t_base_ns = (now_s - cfg.n_unordered * cfg.rows_per_file - 1) * 1_000_000_000
         for i in range(cfg.n_unordered):
             lines = []
             for s in range(cfg.n_series):
                 for r in range(cfg.rows_per_file):
                     if cfg.overlap == "disjoint":
                         # Each file: distinct time range, no overlap with other files
-                        ts = t_base + (i * cfg.rows_per_file + r) * 1_000_000_000
+                        ts = t_base_ns + (i * cfg.rows_per_file + r) * 1_000_000_000
                     else:
                         # Overlapping: all files write to the same time range
-                        ts = t_base + r * 1_000_000_000
+                        ts = t_base_ns + r * 1_000_000_000
                     vals = [i * 10000 + s * 100 + r] * cfg.n_fields
                     lines.append(self._make_line(s, ts, vals))
             self._write_batch(lines)
             self.cluster.flush_memtable()
             if (i + 1) % 10 == 0 or i == 0:
                 print(f"[data] unordered file {i+1}/{cfg.n_unordered} written ({len(lines)} rows)")
-        print(f"[data] unordered: {cfg.n_unordered} files × {cfg.rows_per_file} rows × {cfg.n_series} series")
+        t_start_s = t_base_ns // 1_000_000_000
+        t_end_s = (t_base_ns + cfg.n_unordered * cfg.rows_per_file * 1_000_000_000) // 1_000_000_000
+        print(f"[data] unordered: {cfg.n_unordered} files × {cfg.rows_per_file} rows × "
+              f"{cfg.n_series} series, timestamps [{t_start_s}, {t_end_s}]")
 
     def write_all(self):
         self._ensure_db()
         self.write_ordered()
         self.write_unordered()
         print("[data] all data written and flushed")
+
+        # Verify single shard group
+        self._verify_single_shard_group()
 
         # Verify file count
         cfg = self.config
@@ -370,6 +405,31 @@ class DataWriter:
         if not ok:
             print("[data] WARNING: file count mismatch — compaction may have run during write")
         return ok
+
+    def _verify_single_shard_group(self):
+        """Verify all data landed in a single shard group."""
+        try:
+            resp = self.session.post(f"{SQL_URL}/query",
+                                     data={"q": f"SHOW SHARDS"}, timeout=10)
+            data = resp.json()
+            series = data.get("results", [{}])[0].get("series", [])
+            shard_ids = set()
+            for s in series:
+                if s.get("name") != DB_NAME:
+                    continue
+                for val in s.get("values", []):
+                    # val: [id, database, retention_policy, shard_group, start_time, end_time, expiry_time, owners]
+                    if len(val) > 3 and val[2] == RP_NAME:
+                        shard_ids.add(val[3])  # shard_group id
+            if len(shard_ids) == 1:
+                print(f"[shards] OK: all data in 1 shard group (id={shard_ids.pop()})")
+            elif len(shard_ids) == 0:
+                print("[shards] WARNING: no shards found — data may not be written yet")
+            else:
+                print(f"[shards] WARNING: data spans {len(shard_ids)} shard groups {shard_ids} — "
+                      f"expected 1. Increase SHARD DURATION or narrow the time range.")
+        except Exception as e:
+            print(f"[shards] could not verify shard groups: {e}")
 
     def cleanup(self):
         """Drop the database for clean re-runs."""
