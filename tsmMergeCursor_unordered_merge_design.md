@@ -517,6 +517,125 @@ fallback（lazy 路径发现首批即准入大部分乱序时切回 eager）。
   `Query` 配置项。
 - **merger 池化**：源 record 与输出 batch 仍用 `NewRecordBuilder`，可进一步池化降分配。
 
+### 10.9 时间簇增量准入（future evolution）
+
+#### 动机
+
+当前流式方案（§5）Phase 1 把所有 K 个乱序源同时放入堆（全活跃），峰值 = K × segmentSize。对**单段
+不相交文件**（每个文件 1 segment、时间互不重叠），K × R = M（全部数据），峰值无收益——这是当前方案
+的盲区。多段文件已有峰值收益（K × R = M/S），但单段不相交无法降低。
+
+时间簇增量准入解决此盲区：**按时间重叠关系把乱序 segment 分成不相交簇，逐簇处理**，每簇只活跃该簇的
+源（C << K），峰值 = C × segmentSize + maxRowCnt。
+
+#### 设计：区间并集 flood-fill
+
+```
+1. 取所有源中 minT 最小的 segment A，初始化 watermark = A.timeRange [t1, t2]
+2. 扫描所有源的下一个未读 segment，若 timeRange 与 [t1, t2] 重叠：
+   a. 读入该 segment，加入堆
+   b. watermark = union(watermark, segment.timeRange) → 扩展 [t1, t2]
+   c. 回到步骤 2（扩展后的 watermark 可能与新 segment 重叠）
+3. 无新 segment 重叠 → 簇稳定，heap K-way merge 输出 [t1, t2] 内的行（≤ maxRowCnt/批）
+4. 簇内所有行输出完 → 回到步骤 1，从下一个未读 segment 开始新簇
+```
+
+#### 流程图
+
+```mermaid
+flowchart TD
+    subgraph CLUSTER["时间簇增量准入"]
+        A1["取 minT 最小的未读 segment A"] --> A2["watermark = A.timeRange"]
+        A2 --> A3["扫描所有源: 下一个 segment 与 watermark 重叠?"]
+        A3 -- "有重叠" --> A4["读入该 segment → 堆"]
+        A4 --> A5["watermark = union(watermark, seg.timeRange)"]
+        A5 --> A3
+        A3 -- "无重叠 (簇稳定)" --> A6["heap K-way merge: 输出 watermark 内行"]
+        A6 --> A7{"簇内行全部输出?"}
+        A7 -- "no" --> A6
+        A7 -- "yes" --> A8{"还有未读 segment?"}
+        A8 -- "yes" --> A1
+        A8 -- "no" --> A9["乱序全部完成 → Phase 2 有序"]
+    end
+
+    A4:::io
+    A6:::hot
+    A5:::amp
+    classDef hot fill:#ffd6d6,stroke:#c62828,stroke-width:2px,color:#111;
+    classDef io fill:#d9e8ff,stroke:#1565c0,stroke-width:2px,color:#111;
+    classDef amp fill:#fff0c2,stroke:#b26a00,stroke-width:2px,color:#111;
+```
+
+#### 当前流式 vs 时间簇准入对比
+
+```mermaid
+flowchart LR
+    subgraph CURRENT["当前流式（全 K 活跃）"]
+        C0["K 个乱序源"] --> C1["全部放入堆 (K active)"]
+        C1 --> C2["heap merge maxRowCnt 行/批"]
+        C2 --> C3["峰值 = K × segSize"]
+    end
+    subgraph CLUSTER2["时间簇准入（逐簇活跃）"]
+        D0["K 个乱序源"] --> D1["按时间重叠分簇"]
+        D1 --> D2["簇 1: C₁ 个源 active"]
+        D2 --> D3["heap merge → 输出簇 1"]
+        D3 --> D4["簇 2: C₂ 个源 active"]
+        D4 --> D5["heap merge → 输出簇 2"]
+        D5 --> D6["..."]
+        D6 --> D7["峰值 = max(Cᵢ) × segSize"]
+    end
+
+    C3:::mem
+    D3:::hot
+    D5:::hot
+    classDef mem fill:#f3e5ff,stroke:#6a1b9a,stroke-width:2px,color:#111;
+    classDef hot fill:#ffd6d6,stroke:#c62828,stroke-width:2px,color:#111;
+```
+
+#### 对比表
+
+| 维度 | 当前流式（§5） | 时间簇增量准入 |
+|---|---|---|
+| 活跃源数 | K（全部） | C（当前簇，C << K 当簇小时） |
+| 单段不相交文件峰值 | K×R = M（**无收益**） | C×R（**大降**，每簇 1-few 文件） |
+| 多段文件峰值 | K×R = M/S（已有收益） | C×R（进一步降低，边际小） |
+| I/O 延迟 | 无（全部 segment 读入堆） | 有（只读当前簇，后续簇延迟） |
+| 堆操作 | O(logK) per row | O(logC) per row |
+| 簇检测开销 | 无 | O(K²) flood-fill 或 O(K logK) 预排序+扫描 |
+| 文件全重叠时 | K 活跃 | 退化成一簇 = K 活跃 + 额外检测开销 |
+| 代码复杂度 | 低（堆 + maxRowCnt） | 高（区间并集 + 簇管理 + watermark 扩展） |
+| 正确性前提 | disjoint 布局 | 更通用（flood-fill 天然处理重叠） |
+
+#### 优势
+
+1. **单段不相交文件的峰值降低**（当前方案做不到）：N=1000 个单段文件时间不相交 → 1000 簇，每簇 1
+   文件，峰值 = R + maxRowCnt（vs 当前 M = 1000×R）。
+2. **I/O 延迟**：只读当前簇的 segment，后续簇延迟。真实磁盘 I/O 场景下少读 = 更快。
+3. **更通用**：flood-fill 天然处理乱序-有序重叠（watermark 扩展到有序范围时自动准入有序）。不依赖
+   disjoint 前提。
+
+#### 劣势与风险
+
+1. **簇检测开销**：flood-fill 每次扩展 watermark 检查所有 K 源 → O(K×C) per cluster，O(K²) worst case
+   （每文件独立成簇）。K=1000 时 ~10⁶ 重叠检查（每次 O(1)），约 ~1ms。可接受但非零。优化：预排序
+   segment minT（O(K logK) 一次）+ 扫描分簇（O(K)），但需预读所有 ChunkMeta（放弃增量 I/O）。
+2. **文件全重叠退化**：所有乱序文件时间重叠 → 一个大簇 = K 活跃 + 额外检测开销，比当前更慢。
+3. **代码复杂度**：区间并集 + 簇管理 + watermark 扩展 + 簇间状态。edge cases 多。
+4. **segment 排序前提更关键**：flood-fill 正确性依赖 segment timeRange 可按 minT 检测簇边界。若
+   timeRange 不有序（§9 风险），簇检测可能漏 segment → 漏数据。当前方案（堆按行时间排序）不依赖此
+   前提。
+
+#### 适用判断
+
+| 乱序写入模式 | 簇结构 | 收益 |
+|---|---|---|
+| 分散不同时间点（IoT 补传） | 多小簇（每簇 1-few 文件） | **峰值大降 + I/O 延迟**（核心价值） |
+| 集中同一时段（批量回填） | 一个大簇（全部 K 重叠） | 无收益 + 额外开销 |
+| 混合 | 几个中等簇 | 部分收益 |
+
+**前置**：先用真实数据验证乱序文件的时间簇分布（`OutOfOrders` 文件的 `MinMaxTime` 是否形成多个不相交
+区间），再决定是否实现。
+
 ## 11. 文件清单
 
 | 文件 | 改动 |
