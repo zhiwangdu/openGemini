@@ -116,7 +116,135 @@ N=100 持平，N=1000 惰性快 5×）。阈值保证开启 flag **不退化**�
 ### 5.5 Feature flag 与适用范围
 `lazyUnorderedMergeEnabled`（`atomic.Bool`，默认关）：`SetLazyUnorderedMergeEnabled` 运行时切换。
 `lazyUnorderedEnabled()` 限制：**仅升序**、非聚合（`len(ops)==0`）、非 limit-cut、非 Prom。其余形状
-回退 eager。降序与 limit-cut 的放开见 §10.1/§10.2。
+回退 eager。降序与 limit-cut 的放开见 §10.2/§10.3。
+
+### 5.6 流程图（优化后）
+
+#### 5.6.1 惰性路径的初始化与迭代
+
+```mermaid
+flowchart TD
+    A["newTsmMergeCursor(ctx, sid)"] --> B["AddLoc: ordered + unordered LocationCursor"]
+    B --> O["First Next"]
+    O --> P["FirstTimeInit"]
+    P --> Q{"lazyUnorderedEnabled?"}
+    Q -- "no (eager, 默认)" --> S["sort + read ALL unordered until EOF + chain merge → outRec"]
+    Q -- "yes" --> R["sort unordered locations; newLazyUnorderedMerger (不读数据)"]
+    S --> T["locationInit = true"]
+    R --> T
+
+    T --> N["Next"]
+    N --> G{"lazyMerger != nil?"}
+    G -- "no" --> E0["eager: mergeData(outOrderRecIter, orderRecIter)"]
+    G -- "yes" --> L["nextLazy"]
+    L --> L1{"orderRecIter has remain?"}
+    L1 -- "yes, outOrder empty" --> L2["ensureUnorderedReadyUntil(ordered watermark)"]
+    L1 -- "yes, outOrder has remain" --> L4["mergeData"]
+    L1 -- "no" --> L3["read next ordered batch"]
+    L3 --> L5{"ordered record nil?"}
+    L5 -- "yes (exhausted)" --> L6["nextUnorderedOnlyLazy: drain remaining unordered"]
+    L5 -- "no" --> L2
+    L2 --> L4
+    L4 --> OUT["record to seriesCursor"]
+
+    L2 --> M1["lazyMerger.nextBatchUntil(watermark)"]
+    M1 --> M2["ReadDataBeforeWatermark per location (only segments minT <= watermark)"]
+    M2 --> M3["heap K-way merge: same-time group + seq precedence"]
+    M3 --> M4["outOrderRecIter.init(ready batch)"]
+
+    S:::hot
+    R:::amp
+    M2:::io
+    M3:::hot
+    L6:::amp
+    classDef hot fill:#ffd6d6,stroke:#c62828,stroke-width:2px,color:#111;
+    classDef amp fill:#fff0c2,stroke:#b26a00,stroke-width:2px,color:#111;
+    classDef io fill:#d9e8ff,stroke:#1565c0,stroke-width:2px,color:#111;
+```
+
+标注：
+- eager 分支（默认）保留原 `FirstTimeInit` 全量读 + 链式合并。
+- 惰性分支在 `FirstTimeInit` 只建 `lazyMerger`，**不读乱序数据**；乱序按 ordered watermark 分批读。
+- 有序耗尽走 `nextUnorderedOnlyLazy` drain 剩余乱序。
+
+#### 5.6.2 惰性堆式 K 路合并数据流
+
+```mermaid
+flowchart LR
+    U1["unordered file 1"] --> L1["Location 1"]
+    U2["unordered file 2"] --> L2["Location 2"]
+    UN["unordered file N"] --> LN["Location N"]
+
+    L1 --> W["ReadDataBeforeWatermark (segment minT <= watermark)"]
+    L2 --> W
+    LN --> W
+    W --> H["heap K-way: pop min time, same-time group by seq desc"]
+    H --> SG["appendMergedSameTimeRow: newest non-nil wins"]
+    SG --> RB["outOrderRecIter (ready batch, <= watermark)"]
+
+    OF["ordered file stream"] --> OC["ordered LocationCursor.ReadData"]
+    OC --> OR["orderRecIter"]
+    OR --> WM["watermark = ordered batch max time"]
+    WM --> W
+    RB --> MD["mergeData(outOrderRecIter, orderRecIter)"]
+    OR --> MD
+    MD --> OUT["record to seriesCursor"]
+
+    W:::io
+    H:::hot
+    SG:::cpu
+    RB:::mem
+    MD:::cpu
+    WM:::amp
+    classDef hot fill:#ffd6d6,stroke:#c62828,stroke-width:2px,color:#111;
+    classDef io fill:#d9e8ff,stroke:#1565c0,stroke-width:2px,color:#111;
+    classDef cpu fill:#e5ffd8,stroke:#2e7d32,stroke-width:2px,color:#111;
+    classDef mem fill:#f3e5ff,stroke:#6a1b9a,stroke-width:2px,color:#111;
+    classDef amp fill:#fff0c2,stroke:#b26a00,stroke-width:2px,color:#111;
+```
+
+标注（对比 §4.3 旧路径）：
+- 旧：`LocationCursor.ReadData` 读到 EOF，链式 `MergeRecord(rec, outRec)` 累计拷贝 `O(N²R)`，`outRec` = 全部乱序。
+- 新：`ReadDataBeforeWatermark` 只读 `minT <= watermark` 的 segment；堆 K 路合并 `O(M·logK)`；ready batch 仅含 `<= watermark` 的行。
+- watermark 由 ordered batch 驱动；超过 watermark 的 segment 保留不动，延迟到下个 batch。
+
+#### 5.6.3 watermark 推进与乱序延迟（eager vs lazy 对比）
+
+```mermaid
+flowchart TD
+    subgraph OLD["eager（旧）"]
+        OA["ordered batch 1"] --> OB["FirstTimeInit: 读全部 N 个乱序文件"]
+        OB --> OC["chain merge O(N²R)"]
+        OC --> OD["outRec = 全部乱序"]
+        OD --> OE["mergeData batch 1"]
+    end
+    subgraph NEW["lazy（优化后）"]
+        NA["ordered batch 1 (watermark = maxT1)"] --> NB["admit unordered segments <= maxT1"]
+        NB --> NC["heap K-way merge (仅 admitted)"]
+        NC --> ND["mergeData batch 1"]
+        ND --> NE["ordered batch 2 (watermark = maxT2 > maxT1)"]
+        NE --> NF["admit unordered in (maxT1, maxT2]"]
+        NF --> NG["heap merge"]
+        NG --> NH["mergeData batch 2"]
+        NH --> NI["ordered exhausted"]
+        NI --> NJ["drain remaining unordered"]
+    end
+    OB:::hot
+    OC:::hot
+    OD:::mem
+    NB:::io
+    NC:::hot
+    NF:::io
+    NJ:::amp
+    classDef hot fill:#ffd6d6,stroke:#c62828,stroke-width:2px,color:#111;
+    classDef io fill:#d9e8ff,stroke:#1565c0,stroke-width:2px,color:#111;
+    classDef mem fill:#f3e5ff,stroke:#6a1b9a,stroke-width:2px,color:#111;
+    classDef amp fill:#fff0c2,stroke:#b26a00,stroke-width:2px,color:#111;
+```
+
+标注：
+- eager 在首批前读完全部乱序、构造完整 `outRec`（内存峰值 = 全部乱序 `O(F·U)`）。
+- lazy 按 ordered watermark 分批准入，峰值 = 当前 watermark 内乱序 + batch；乱序多在后续时段时首批收益最大（见 §8 benchmark：N=1000 时 5.2× 更快、58× 省内存）。
 
 ## 6. 生命周期：ReInit 修复
 
