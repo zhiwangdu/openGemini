@@ -306,7 +306,7 @@ class DataWriter:
                 # Wait for meta to propagate to store nodes
                 time.sleep(3)
                 # Verify by writing a test point with current timestamp
-                test_ts = int(time.time()) * 1_000_000_000
+                test_ts = time.time_ns()
                 test_resp = self.session.post(
                     f"{SQL_URL}/write?db={DB_NAME}&rp={RP_NAME}",
                     data=f"_test,foo=bar v=1 {test_ts}",
@@ -337,57 +337,58 @@ class DataWriter:
 
     def _make_line(self, series_idx: int, timestamp_ns: int, field_vals: List[int]) -> str:
         tags = f"k0=s{series_idx}"
-        fields = ",".join(f"f{i}={v}" for i, v in enumerate(field_vals))
+        # Integer fields need 'i' suffix in Line Protocol
+        fields = ",".join(f"f{i}={v}i" for i, v in enumerate(field_vals))
         return f"{MST_NAME},{tags} {fields} {timestamp_ns}"
 
     def write_ordered(self):
         """Write ordered data (newer timestamps, AFTER all unordered)."""
         cfg = self.config
-        # Use current time as base. Ordered starts right after unordered ends.
-        # Unordered occupies [now - N*R - 1, now - 1] seconds.
-        # Ordered occupies [now, now + R] seconds.
-        now_ns = int(time.time()) * 1_000_000_000
-        t_order_start_ns = now_ns
+        # Use true ns precision from system clock. Row spacing = 1ms (1_000_000 ns).
+        # Ordered: [now, now + R*1ms]
+        now_ns = time.time_ns()
+        row_step_ns = 1_000_000  # 1ms per row
         lines = []
         for s in range(cfg.n_series):
             for r in range(cfg.rows_per_file):
-                ts = t_order_start_ns + r * 1_000_000_000  # ns, 1s per row
+                ts = now_ns + r * row_step_ns
                 vals = [s * 1000 + r + 1] * cfg.n_fields
                 lines.append(self._make_line(s, ts, vals))
         self._write_batch(lines)
         self.cluster.flush_memtable()
-        t_start_s = t_order_start_ns // 1_000_000_000
-        t_end_s = (t_order_start_ns + cfg.rows_per_file * 1_000_000_000) // 1_000_000_000
-        print(f"[data] ordered: {len(lines)} rows, timestamps [{t_start_s}, {t_end_s}] "
+        span_ms = cfg.rows_per_file * 1  # 1ms per row
+        print(f"[data] ordered: {len(lines)} rows, span={span_ms}ms "
               f"({cfg.n_series} series × {cfg.rows_per_file} rows)")
 
     def write_unordered(self):
         """Write N unordered batches (older timestamps), each flush = 1 unordered file."""
         cfg = self.config
-        # Unordered: timestamps go backwards from now-1. Each file gets R consecutive seconds.
-        # File 0: [now - R, now - 1], File 1: [now - 2R, now - R - 1], etc.
-        now_s = int(time.time())
-        t_base_ns = (now_s - cfg.n_unordered * cfg.rows_per_file - 1) * 1_000_000_000
+        # Unordered: timestamps before ordered. Row spacing = 1ms.
+        # File i occupies [base + i*R*1ms, base + (i+1)*R*1ms - 1ms].
+        # base = now - N*R*1ms - 1s (1s gap before ordered for clean disjoint).
+        now_ns = time.time_ns()
+        row_step_ns = 1_000_000  # 1ms per row
+        gap_ns = 1_000_000_000   # 1s gap between unordered end and ordered start
+        t_base_ns = now_ns - gap_ns - cfg.n_unordered * cfg.rows_per_file * row_step_ns
         for i in range(cfg.n_unordered):
             lines = []
             for s in range(cfg.n_series):
                 for r in range(cfg.rows_per_file):
                     if cfg.overlap == "disjoint":
                         # Each file: distinct time range, no overlap with other files
-                        ts = t_base_ns + (i * cfg.rows_per_file + r) * 1_000_000_000
+                        ts = t_base_ns + (i * cfg.rows_per_file + r) * row_step_ns
                     else:
                         # Overlapping: all files write to the same time range
-                        ts = t_base_ns + r * 1_000_000_000
+                        ts = t_base_ns + r * row_step_ns
                     vals = [i * 10000 + s * 100 + r] * cfg.n_fields
                     lines.append(self._make_line(s, ts, vals))
             self._write_batch(lines)
             self.cluster.flush_memtable()
             if (i + 1) % 10 == 0 or i == 0:
                 print(f"[data] unordered file {i+1}/{cfg.n_unordered} written ({len(lines)} rows)")
-        t_start_s = t_base_ns // 1_000_000_000
-        t_end_s = (t_base_ns + cfg.n_unordered * cfg.rows_per_file * 1_000_000_000) // 1_000_000_000
+        total_ms = cfg.n_unordered * cfg.rows_per_file  # 1ms per row
         print(f"[data] unordered: {cfg.n_unordered} files × {cfg.rows_per_file} rows × "
-              f"{cfg.n_series} series, timestamps [{t_start_s}, {t_end_s}]")
+              f"{cfg.n_series} series, span={total_ms}ms")
 
     def write_all(self):
         self._ensure_db()
