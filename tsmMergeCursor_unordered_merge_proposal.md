@@ -1,0 +1,684 @@
+# tsmMergeCursor 乱序合并优化方案
+
+> 本文档整合乱序合并优化的完整设计方案，包含问题分析、核心算法、复杂度对比、压测数据、正确性验证、
+> 查询路径覆盖、未来演进及端到端压测方案。纯方案讨论，不含实现状态。
+
+---
+
+## 目录
+
+1. [背景与目标](#1-背景与目标)
+2. [问题根因](#2-问题根因)
+3. [openGemini 数据布局](#3-opengemini-数据布局)
+4. [总体方案](#4-总体方案)
+5. [核心优化：堆式 K 路合并 + 流式分批](#5-核心优化堆式-k-路合并--流式分批)
+6. [辅助优化](#6-辅助优化)
+7. [流程图](#7-流程图)
+8. [复杂度分析](#8-复杂度分析)
+9. [性能压测数据](#9-性能压测数据)
+10. [正确性验证](#10-正确性验证)
+11. [查询路径覆盖矩阵](#11-查询路径覆盖矩阵)
+12. [未来演进](#12-未来演进)
+13. [端到端压测方案](#13-端到端压测方案)
+14. [关键前提与风险](#14-关键前提与风险)
+
+---
+
+## 1. 背景与目标
+
+openGemini 是云原生分布式时序数据库，采用 LSM 存储引擎。写入数据按时间戳分为**有序（ordered）**和
+**乱序（out-of-order）**两类，分别落盘为不同的 TSSP 文件。查询时需要将有序与乱序数据合并后按时间
+有序返回。
+
+优化针对两个核心问题：
+
+1. **内存/GC 压力**：`tsmMergeCursor.FirstTimeInit` 在非聚合路径中把所有命中的乱序 location 读空，
+   链式合并成一个完整 `outRec`。乱序文件多时 `outRec` 巨大，内存峰值高、GC 抖动。
+2. **总查询性能差**：链式合并“读一个 record，与累计 outRec 合并一次”，每次 merge 重扫/重拷累计
+   `outRec`，复杂度 `O(N²·R)`（N 个乱序文件、每文件 R 行）。乱序文件多时查询明显变慢。
+
+**成功指标**：乱序文件较多的场景下，总查询耗时下降、峰值内存下降；乱序文件少时不退化。
+
+---
+
+## 2. 问题根因
+
+### 2.1 查询调用链
+
+```mermaid
+flowchart TD
+    A["IndexScanTransform.Work"] --> B["indexScan → tsIndexScan"]
+    B --> C["shard.CreateCursor"]
+    C --> D["shard.Scan: index → tagSets / series"]
+    C --> E["cloneReaders: ordered + out-of-order file refs"]
+    E --> F["GetBothFilesRef: file time range coarse filter"]
+    C --> G["createGroupCursors"]
+    G --> H["groupCursor → tagSetCursor → seriesCursor"]
+    H --> K["newTsmMergeCursor → AddLoc"]
+    K --> L["ordered LocationCursor + unordered LocationCursor"]
+    H --> O["groupCursor.Next → tagSetCursor.Next → seriesCursor.Next"]
+    O --> R["tsmMergeCursor.Next → FirstTimeInit"]
+
+    E:::amp
+    K:::amp
+    R:::hot
+    classDef hot fill:#ffd6d6,stroke:#c62828,stroke-width:2px,color:#111;
+    classDef amp fill:#fff0c2,stroke:#b26a00,stroke-width:2px,color:#111;
+```
+
+- `GetBothFilesRef`：文件数为 `ordered + unordered`，只做文件级时间粗过滤。
+- `AddLoc`：对每个 series 遍历 unordered 文件做 `Location.Contains`（bloom + metaIndex + chunkMeta），
+  放大因子 `S × N`（S 个 series、N 个乱序文件）。
+- `FirstTimeInit`：读完全部命中 unordered 数据 + 链式合并，是性能瓶颈。
+
+### 2.2 链式合并的 `O(N²R)` 来源
+
+```mermaid
+flowchart LR
+    U1["unordered file 1"] --> L1["Location 1"]
+    U2["unordered file 2"] --> L2["Location 2"]
+    UN["unordered file N"] --> LN["Location N"]
+
+    L1 --> C["LocationCursor.ReadData (逐文件)"]
+    L2 --> C
+    LN --> C
+    C --> R1["rec_i = ReadAt + FilterByTime + FilterByField"]
+    R1 --> M1{"First record?"}
+    M1 -- "yes" --> O["outRec = rec_i"]
+    M1 -- "no" --> M2["MergeRecord(rec_i, outRec) — 重扫累计 outRec"]
+    M2 --> O
+    O --> I["outOrderRecIter"]
+
+    OF["ordered file stream"] --> OC["ordered ReadData"]
+    OC --> OR["orderRecIter"]
+    I --> MD["mergeData(outOrderRecIter, orderRecIter)"]
+    OR --> MD
+    MD --> OUT["→ seriesCursor"]
+
+    M2:::hot
+    I:::mem
+    classDef hot fill:#ffd6d6,stroke:#c62828,stroke-width:2px,color:#111;
+    classDef mem fill:#f3e5ff,stroke:#6a1b9a,stroke-width:2px,color:#111;
+```
+
+每次 `MergeRecord(rec_k, outRec)` 扫描累计 `outRec`（~k·R 行）+ 新 rec（R 行），k=1..N 求和得
+`O(N²·R·F)`（F = 字段数）。`outRec` 持有全部乱序数据直到 `mergeData` 消耗完。
+
+### 2.3 乱序文件数量放大
+
+```mermaid
+flowchart TD
+    A["N = unordered file count"] --> B1["N=1: 读 1 文件, 合并 ~B 行"]
+    A --> B2["N=10: 读 10 文件, 链式合并 ~10B 行"]
+    A --> B3["N=100: 合并成本 ~O((100B)²·R·F)"]
+    A --> B4["N=1000: 首批前读完所有乱序"]
+
+    B3:::hot
+    B4:::hot
+    classDef hot fill:#ffd6d6,stroke:#c62828,stroke-width:2px,color:#111;
+```
+
+N 越大，链式合并的累计重扫越严重，内存峰值 = 全部乱序行。
+
+---
+
+## 3. openGemini 数据布局
+
+### 3.1 有序/乱序的时间关系
+
+写路径 `mutable.tsMemTableImpl.WriteRows` → `appendFields` 追加行到 `WriteRec.rec`，跟踪
+`lastAppendTime`/`firstAppendTime`/`timeAsd`。flush 时 `SplitRecordByTime(rec, flushTime)` 按已落盘
+有序最大时间 `flushTime`（来自 `mmsIdTime.Get(sid)`）切分：
+
+- `time > flushTime` → **ordered**（更新）
+- `time <= flushTime` → **unordered**（更旧）
+
+二者在 `flushTime` 处严格不相交，**乱序是更旧的那段，有序是更新的那段**。首次 flush（无有序文件）
+`flushTime = MinInt64`，全部 ordered。
+
+### 3.2 对查询输出的影响
+
+升序查询 `[A, B]` 的合并输出顺序：**乱序(旧) → 有序(新)**（disjoint，无交错）。
+降序查询：**有序(新) → 乱序(旧)**。
+
+---
+
+## 4. 总体方案
+
+| 层 | 范围 | 说明 |
+|---|---|---|
+| **核心优化** | 堆式 K 路合并 + `maxRowCnt` 流式分批 | 替换链式 `O(N²R)` 为 `O(M·logK)`；乱序按簇流式输出 |
+| **辅助优化** | dst 内存复用 + 观测指标 + ReInit 修复 | 降低分配/GC 压力；增加可观测性；修复 cursor 复用 bug |
+
+核心优化通过 feature flag 控制（默认关），仅对升序非聚合非 limit-cut 非 Prom 查询生效。
+
+---
+
+## 5. 核心优化：堆式 K 路合并 + 流式分批
+
+### 5.1 核心思路
+
+openGemini 的乱序数据比有序数据**更旧**（§3），升序查询输出 = **乱序(旧) → 有序(新)**，无需交错合并
+或 watermark 延迟。
+
+基于此，优化方案为：**用堆 K 路合并乱序文件，按 `maxRowCnt` 流式分批输出，全部乱序输出完再读有序**。
+合并复杂度 `O(M·logK)`（M = N·R 总行数），替换链式 `O(N²·R)`；输出按 `maxRowCnt` 分批，每批只合并
+`maxRowCnt` 行（而非首批全量），降低首包延迟与分配峰值。
+
+### 5.2 组件设计
+
+**`lazyUnorderedMerger`**（`engine/unordered_lazy_merge.go`）：
+- 持有 `sources []*unorderedSource`（每个乱序 location 一个）和 `heap lazyMergerHeap`（`container/heap`）。
+- `unorderedSource`：`loc`（`immutable.Location`）、`seq`（文件序列号，越大越新）、`rec`（当前 segment
+  的 record）、`pos`、`done`、`inHeap`。
+- `nextBatch(watermark, maxRows)`：watermark 为 nil（乱序-only，准入全部），按 `maxRows` cap 输出。
+  每源只持当前 1 个 segment，耗尽才读下一个 → 堆 live = K × segmentSize。
+- 堆序：当前行时间升序，同时间 `seq` 降序（最新者先 pop）。
+- `appendMergedSameTimeRow`：同时间组按 newest→oldest 折叠，每列取最新非 nil 值，等价于 `mergeRecRow`
+  折叠。所有输入 record 共享 `ctx.schema`，按列下标对齐。
+- `isAborted` 回调：合并循环顶检查，abort 时 `return nil, nil`（丢弃半成品）。
+
+**`ReadDataBeforeWatermark`**（`engine/immutable/location.go`）：
+- 读下一个与查询时间范围重叠的 segment，应用 `FilterByTime`/`FilterByField`。
+- 核心优化传 watermark=maxInt64（不延迟），逐 segment 读。
+- 另暴露 `Location.HasNext()`、`Location.Sequence()`、`LocationCursor.LocationAt(i)`。
+
+**`nextLazy`**（`engine/tsm_merge_cursor.go`）两阶段：
+- **Phase 1**（乱序流式）：`lazyMerger.nextBatch(nil, maxRowCnt)` 每次产 `maxRowCnt` 行 →
+  `outOrderRecIter` → `mergeData` 输出。重复直到 `allDone()`。
+- **Phase 2**（有序）：乱序耗尽后读有序 batch，`mergeData` 输出。有序与乱序 disjoint，
+  `mergeData` 走 NonOverlap 批量分支（廉价）。
+
+### 5.3 正确性不变式
+
+1. **Disjoint 布局**：乱序 `time <= flushTime`、有序 `time > flushTime`，不相交。升序输出 =
+   乱序(旧) → 有序(新)，Phase 1 全部输出乱序后再 Phase 2 输出有序，顺序正确，无需交错去重。
+2. **同时间覆盖（乱序间）**：多个乱序文件同 timestamp 时，堆按 `seq` 降序 pop 同时间组，
+   `appendMergedSameTimeRow` newest 非 nil 胜出，与链式 `MergeRecord(newRec=高seq, oldRec=累计)`
+   语义等价。
+3. **终止**：堆空且所有源 `done` 时 `nextBatch` 返回 nil；`allDone()` 判定 Phase 1 完成，转 Phase 2；
+   有序也读完返回 nil。无死循环。
+4. **abort**：`nextBatch` 循环顶检查 `isAborted`，abort 时丢弃半成品返回 nil。
+
+> **前提**：disjoint 布局是 `SplitRecordByTime` 的 flush 语义保证的（正常写）。若乱序与有序时间重叠
+> （非正常场景），Phase 1/2 顺序会错。`lazyUnorderedEnabled()` 限制仅升序非聚合非 limit-cut 非 Prom，
+> 作为额外保护。
+
+### 5.4 小 N 阈值（防退化）
+
+`lazyUnorderedMergeMinLocations`（默认 64，`atomic.Int32`，可调）：命中的乱序 location 数低于阈值时
+回退 eager。benchmark 显示交叉点约 N=100（N=10 惰性慢 2.1×，N=100 持平，N=1000 快 5.4×）。阈值保证
+开启 flag **不退化**小 N 常见场景。0 表示禁用阈值（测试用）。
+
+### 5.5 Feature flag 与适用范围
+
+`lazyUnorderedMergeEnabled`（`atomic.Bool`，默认关）：`SetLazyUnorderedMergeEnabled` 运行时切换。
+`lazyUnorderedEnabled()` 限制：**仅升序**、非聚合（`len(ops)==0`）、非 limit-cut、非 Prom。其余形状
+回退 eager。
+
+---
+
+## 6. 辅助优化
+
+### 6.1 dst 内存复用
+
+非聚合 `FirstTimeInit` 循环里的 `dst := record.NewRecordBuilder(...)` 改为从 `unorderPool`（环形，
+`unorderRecordNum = 2`）获取。
+
+**关键约束**：`record.Record.mergeRecordSchema` 向 receiver 的 schema **追加**，因此池化的 record 只能
+作为 `MergeRecord` 的 `newRec`/`oldRec` 参数（只读），**不能**作为 receiver。合并 scratch 仍用
+`var mergeRecord record.Record`。`reset()` 先 `outOrderRecIter.reset()`（释放引用）再 `unorderPool.Put()`。
+
+### 6.2 观测指标
+
+新增 span 计数（`FirstTimeInit` 内 `CreateCounter` 幂等创建）：
+- `unordered_location_count`：命中的乱序 location 数（放大因子 K）。
+- `unordered_merge_count`：非聚合路径的链式合并次数。
+
+### 6.3 ReInit 生命周期修复
+
+`ReInit`/`ReInitWithShard` 复用 cursor 给新 series 时，重置 `c.locationInit = false; c.lazyMerger = nil`，
+使新 series 重新跑 `FirstTimeInit`。否则：
+- 核心优化路径：`nextLazy` 会把上一个 series 残留的 stale `lazyMerger` 源排进新 series 输出 → 跨 series
+  数据错乱。
+- eager 路径：`locationInit` 残留导致 `FirstTimeInit` 被跳过，新 series 乱序数据不读。
+
+---
+
+## 7. 流程图
+
+### 7.1 初始化与两阶段迭代
+
+```mermaid
+flowchart TD
+    A["newTsmMergeCursor(ctx, sid)"] --> B["AddLoc: ordered + unordered LocationCursor"]
+    B --> O["First Next"]
+    O --> P["FirstTimeInit"]
+    P --> Q{"lazyUnorderedEnabled?"}
+    Q -- "no (eager, 默认)" --> S["sort + read ALL unordered + chain merge → outRec"]
+    Q -- "yes" --> R["sort unordered locations; newLazyUnorderedMerger (不读数据)"]
+    S --> T["locationInit = true"]
+    R --> T
+
+    T --> N["Next → nextLazy"]
+    N --> P1{"Phase 1: unordered allDone?"}
+    P1 -- "no" --> P1a{"outOrderRecIter has remain?"}
+    P1a -- "yes" --> P1b["mergeData → emit unordered batch"]
+    P1a -- "no" --> P1c["lazyMerger.nextBatch(nil, maxRowCnt)"]
+    P1c --> P1d["heap K-way merge maxRowCnt rows"]
+    P1d --> P1b
+    P1b --> OUT["record to seriesCursor"]
+    P1 -- "yes" --> P2{"Phase 2: orderRecIter has remain?"}
+    P2 -- "no" --> P2a["read next ordered batch"]
+    P2a --> P2b{"ordered nil?"}
+    P2b -- "yes" --> P2c["return nil (done)"]
+    P2b -- "no" --> P2d["mergeData → emit ordered"]
+    P2 -- "yes" --> P2d
+    P2d --> OUT
+
+    S:::hot
+    R:::amp
+    P1d:::hot
+    classDef hot fill:#ffd6d6,stroke:#c62828,stroke-width:2px,color:#111;
+    classDef amp fill:#fff0c2,stroke:#b26a00,stroke-width:2px,color:#111;
+```
+
+- eager 分支（默认）保留原 `FirstTimeInit` 全量读 + 链式合并。
+- 核心优化分支：Phase 1 堆合并乱序按 `maxRowCnt` 流式输出；Phase 2 乱序耗尽后读有序（disjoint）。
+
+### 7.2 堆式 K 路合并数据流
+
+```mermaid
+flowchart LR
+    U1["unordered file 1"] --> L1["Location 1"]
+    U2["unordered file 2"] --> L2["Location 2"]
+    UN["unordered file N"] --> LN["Location N"]
+
+    L1 --> W["ReadDataBeforeWatermark (逐 segment, 每文件持当前段)"]
+    L2 --> W
+    LN --> W
+    W --> H["heap K-way: pop min time, same-time group by seq desc"]
+    H --> SG["appendMergedSameTimeRow: newest non-nil wins"]
+    SG --> RB["outOrderRecIter (ready batch, ≤ maxRowCnt)"]
+
+    RB --> MD["mergeData(outOrderRecIter, orderRecIter=nil)"]
+    MD --> OUT1["unordered batch → seriesCursor"]
+
+    OF["ordered file stream (Phase 2)"] --> OC["ordered ReadData"]
+    OC --> OR["orderRecIter"]
+    OR --> MD2["mergeData(outOrderRecIter=nil, orderRecIter)"]
+    MD2 --> OUT2["ordered batch → seriesCursor"]
+
+    W:::io
+    H:::hot
+    SG:::cpu
+    RB:::mem
+    MD:::cpu
+    classDef hot fill:#ffd6d6,stroke:#c62828,stroke-width:2px,color:#111;
+    classDef io fill:#d9e8ff,stroke:#1565c0,stroke-width:2px,color:#111;
+    classDef cpu fill:#e5ffd8,stroke:#2e7d32,stroke-width:2px,color:#111;
+    classDef mem fill:#f3e5ff,stroke:#6a1b9a,stroke-width:2px,color:#111;
+```
+
+- 旧：`ReadData` 读到 EOF，链式 `MergeRecord` 累计拷贝 `O(N²R)`，`outRec` = 全部乱序。
+- 新：堆 K 路合并 `O(M·logK)`；每源只持当前 segment；输出按 `maxRowCnt` 分批。
+
+### 7.3 eager vs 优化方案对比
+
+```mermaid
+flowchart TD
+    subgraph OLD["eager（旧）"]
+        OB["FirstTimeInit: 读全部 N 个乱序文件"] --> OC["chain merge O(N²R)"]
+        OC --> OD["outRec = 全部乱序 (一次性)"]
+        OD --> OE["mergeData: 乱序 + 有序"]
+    end
+    subgraph NEW["优化方案"]
+        NB["Phase 1: nextBatch(nil, maxRowCnt)"] --> NC["heap K-way merge maxRowCnt 行"]
+        NC --> ND["emit 乱序 batch"]
+        ND --> NE{"allDone?"}
+        NE -- "no" --> NB
+        NE -- "yes" --> NF["Phase 2: 读有序 batch"]
+        NF --> NG["mergeData: 有序 (NonOverlap)"]
+    end
+    OB:::hot
+    OC:::hot
+    OD:::mem
+    NC:::hot
+    classDef hot fill:#ffd6d6,stroke:#c62828,stroke-width:2px,color:#111;
+    classDef mem fill:#f3e5ff,stroke:#6a1b9a,stroke-width:2px,color:#111;
+```
+
+- eager 首批前读完全部乱序、链式合并构造完整 `outRec`（`O(N²R)` + 全量内存）。
+- 优化方案按 `maxRowCnt` 流式堆合并，首批只合并 `maxRowCnt` 行；乱序全部输出后读有序（disjoint）。
+
+---
+
+## 8. 复杂度分析
+
+### 8.1 链式 `O(N²R)` vs 堆式 `O(M·logK)`
+
+链式：每次 `MergeRecord(rec_k, outRec)` 重扫累计 `outRec`（~k·R 行），k=1..N 求和 = `O(N²·R·F)`。
+堆式：每源行处理一次（pop/push `O(logK)` + 列合并 `O(F)`），总计 `O(M·(logK + F))` = `O(N·R·(logN + F))`。
+
+复杂度对比图（R=20，理论常数=1）：
+
+![乱序合并复杂度对比](unordered_merge_complexity_chart.png)
+
+纯复杂度比 `N/log₂N`：N=100 约 15×、N=1000 约 100×。实测因常数因子差距更小——N=100 基本持平、
+N=1000 约 5.4×——但发散趋势一致。
+
+### 8.2 eager 两分支（Overlap / NonOverlap）
+
+eager `MergeRecord` 在 `MergeRecordLimitRows` 按时间范围分两个分支：
+
+| 分支 | 触发 | 实现 | 常数 |
+|---|---|---|---|
+| **NonOverlap** | newRec 与 outRec 时间不相交 | `AppendColVal` 整段批量拷贝 | 低 |
+| **Overlap** | 时间相交 | per-row 双指针 + `mergeRecRow` 列级 nil 合并 | 高（~2-3× NonOverlap） |
+
+两者都是 `O(N²·R·F)`（累计重扫）。堆式 `O(N·R·(logN+F))` 无重扫，常数 `c_l > c_o > c_n`（堆指针跳转
++ per-row 列合并，cache 局部性差）。overlap 度影响堆式的**常数**（同时间组越大 churn 越多）但不改大 O。
+
+| 场景 | eager 分支 | 优化方案 | crossover(N*) | N=1000 实测 |
+|---|---|---|---|---|
+| 不重叠（g≈1） | NonOverlap | `O(NR(logN+F))` | ~100 | 5.4× 更快 |
+| 全重叠（g=K=N） | Overlap | `O(NR(logN+F))`（常数↑） | >100 | 大 N 理论反超 |
+
+---
+
+## 9. 性能压测数据
+
+### 9.1 微基准（mock，无 I/O）
+
+`engine/tsm_merge_cursor_bench_test.go`，mock 读（无 I/O，反映 CPU/分配）。数据布局为**真实布局**
+（乱序旧、有序新，disjoint）。阈值置 0 以测量纯优化路径。
+
+#### Total drain（drain 到完成 = 真实查询指标）
+
+| N | Eager | 优化方案 | 加速比 | B/op |
+|---|---|---|---|---|
+| 10 | 20.5 µs | 42.6 µs | 慢（小 N → 阈值路由 eager） | 46 KB vs 25 KB |
+| 100 | 574 µs | 613 µs | 持平 | 2.2 MB → 276 KB（8×） |
+| 1000 | 44.0 ms | 8.14 ms | **5.4×** | 175 MB → 2.75 MB（**64×**） |
+
+#### First packet（首包延迟）
+
+| N | Eager 首包 | 优化方案首包 | 加速比 |
+|---|---|---|---|
+| 10 | 22.0 µs | 42.7 µs | 慢（小 N） |
+| 100 | 599 µs | 392 µs | 1.5× |
+| 1000 | 44.4 ms | **1.57 ms** | **28×** |
+
+首包大幅改善：流式分批每批只合并 `maxRowCnt` 行，非首批全量合并。
+
+### 9.2 多段 vs 单段（峰值内存分析）
+
+| 场景 | Eager | 优化方案 | 加速比 | B/op | maxHeapInuse |
+|---|---|---|---|---|---|
+| **MultiSeg** (N=100, S=10, R=20, M=20000) | 57.9 ms | 7.1 ms | **8×** | 175 MB → 3.1 MB（56×） | 24.0 MB → 14.5 MB（1.7×） |
+| **SingleSeg** (N=100, R=200, M=20000) | 10.5 ms | 6.7 ms | 1.6× | 21.8 MB → 2.6 MB（8×） | 23.5 MB → 14.1 MB（1.7×） |
+
+关键发现：
+- **多段文件放大优化优势**：eager 随段数增长变差（N×S 次链式迭代），优化方案与段数无关（每行一次）。
+  真实 TSSP 文件是多段的，所以这是实际场景。
+- **峰值（maxHeapInuse）**：~1.7× 降低，但被分配量主导。激进 GC 实验确认多段 live-peak（13.6 MB）
+  < 单段（15.7 MB），源段效应存在但 M=20000 时数据峰值相对运行时基线太小。真实大 M（百万行）下
+  峰值收益才显著。
+- **单段不相交文件**：堆持 K 段 = M（全部数据），峰值无收益——这是当前方案的盲区，见 §12.5。
+
+### 9.3 真实布局 vs 旧布局验证
+
+| 布局 | N=1000 Eager | N=1000 优化方案 |
+|---|---|---|
+| 真实布局（ordered 新/unordered 旧） | 44.0 ms | 8.14 ms（5.4×） |
+| 旧布局（ordered 旧/unordered 新） | 42.4 ms | 8.30 ms（5.1×） |
+
+两种布局结果几乎一致 → **收益与布局无关**，来自堆合并算法 `O(M·logK)` vs 链式 `O(N²R)`，而非
+deferral（升序真实布局下 deferral 不生效——乱序更旧，先输出）。
+
+---
+
+## 10. 正确性验证
+
+### 10.1 差分测试
+
+以 eager 路径为 oracle，对优化路径逐行比较 `(time, value, isNil)`。
+
+- **固定 edge case**：仅有序、仅乱序、乱序间同时间高 seq 覆盖、nil 列由旧源填补、disjoint 不重叠、
+  小批流式、多有序文件。
+- **3000 个随机用例**：1-3 有序文件、1-4 乱序文件、**disjoint 布局**（乱序时间 [1,20]、有序时间
+  [21,40]，匹配 `SplitRecordByTime` 的 flush 边界）、含 nil 值、`maxRowCnt` 1-4 强制分批。
+- **多段用例**：`mocTsspFileMultiSeg` + `NewChunkMetaWithSegs`，覆盖 segment 逐段读取。
+
+差分测试覆盖**新增逻辑**（堆合并、同时间组、流式分批）；文件 I/O/过滤复用 eager 路径未改。
+
+### 10.2 覆盖场景
+
+- 仅有序、仅乱序（有序耗尽 fallback）
+- 乱序间同时间高 seq 覆盖
+- nil 列由旧源填补
+- disjoint 不重叠
+- 小批 `maxRowCnt` 流式
+- 乱序跨多个有序文件
+- 多段文件 segment 逐段读取
+
+---
+
+## 11. 查询路径覆盖矩阵
+
+| 路径 | 触发条件 | 乱序读取方式 | 覆盖? | 严重性 |
+|---|---|---|---|---|
+| TS 非聚合升序 | 默认 | 堆合并 + 流式分批 | ✅ | — |
+| 降序非聚合 | `!Ascending` | eager 链式 | ❌（§12.1） | 中 |
+| limit-cut 非聚合 | `CanLimitCut` | eager 全量读 | ❌（§12.2） | 中 |
+| Prom 查询 | `IsPromQuery` | eager（经 tsmMergeCursor） | ❌（未分析） | 中 |
+| tsmMergeCursor 聚合 | `len(ops)>0` 且非 fileCursor | pre-agg meta | ❌ | 低 |
+| **fileCursor 聚合** | `enableFileCursor`+`HasOptimizeAgg` | **eager 全量 drain** | ❌（§12.3） | 高 |
+| 列存 CS/hybrid | `COLUMNSTORE` | 独立 reader | **不考虑** | — |
+| 小 N | location 数 < 64 | eager | 设计回退 | — |
+
+---
+
+## 12. 未来演进
+
+### 12.1 降序支持
+
+降序输出 = 有序(新) → 乱序(旧)。有序先输出，可用 watermark=ordered.min 延迟更旧的乱序——deferral
+在此方向有效。主要工作：
+- `ReadDataBeforeWatermark` 降序分支（segPos 高→低，`if maxT < watermark { return nil }`）。
+- 堆按时间降序（`Less` 改 `ti > tj`）。
+- `nextLazy` 降序 watermark = `MinTime(false)`。
+
+### 12.2 limit-cut 支持
+
+limit-cut 机制（`CanLimitCut`）：`itrsInitWithLimit` + `topNLinkedList` 按 `limitFirstTime` 砍 series。
+`limitFirstTime` 全程只来自 ChunkMeta 元数据，不依赖读数据。limit-cut 不裁剪 unordered 的数据读取。
+
+可兼容理由：`limitFirstTime` 在 `AddLoc`（`FirstTimeInit` 之前）算好；优化方案的 `nextBatch` 准入全部
+乱序，`limitCursor` 取最早 `limit+offset` 行不会漏。放开前需补差分测试。
+
+详见 `limit_cut_cursor_analysis.md`。
+
+### 12.3 fileCursor 聚合路径
+
+`enableFileCursor=true`（默认）且 `HasOptimizeAgg()` 时走 `fileLoopCursor`，不经 `tsmMergeCursor`。
+`fileLoopCursor.initMergeIters` eager drain 全部乱序文件到 `mergeRecIters`。
+
+fileCursor 的“消费一次”模型（sid 在首个 ordered 文件处消费并删除）与堆式流式合并不同。需重构为
+per-sid 流式 watermark 合并。先做 `readData`（非 pre-agg）子路径，`readPreAggData`（meta 成本低）
+后做。
+
+### 12.4 schema/field 预过滤
+
+`AddLocations` 在 `Contains` 命中后，若 ChunkMeta 的列与查询 schema 无交集则不加入 location。风险：
+count(time)/aux/Prom 语义需验证。
+
+### 12.5 时间簇增量准入
+
+当前方案的盲区：**单段不相交文件**——堆持 K 段 = M（全部数据），峰值无收益。时间簇增量准入解决此
+盲区：按时间重叠关系把乱序 segment 分成不相交簇，逐簇处理。
+
+#### 设计：区间并集 flood-fill
+
+```
+1. 取所有源中 minT 最小的 segment A，初始化 watermark = A.timeRange [t1, t2]
+2. 扫描所有源的下一个未读 segment，若 timeRange 与 [t1, t2] 重叠：
+   a. 读入该 segment，加入堆
+   b. watermark = union(watermark, segment.timeRange) → 扩展 [t1, t2]
+   c. 回到步骤 2
+3. 无新 segment 重叠 → 簇稳定，heap K-way merge 输出 [t1, t2] 内的行（≤ maxRowCnt/批）
+4. 簇内所有行输出完 → 回到步骤 1，从下一个未读 segment 开始新簇
+```
+
+#### 流程图
+
+```mermaid
+flowchart TD
+    subgraph CLUSTER["时间簇增量准入"]
+        A1["取 minT 最小的未读 segment A"] --> A2["watermark = A.timeRange"]
+        A2 --> A3["扫描所有源: 下一个 segment 与 watermark 重叠?"]
+        A3 -- "有重叠" --> A4["读入该 segment → 堆"]
+        A4 --> A5["watermark = union(watermark, seg.timeRange)"]
+        A5 --> A3
+        A3 -- "无重叠 (簇稳定)" --> A6["heap K-way merge: 输出 watermark 内行"]
+        A6 --> A7{"簇内行全部输出?"}
+        A7 -- "no" --> A6
+        A7 -- "yes" --> A8{"还有未读 segment?"}
+        A8 -- "yes" --> A1
+        A8 -- "no" --> A9["乱序全部完成 → Phase 2 有序"]
+    end
+
+    A4:::io
+    A6:::hot
+    A5:::amp
+    classDef hot fill:#ffd6d6,stroke:#c62828,stroke-width:2px,color:#111;
+    classDef io fill:#d9e8ff,stroke:#1565c0,stroke-width:2px,color:#111;
+    classDef amp fill:#fff0c2,stroke:#b26a00,stroke-width:2px,color:#111;
+```
+
+#### 当前流式 vs 时间簇对比
+
+```mermaid
+flowchart LR
+    subgraph CURRENT["当前流式（全 K 活跃）"]
+        C0["K 个乱序源"] --> C1["全部放入堆 (K active)"]
+        C1 --> C2["heap merge maxRowCnt 行/批"]
+        C2 --> C3["峰值 = K × segSize"]
+    end
+    subgraph CLUSTER2["时间簇准入（逐簇活跃）"]
+        D0["K 个乱序源"] --> D1["按时间重叠分簇"]
+        D1 --> D2["簇 1: C₁ 个源 active"]
+        D2 --> D3["heap merge → 输出簇 1"]
+        D3 --> D4["簇 2: C₂ 个源 active"]
+        D4 --> D5["heap merge → 输出簇 2"]
+        D5 --> D6["..."]
+        D6 --> D7["峰值 = max(Cᵢ) × segSize"]
+    end
+
+    C3:::mem
+    D3:::hot
+    D5:::hot
+    classDef mem fill:#f3e5ff,stroke:#6a1b9a,stroke-width:2px,color:#111;
+    classDef hot fill:#ffd6d6,stroke:#c62828,stroke-width:2px,color:#111;
+```
+
+#### 对比
+
+| 维度 | 当前流式 | 时间簇增量准入 |
+|---|---|---|
+| 活跃源数 | K（全部） | C（当前簇，C << K 当簇小时） |
+| 单段不相交文件峰值 | K×R = M（无收益） | C×R（大降） |
+| I/O 延迟 | 无 | 有（只读当前簇） |
+| 堆操作 | O(logK) | O(logC) |
+| 簇检测开销 | 无 | O(K²) flood-fill 或 O(K logK) 预排序 |
+| 文件全重叠时 | K 活跃 | 退化成一簇 = K + 额外开销 |
+| 代码复杂度 | 低 | 高 |
+
+#### 适用判断
+
+| 乱序写入模式 | 簇结构 | 收益 |
+|---|---|---|
+| 分散不同时间点（IoT 补传） | 多小簇 | 峰值大降 + I/O 延迟 |
+| 集中同一时段（批量回填） | 一个大簇 | 无收益 + 额外开销 |
+
+前置：先用真实数据验证乱序文件的时间簇分布。
+
+### 12.6 全重叠 fallback
+
+所有乱序与有序同时间时，优化方案无延迟收益，且 per-row `AppendColVal` 合并慢于 eager 向量化
+`MergeRecord`。fallback 触发条件应同时考虑 N 与 overlap 度（同时间组规模 g）：g 大时常数升高、
+crossover 推后、内存收益消失 → 回退 eager。
+
+### 12.7 后台分层合并
+
+乱序文件过多的 shard/measurement 触发后台预合并/分层 compact，从源头降低 N。长期 compaction 侧工作。
+
+### 12.8 其他
+
+- **config 接入**：`lazyUnorderedMergeEnabled` 接 `Query` 配置项。
+- **merger 池化**：源 record 与输出 batch 进一步池化降分配。
+
+---
+
+## 13. 端到端压测方案
+
+### 13.1 环境
+
+单机 `ts-server`（standalone），固定硬件。关键配置控制 N（乱序文件数）并冻结 compaction：
+
+| 配置 | 取值 | 作用 |
+|---|---|---|
+| `shard-mutable-size-limit` | 小（1MB） | 每批次写入即 flush |
+| `write-cold-duration` | 短（1s） | 加速 flush |
+| `max-unordered-file-number` | 大（2000） | 抑制合并 |
+| `max-concurrent-compactions` | 0 | 关闭 compaction |
+| `max-rows-per-segment` | 可调 | 控制 R |
+
+### 13.2 数据模型与写入
+
+- **有序区**：S series × T 点，升序写入 `[t0, t0+T)`。
+- **乱序区**：N 批次，每批次 R 行/series，时间戳早于有序区，每批次 flush = 1 乱序文件。
+- **重叠度**：no-overlap / partial / full（三组数据集）。
+- 变量：N∈{1,10,32,64,100,200,500,1000}、R∈{20,100,1000}、S∈{1,100,10000}、F∈{1,5,20}。
+
+### 13.3 查询负载
+
+- 主查询：非聚合升序全范围 `SELECT * ...`。
+- 回归：降序、聚合、limit-cut。
+
+### 13.4 指标
+
+总耗时 p50/p95/p99、峰值堆（pprof + RSS）、GC、CPU profile、磁盘 I/O、span 计数。flag on/off 对照。
+
+### 13.5 预期
+
+| 场景 | 预期 |
+|---|---|
+| N=1000, no-overlap, 升序非聚合 | 总耗时 ↓ ~5×、峰值堆 ↓（多段显著） |
+| N=100 | 持平 |
+| N<64 | 走 eager 不退化 |
+| full-overlap | 无收益（记录为 fallback 依据） |
+| 降序/聚合/limit-cut | flag on 与 off 一致 |
+
+---
+
+## 14. 关键前提与风险
+
+### 14.1 segment timeRange 排序前提
+
+堆合并的 `ReadDataBeforeWatermark` 逐 segment 读，依赖 segment timeRange 在文件内按 segPos 单调有序。
+openGemini 的 memtable 落盘前按时间排序，ordered/unordered 文件内部 segment 应当时间有序（“out-of-order”
+是文件间相对概念）。需用真实落盘文件 + 多段差分测试验证。
+
+### 14.2 disjoint 布局前提
+
+核心优化正确性依赖乱序旧、有序新、disjoint（`SplitRecordByTime` 保证）。若乱序与有序时间重叠
+（非正常场景），Phase 1/2 顺序会错。`lazyUnorderedEnabled()` 限制仅升序非聚合非 limit-cut 非 Prom。
+
+### 14.3 ReInit 复用
+
+cursor 复用时必须重置 `locationInit`/`lazyMerger`，否则跨 series 数据错乱。
+
+### 14.4 全重叠退化
+
+全重叠（同时间组 = K）时优化方案常数升高、crossover 推后、内存收益消失。需 fallback 机制（§12.6）。
