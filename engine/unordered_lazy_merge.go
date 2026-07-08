@@ -104,19 +104,6 @@ func (s *unorderedSource) curTime() int64 {
 	return s.rec.Times()[s.pos]
 }
 
-// nextBatchUntil merges ALL rows with time <= watermark into a single record. Every row at or
-// before the watermark must be admitted together so that mergeData can merge them with the
-// ordered batch without missing a same-timestamp out-of-order row. Rows beyond the watermark
-// remain buffered in their sources for a later batch. Returns nil when no rows at or before
-// the watermark are available.
-func (m *lazyUnorderedMerger) nextBatchUntil(watermark int64) (*record.Record, error) {
-	// No row cap: emit every row <= watermark so mergeData sees all same-timestamp out-of-order
-	// rows for the current ordered batch (watermark invariant). Capping would break overlapping
-	// layouts where ordered shares timestamps with not-yet-admitted unordered. The caller splits
-	// the result into maxRowCnt-sized outputs.
-	return m.nextBatch(&watermark, 1<<30)
-}
-
 // nextBatch merges up to maxRows rows. If watermark is non-nil, only rows with time <= watermark
 // are emitted; if nil, all available rows are emitted (unordered-only fallback path).
 func (m *lazyUnorderedMerger) nextBatch(watermark *int64, maxRows int) (*record.Record, error) {

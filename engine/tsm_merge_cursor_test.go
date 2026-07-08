@@ -308,7 +308,7 @@ func TestLazyUnorderedMergeDifferential(t *testing.T) {
 	cases := []tc{
 		{
 			name:      "ordered_only",
-			ordered:   [][]mocRow{{{t: 1, v: 1}, {t: 2, v: 2}}},
+			ordered:   [][]mocRow{{{t: 10, v: 1}, {t: 11, v: 2}}},
 			unordered: [][]mocRow{},
 			maxRows:   100,
 		},
@@ -319,17 +319,18 @@ func TestLazyUnorderedMergeDifferential(t *testing.T) {
 			maxRows:   100,
 		},
 		{
-			name:    "overlap_higher_seq_wins",
-			ordered: [][]mocRow{{{t: 1, v: 1}, {t: 5, v: 5}}},
+			// unordered files overlap each other at t=1; higher sequence wins (no ordered overlap).
+			name:    "unordered_overlap_higher_seq_wins",
+			ordered: [][]mocRow{{{t: 10, v: 1}, {t: 11, v: 5}}},
 			unordered: [][]mocRow{
-				{{t: 2, v: 2}, {t: 4, v: 4}}, // seq 1
-				{{t: 2, v: 99}},              // seq 2, higher -> wins at t=2
+				{{t: 1, v: 2}, {t: 2, v: 4}}, // seq 1
+				{{t: 1, v: 99}},              // seq 2, higher -> wins at t=1
 			},
 			maxRows: 100,
 		},
 		{
-			name:    "nil_column_fills_from_older",
-			ordered: [][]mocRow{{{t: 1, v: 1}}},
+			name:    "nil_column_fills_from_older_unordered",
+			ordered: [][]mocRow{{{t: 10, v: 1}}},
 			unordered: [][]mocRow{
 				{{t: 1, v: 10}},      // seq 1
 				{{t: 1, nilV: true}}, // seq 2, nil -> older (seq 1) value 10 retained
@@ -337,23 +338,23 @@ func TestLazyUnorderedMergeDifferential(t *testing.T) {
 			maxRows: 100,
 		},
 		{
-			name:      "no_overlap",
-			ordered:   [][]mocRow{{{t: 1, v: 1}, {t: 2, v: 2}}},
-			unordered: [][]mocRow{{{t: 10, v: 10}, {t: 11, v: 11}}},
+			name:      "disjoint_unordered_older",
+			ordered:   [][]mocRow{{{t: 10, v: 1}, {t: 11, v: 2}}},
+			unordered: [][]mocRow{{{t: 1, v: 10}, {t: 2, v: 11}}},
 			maxRows:   100,
 		},
 		{
-			name:    "small_batch_ready_buffer_ownership",
-			ordered: [][]mocRow{{{t: 1, v: 1}, {t: 2, v: 2}, {t: 3, v: 3}, {t: 4, v: 4}}},
+			name:    "small_batch_streaming",
+			ordered: [][]mocRow{{{t: 10, v: 1}, {t: 11, v: 2}, {t: 12, v: 3}, {t: 13, v: 4}}},
 			unordered: [][]mocRow{
 				{{t: 1, v: 100}, {t: 3, v: 300}},
 				{{t: 2, v: 200}, {t: 4, v: 400}},
 			},
-			maxRows: 2, // force mergeData to split batches
+			maxRows: 2, // force the heap merger to stream in maxRowCnt batches
 		},
 		{
-			name:    "unordered_spans_multiple_ordered_batches",
-			ordered: [][]mocRow{{{t: 1, v: 1}}, {{t: 5, v: 5}}},
+			name:    "multiple_ordered_files_after_unordered",
+			ordered: [][]mocRow{{{t: 10, v: 1}}, {{t: 11, v: 5}}},
 			unordered: [][]mocRow{
 				{{t: 1, v: 11}, {t: 3, v: 33}, {t: 5, v: 55}, {t: 7, v: 77}},
 			},
@@ -384,17 +385,19 @@ func TestLazyUnorderedMergeDifferential(t *testing.T) {
 		}
 	}
 
-	// Randomized differential testing.
+	// Randomized differential testing on the real (disjoint) layout: unordered times in [1,20],
+	// ordered times in [21,40]. Unordered files may overlap each other (dedup tested); ordered
+	// and unordered never overlap (matches SplitRecordByTime's flush boundary).
 	rng := rand.New(rand.NewSource(20240706))
 	for iter := 0; iter < 3000; iter++ {
 		c := tc{maxRows: 1 + rng.Intn(4)}
 		nOrd := rng.Intn(3)
 		for i := 0; i < nOrd; i++ {
-			c.ordered = append(c.ordered, randomRows(rng, 1+rng.Intn(4)))
+			c.ordered = append(c.ordered, randomRows(rng, 1+rng.Intn(4), 21, 40))
 		}
 		nUnord := 1 + rng.Intn(4)
 		for i := 0; i < nUnord; i++ {
-			c.unordered = append(c.unordered, randomRows(rng, 1+rng.Intn(4)))
+			c.unordered = append(c.unordered, randomRows(rng, 1+rng.Intn(4), 1, 20))
 		}
 		eager := runOne(c, false)
 		lazy := runOne(c, true)
@@ -405,15 +408,16 @@ func TestLazyUnorderedMergeDifferential(t *testing.T) {
 	}
 }
 
-// randomRows generates n rows with distinct ascending times in [1,20], mimicking a real TSSP
-// segment (which is time-sorted with distinct timestamps within a file). Some values are nil to
-// exercise column-level nil merge. Out-of-order behavior comes from overlapping times across
-// files, not duplicate times within a file.
-func randomRows(rng *rand.Rand, n int) []mocRow {
+// randomRows generates n rows with distinct ascending times in [minT, maxT], mimicking a real
+// TSSP segment (time-sorted, distinct timestamps within a file). Some values are nil to exercise
+// column-level nil merge. The real layout is disjoint (unordered older than ordered), so callers
+// pass disjoint time ranges for ordered vs unordered; unordered files may overlap each other.
+func randomRows(rng *rand.Rand, n, minT, maxT int) []mocRow {
 	used := make(map[int64]bool, n)
 	times := make([]int64, 0, n)
+	span := maxT - minT + 1
 	for len(times) < n {
-		t := int64(1 + rng.Intn(20))
+		t := int64(minT + rng.Intn(span))
 		if used[t] {
 			continue
 		}
@@ -483,8 +487,9 @@ func TestLazyUnorderedMergeMultiSegment(t *testing.T) {
 		maxRows   int
 	}{
 		{
-			name:    "multiseg_deferred_per_watermark",
-			ordered: []immutable.TSSPFile{mocTsspFileWithData{rows: []mocRow{{t: 1, v: 1}, {t: 6, v: 6}, {t: 11, v: 11}}, order: true, seq: 1}},
+			// disjoint: unordered (older, multi-segment) then ordered (newer).
+			name:    "multiseg_unordered_older_then_ordered",
+			ordered: []immutable.TSSPFile{mocTsspFileWithData{rows: []mocRow{{t: 20, v: 1}, {t: 21, v: 6}, {t: 22, v: 11}}, order: true, seq: 1}},
 			unordered: []immutable.TSSPFile{
 				mocTsspFileMultiSeg{segs: [][]mocRow{
 					{{t: 2, v: 20}, {t: 3, v: 30}},
@@ -496,7 +501,7 @@ func TestLazyUnorderedMergeMultiSegment(t *testing.T) {
 		},
 		{
 			name:    "multiseg_small_batch",
-			ordered: []immutable.TSSPFile{mocTsspFileWithData{rows: []mocRow{{t: 1, v: 1}, {t: 8, v: 8}}, order: true, seq: 1}},
+			ordered: []immutable.TSSPFile{mocTsspFileWithData{rows: []mocRow{{t: 20, v: 1}, {t: 21, v: 8}}, order: true, seq: 1}},
 			unordered: []immutable.TSSPFile{
 				mocTsspFileMultiSeg{segs: [][]mocRow{
 					{{t: 2, v: 2}},
@@ -507,13 +512,12 @@ func TestLazyUnorderedMergeMultiSegment(t *testing.T) {
 			maxRows: 2,
 		},
 		{
-			name:    "multiseg_overlap_at_boundary",
-			ordered: []immutable.TSSPFile{mocTsspFileWithData{rows: []mocRow{{t: 5, v: 5}}, order: true, seq: 1}},
+			// two multi-seg unordered files overlapping each other (dedup), ordered newer.
+			name:    "multiseg_two_files_overlap_each_other",
+			ordered: []immutable.TSSPFile{mocTsspFileWithData{rows: []mocRow{{t: 20, v: 5}}, order: true, seq: 1}},
 			unordered: []immutable.TSSPFile{
-				mocTsspFileMultiSeg{segs: [][]mocRow{
-					{{t: 1, v: 1}, {t: 5, v: 99}}, // t=5 overlaps ordered; unordered wins
-					{{t: 9, v: 9}},
-				}, seq: 2},
+				mocTsspFileMultiSeg{segs: [][]mocRow{{{t: 1, v: 1}, {t: 5, v: 2}}}, seq: 2},
+				mocTsspFileMultiSeg{segs: [][]mocRow{{{t: 5, v: 99}, {t: 9, v: 9}}}, seq: 3}, // t=5: higher seq wins
 			},
 			maxRows: 100,
 		},

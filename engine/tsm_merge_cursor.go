@@ -501,89 +501,55 @@ func (c *tsmMergeCursor) Next() (*record.Record, error) {
 	return rec, nil
 }
 
-// nextLazy drives the lazy out-of-order merge path. Before merging the current ordered batch,
-// it admits out-of-order rows at or before the batch's watermark into outOrderRecIter, then
-// reuses the existing mergeData to combine unordered (newer) with ordered (older). When the
-// ordered stream is exhausted, it drains the remaining out-of-order data via nextUnorderedOnlyLazy.
+// nextLazy drives the lazy out-of-order merge path: heap K-way merge of the out-of-order
+// locations, streamed in maxRowCnt-sized batches, with no watermark.
+//
+// openGemini's out-of-order data is older than the ordered data (SplitRecordByTime at flush splits
+// at the persisted ordered max; unordered = time <= that max). The two are time-disjoint, so an
+// ascending query's output is simply unordered(older) -> ordered(newer). nextLazy therefore emits
+// all out-of-order data first (in maxRowCnt batches via the heap merger) and only then reads and
+// emits the ordered data. No watermark/deferral is needed (or possible) for ascending; the win is
+// the heap merge (O(M logK) vs eager chain O(N^2 R)) plus a bounded output batch.
+//
+// Correctness relies on the disjoint layout. If unordered and ordered ever overlap in time this
+// ordering would be wrong; lazyUnorderedEnabled keeps this path off for non-ascending/aggregate/
+// limit-cut/Prom shapes, and the disjoint property holds for normal writes.
 func (c *tsmMergeCursor) nextLazy() (*record.Record, error) {
 	if c.ctx.IsAborted() {
 		return nil, nil
 	}
 
-	// If the current ordered batch still has rows, admit out-of-order data up to its watermark
-	// before merging. Skip admission while the ready buffer still has rows (ownership: never
-	// overwrite a partially consumed outOrderRecIter).
-	if c.orderRecIter.hasRemainData() && !c.outOrderRecIter.hasRemainData() {
-		watermark := c.orderRecIter.record.MaxTime(c.ctx.decs.Ascending)
-		if err := c.ensureUnorderedReadyUntil(watermark); err != nil {
+	// Phase 1: stream out-of-order data (older) in maxRowCnt-sized batches. The heap merger holds
+	// only one segment per source at a time, so peak live memory is K*segmentSize + maxRowCnt
+	// rather than eager's full outRec.
+	if c.lazyMerger != nil && !c.lazyMerger.allDone() {
+		if c.outOrderRecIter.hasRemainData() {
+			return mergeData(&c.outOrderRecIter, &c.orderRecIter, c.ctx.maxRowCnt, c.ctx.decs.Ascending), nil
+		}
+		c.ctx.decs.Set(c.ctx.decs.Ascending, c.ctx.tr, c.onlyFirstOrLast, c.ops)
+		c.ctx.decs.SetClosedSignal(c.ctx.closedSignal)
+		rec, err := c.lazyMerger.nextBatch(nil, c.ctx.maxRowCnt)
+		if err != nil {
 			return nil, err
 		}
-	}
-	if c.orderRecIter.hasRemainData() || c.outOrderRecIter.hasRemainData() {
-		return mergeData(&c.outOrderRecIter, &c.orderRecIter, c.ctx.maxRowCnt, c.ctx.decs.Ascending), nil
+		if rec != nil {
+			c.outOrderRecIter.init(rec)
+			return mergeData(&c.outOrderRecIter, &c.orderRecIter, c.ctx.maxRowCnt, c.ctx.decs.Ascending), nil
+		}
 	}
 
-	// Read the next ordered batch.
-	orderRec := c.recordPool.Get()
-	newRec, err := c.readData(true, orderRec)
-	if err != nil {
-		return nil, err
+	// Phase 2: out-of-order exhausted, read and emit the ordered data (newer).
+	if !c.orderRecIter.hasRemainData() {
+		orderRec := c.recordPool.Get()
+		newRec, err := c.readData(true, orderRec)
+		if err != nil {
+			return nil, err
+		}
+		c.orderRecIter.init(newRec)
 	}
-	c.orderRecIter.init(newRec)
-
 	if c.orderRecIter.record == nil {
-		// Ordered stream exhausted: drain remaining out-of-order data in batches.
-		return c.nextUnorderedOnlyLazy()
-	}
-	watermark := c.orderRecIter.record.MaxTime(c.ctx.decs.Ascending)
-	if err := c.ensureUnorderedReadyUntil(watermark); err != nil {
-		return nil, err
-	}
-	return mergeData(&c.outOrderRecIter, &c.orderRecIter, c.ctx.maxRowCnt, c.ctx.decs.Ascending), nil
-}
-
-// ensureUnorderedReadyUntil admits all out-of-order rows with time <= watermark into
-// outOrderRecIter as a single merged batch. It is a no-op if the ready buffer still has rows.
-// All rows at or before the watermark must be admitted before mergeData runs, otherwise a later
-// out-of-order row could miss merging with an ordered row at the same timestamp.
-func (c *tsmMergeCursor) ensureUnorderedReadyUntil(watermark int64) error {
-	if c.lazyMerger == nil || c.outOrderRecIter.hasRemainData() {
-		return nil
-	}
-	c.ctx.decs.Set(c.ctx.decs.Ascending, c.ctx.tr, c.onlyFirstOrLast, c.ops)
-	c.ctx.decs.SetClosedSignal(c.ctx.closedSignal)
-	rec, err := c.lazyMerger.nextBatchUntil(watermark)
-	if err != nil {
-		return err
-	}
-	if rec != nil {
-		c.outOrderRecIter.init(rec)
-	}
-	return nil
-}
-
-// nextUnorderedOnlyLazy drains the remaining out-of-order data once the ordered stream is
-// exhausted, emitting it in maxRowCnt-sized batches.
-func (c *tsmMergeCursor) nextUnorderedOnlyLazy() (*record.Record, error) {
-	if c.lazyMerger == nil {
 		return nil, nil
 	}
-	if c.outOrderRecIter.hasRemainData() {
-		return mergeData(&c.outOrderRecIter, &c.orderRecIter, c.ctx.maxRowCnt, c.ctx.decs.Ascending), nil
-	}
-	if c.lazyMerger.allDone() {
-		return nil, nil
-	}
-	c.ctx.decs.Set(c.ctx.decs.Ascending, c.ctx.tr, c.onlyFirstOrLast, c.ops)
-	c.ctx.decs.SetClosedSignal(c.ctx.closedSignal)
-	rec, err := c.lazyMerger.nextBatch(nil, c.ctx.maxRowCnt)
-	if err != nil {
-		return nil, err
-	}
-	if rec == nil {
-		return nil, nil
-	}
-	c.outOrderRecIter.init(rec)
 	return mergeData(&c.outOrderRecIter, &c.orderRecIter, c.ctx.maxRowCnt, c.ctx.decs.Ascending), nil
 }
 
