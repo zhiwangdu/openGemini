@@ -297,6 +297,53 @@ flowchart TD
 （链式 `MergeRecord` 向量化双指针 vs 堆 per-row 堆操作 + 同时间组列合并）差距更小——N=100 基本持平、
 N=1000 约 5.2×——但发散趋势一致：N 越大堆式优势越明显。
 
+### 8.2 eager 两分支（Overlap / NonOverlap）与 lazy 的对比
+
+eager 链式合并 `MergeRecord(rec_k, outRec)` 在 `MergeRecordLimitRows`（`lib/record/record.go:811`）
+按时间范围分两个分支，二者**大 O 相同但常数不同**：
+
+| 分支 | 触发条件 | 实现 | 常数 |
+|---|---|---|---|
+| **NonOverlap** `mergeRecordNonOverlap` | newRec 与 outRec 时间范围不相交（new.min > old.max 或 new.max < old.min） | `AppendColVal` 整段范围批量拷贝（按列），无 per-row 时间比较 | 低（向量化批量拷贝） |
+| **Overlap** `mergeRecordOverlap`→`appendRecs` | 时间范围相交 | per-row 双指针时间比较；同 timestamp 走 `mergeRecRow` 列级 nil 合并 | 高（per-row 分支 + 单行 AppendRec/mergeRecRow） |
+
+两者都是 **`O(N²·R·F)`**：因为每次 merge 都要把累计 `outRec`（~k·R 行）重新扫一遍/拷一遍
+（NonOverlap 批量重拷、Overlap 逐行重扫），k=1..N 求和得 `O(N²RF)`。差别只在 per-row 常数：
+NonOverlap 批量拷贝 `c_n`，Overlap 逐行合并 `c_o ≈ 2–3·c_n`。
+
+**lazy 堆式合并**：`O(N·R·(logN + F))`——每个源行只处理一次（pop/push O(logK) + 列合并 O(F)），
+**无累计重扫**。常数 `c_l > c_o > c_n`（堆指针跳转 + per-row 列合并，cache 局部性差于 eager 的紧凑循环）。
+overlap 度影响 lazy 的**常数**（同时间组越大，每组 pop/push churn 越多）但不改变大 O。
+
+#### 各自优势点
+
+- **eager-NonOverlap 最强**：批量拷贝、常数最低。lazy 仅靠 big-O（消除 N² 重拷）取胜，crossover ~N=100
+  （实测 `BenchmarkTotal_NoOverlap`：N=100 持平、N=1000 lazy 快 5.2×）。小/中 N 下 eager 更快。
+- **eager-Overlap 较弱**：逐行 + `mergeRecRow`，常数高；但 lazy 在 overlap 场景常数也升高（同时间组
+  churn），crossover 比 NonOverlap **更高**。实测 `BenchmarkFirstPacket_FullOverlap`（全重叠，g=K）：
+  N=100 lazy 仍慢 1.74×（crossover 未达）；N 很大时 lazy 由 big-O 反超。
+- **lazy 的核心优势**：消除累计重扫（每行一次），大 N 下 big-O 主导；外加峰值内存受 batch + 堆 live 源
+  限制（NonOverlap/低重叠时 live 源少 → 内存收益大；全重叠时全部源 live → 内存收益消失）。
+
+#### 理论性能差距
+
+`eager/lazy ≈ N·F / ((logN+F)·(c_l/c_branch))`，N→∞ 时 lazy 必胜：
+
+| 场景 | eager 分支 | lazy 大 O | crossover(N*) | N=1000 实测 |
+|---|---|---|---|---|
+| 不重叠（g≈1） | NonOverlap `O(N²RF)` | `O(NR(logN+F))` | ~100 | lazy 快 5.2× |
+| 全重叠（g=K=N） | Overlap `O(N²RF)` | `O(NR(logN+F))`（常数↑） | >100 | 未测；理论大 N 反超 |
+
+> 关键：lazy 的收益**不是无条件的**——它在大 N 由 big-O 主导获胜，但常数因子（堆操作 + per-row 列合并）
+> 把 crossover 推后，且 **overlap 越高 crossover 越大**。全重叠（同时间组 = K）是 lazy 最差场景：
+> crossover 最高、且无内存收益。
+
+#### 对 §10.7 fallback 的细化
+
+原 §10.7 只提“全重叠 fallback”。本分析表明 fallback 触发条件应同时考虑 **N 与 overlap 度（同时间组
+规模 g）**：g 大（多文件共享 timestamp）时 lazy 常数升高、crossover 推后、且内存收益消失 → 应回退
+eager。可在 `nextBatchUntil` 统计同时间组平均规模，超阈值时切回 eager 全量读。
+
 ## 9. 关键前提与风险
 
 **segment timeRange 必须在文件内按 segPos 单调有序**，否则 watermark 延迟会漏数据：
