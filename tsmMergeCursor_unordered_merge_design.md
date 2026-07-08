@@ -59,59 +59,63 @@ Phase 2（schema/field 预过滤）、Phase 4（后台分层合并）、降序�
 receiver。合并 scratch 仍用 `var mergeRecord record.Record`。`reset()` 先 `outOrderRecIter.reset()`
 （释放对池槽的引用）再 `unorderPool.Put()`。
 
-## 5. Phase 3：惰性堆式 K 路合并（flag 灰度）
+## 5. Phase 3：堆式 K 路合并 + 流式分批（flag 灰度）
 
 ### 5.1 核心思路
-不在 `FirstTimeInit` 一次性读完所有乱序数据。每个有序 batch 决定一个 watermark（升序 = 该 batch
-的最大时间），只把时间 `<= watermark` 的乱序数据读出并合并，交给已有的 `mergeData`
-（`MergeRecordByMaxTimeOfOldRec`）与有序数据合并。乱序数据按 watermark 分批读入，**峰值内存受
-batch + 堆中 live 源数限制**，而非全部乱序数据量。合并用 **`container/heap` K 路归并**，复杂度
-`O(M·log K)`（M = N·R 总行数），替换链式 `O(N²·R)`。
+
+openGemini 的乱序数据比有序数据**更旧**（`SplitRecordByTime` 在 flush 时按已落盘有序最大时间切分：
+`time <= flushTime` → 乱序，`> flushTime` → 有序；二者时间不相交）。因此升序查询的输出顺序就是
+**乱序(旧) → 有序(新)**，无需交错合并或 watermark 延迟。
+
+基于此，lazy 路径简化为：**用堆 K 路合并乱序文件，按 `maxRowCnt` 流式分批输出，全部乱序输出完
+再读有序**。不再有 watermark / `ensureUnorderedReadyUntil` / `nextBatchUntil` 等机制。合并复杂度
+`O(M·logK)`（M = N·R 总行数），替换 eager 链式 `O(N²·R)`；输出按 `maxRowCnt` 分批，每批只合并
+`maxRowCnt` 行（而非首批全量），降首包延迟与分配峰值。
 
 ### 5.2 组件
 
 - `engine/unordered_lazy_merge.go` `lazyUnorderedMerger`：
   - 持有 `sources []*unorderedSource`（每个乱序 location 一个）和 `heap lazyMergerHeap`。
   - `unorderedSource`：`loc`、`seq`（文件序列号，越大越新）、`rec`、`pos`、`done`、`inHeap`。
-  - `nextBatchUntil(watermark)`：emit **所有** `time <= watermark` 的行（无行数上限，正确性要求：
-    `mergeData` 必须看到该 watermark 内全部同时间点乱序行）。
-  - `nextBatch(nil, maxRows)`：有序耗尽后的乱序-only 路径，按 `maxRows` 分批。
+  - `nextBatch(watermark, maxRows)`：watermark 为 nil（乱序-only，准入全部），按 `maxRows` cap 输出。
+    每源只持当前 1 个 segment，耗尽才读下一个 → 堆 live = K × segmentSize。
   - 堆序：当前行时间升序，同时间 `seq` 降序（最新者先 pop）。
   - `appendMergedSameTimeRow`：同时间组按 newest→oldest 折叠，每列取最新非 nil 值，等价于
     `mergeRecRow` 折叠。所有输入 record 共享 `ctx.schema`，按列下标对齐。
   - `isAborted` 回调：合并循环顶检查，abort 时 `return nil, nil`（丢弃半成品）。
 
-- `engine/immutable/location.go` `ReadDataBeforeWatermark(filterOpts, dst, watermark)`：读下一个
-  “时间 `<= watermark` 且与查询时间范围重叠”的 segment，应用与 `ReadData` 相同的
-  `FilterByTime`/`FilterByField`；不重叠查询范围的 segment 跳过（推进），首个超过 watermark 的
-  segment **保留不动**并返回 nil（延迟到 watermark 推进后再读）。**仅支持升序**。另暴露
-  `Location.HasNext()`、`Location.Sequence()`、`LocationCursor.LocationAt(i)`。
+- `engine/immutable/location.go` `ReadDataBeforeWatermark(filterOpts, dst, watermark)`：读下一个与查询
+  时间范围重叠的 segment，应用 `FilterByTime`/`FilterByField`。lazy 路径传 watermark=maxInt64（不
+  延迟），逐 segment 读。另暴露 `Location.HasNext()`、`Location.Sequence()`、
+  `LocationCursor.LocationAt(i)`。
 
 - `engine/tsm_merge_cursor.go`：
   - `FirstTimeInit` 惰性分支：排序乱序 locations、`Set` decs、创建 `lazyMerger`，**不读数据**。
-  - `nextLazy()`：若有序 batch 有剩余且 ready buffer 空，先 `ensureUnorderedReadyUntil(watermark)`
-    再 `mergeData`；有序耗尽则走 `nextUnorderedOnlyLazy()`。
-  - `ensureUnorderedReadyUntil(watermark)`：ready buffer 非空时直接返回（所有权不变式）；否则
-    `lazyMerger.nextBatchUntil(watermark)` 产出全部 `<= watermark` 的乱序行 init 进 `outOrderRecIter`。
-  - `nextUnorderedOnlyLazy()`：乱序-only drain，`nextBatch(nil, maxRowCnt)` 分批。
+  - `nextLazy()` 两阶段：
+    - **Phase 1**（乱序流式）：`lazyMerger.nextBatch(nil, maxRowCnt)` 每次产 `maxRowCnt` 行 →
+      `outOrderRecIter` → `mergeData` 输出。重复直到 `allDone()`。
+    - **Phase 2**（有序）：乱序耗尽后读有序 batch，`mergeData` 输出。有序与乱序 disjoint，
+      `mergeData` 走 NonOverlap 批量分支（廉价）。
 
 ### 5.3 正确性不变式
 
-1. **Watermark**：返回任何 `t <= watermark` 的行前，所有可能产生该时间的乱序 location 已被读取并
-   进入 merger。`nextBatchUntil` 无行数上限地 emit 全部 `<= watermark` 的行，保证 `mergeData` 不漏
-   同时间点乱序覆盖。
-2. **同时间覆盖**：堆按 `seq` 降序 pop 同时间组，`appendMergedSameTimeRow` newest 非 nil 胜出，与
-   eager 链式 `MergeRecord(newRec=高seq, oldRec=累计)` 语义等价。
-3. **Ready buffer 所有权**：`ensureUnorderedReadyUntil` 在 `outOrderRecIter.hasRemainData()` 时直接
-   返回，绝不覆盖未消费完的 batch（`mergeData` 可能因 `maxRowCnt` 只消费一部分）。
-4. **有序耗尽 fallback**：`nextUnorderedOnlyLazy` 在有序读完后 drain 剩余乱序，按 `maxRows` 分批。
-5. **终止**：堆空且所有源 `done`/`deferred` 时 `nextBatch` 返回 nil；`allDone()` 判定 drain 完成，
-   无死循环。
+1. **Disjoint 布局**：乱序 `time <= flushTime`、有序 `time > flushTime`，不相交。升序输出 =
+   乱序(旧) → 有序(新)，Phase 1 全部输出乱序后再 Phase 2 输出有序，顺序正确，无需交错去重。
+2. **同时间覆盖（乱序间）**：多个乱序文件同 timestamp 时，堆按 `seq` 降序 pop 同时间组，
+   `appendMergedSameTimeRow` newest 非 nil 胜出，与 eager 链式 `MergeRecord(newRec=高seq, oldRec=累计)`
+   语义等价。
+3. **终止**：堆空且所有源 `done` 时 `nextBatch` 返回 nil；`allDone()` 判定 Phase 1 完成，转 Phase 2；
+   有序也读完返回 nil。无死循环。
+4. **abort**：`nextBatch` 循环顶检查 `isAborted`，abort 时丢弃半成品返回 nil。
+
+> **前提**：disjoint 布局是 `SplitRecordByTime` 的 flush 语义保证的（正常写）。若乱序与有序时间
+> 重叠（非正常场景），Phase 1/2 顺序会错。`lazyUnorderedEnabled()` 限制仅升序非聚合非 limit-cut
+> 非 Prom，作为额外保护；降序/limit-cut 的 deferral 见 §10.2/§10.3。
 
 ### 5.4 小 N 阈值（防退化）
 `lazyUnorderedMergeMinLocations`（默认 64，`atomic.Int32`，`SetLazyUnorderedMergeMinLocations` 可调）：
-命中的乱序 location 数低于阈值时回退 eager。benchmark 显示交叉点约 N=100（N=10 惰性慢 2.2×，
-N=100 持平，N=1000 惰性快 5×）。阈值保证开启 flag **不退化**小 N 常见场景。0 表示禁用阈值（测试用）。
+命中的乱序 location 数低于阈值时回退 eager。benchmark 显示交叉点约 N=100（N=10 惰性慢 2.1×，
+N=100 持平，N=1000 惰性快 5.4×）。阈值保证开启 flag **不退化**小 N 常见场景。0 表示禁用阈值（测试用）。
 
 ### 5.5 Feature flag 与适用范围
 `lazyUnorderedMergeEnabled`（`atomic.Bool`，默认关）：`SetLazyUnorderedMergeEnabled` 运行时切换。
@@ -120,7 +124,7 @@ N=100 持平，N=1000 惰性快 5×）。阈值保证开启 flag **不退化**�
 
 ### 5.6 流程图（优化后）
 
-#### 5.6.1 惰性路径的初始化与迭代
+#### 5.6.1 初始化与两阶段迭代
 
 ```mermaid
 flowchart TD
@@ -128,46 +132,40 @@ flowchart TD
     B --> O["First Next"]
     O --> P["FirstTimeInit"]
     P --> Q{"lazyUnorderedEnabled?"}
-    Q -- "no (eager, 默认)" --> S["sort + read ALL unordered until EOF + chain merge → outRec"]
+    Q -- "no (eager, 默认)" --> S["sort + read ALL unordered + chain merge → outRec"]
     Q -- "yes" --> R["sort unordered locations; newLazyUnorderedMerger (不读数据)"]
     S --> T["locationInit = true"]
     R --> T
 
-    T --> N["Next"]
-    N --> G{"lazyMerger != nil?"}
-    G -- "no" --> E0["eager: mergeData(outOrderRecIter, orderRecIter)"]
-    G -- "yes" --> L["nextLazy"]
-    L --> L1{"orderRecIter has remain?"}
-    L1 -- "yes, outOrder empty" --> L2["ensureUnorderedReadyUntil(ordered watermark)"]
-    L1 -- "yes, outOrder has remain" --> L4["mergeData"]
-    L1 -- "no" --> L3["read next ordered batch"]
-    L3 --> L5{"ordered record nil?"}
-    L5 -- "yes (exhausted)" --> L6["nextUnorderedOnlyLazy: drain remaining unordered"]
-    L5 -- "no" --> L2
-    L2 --> L4
-    L4 --> OUT["record to seriesCursor"]
-
-    L2 --> M1["lazyMerger.nextBatchUntil(watermark)"]
-    M1 --> M2["ReadDataBeforeWatermark per location (only segments minT <= watermark)"]
-    M2 --> M3["heap K-way merge: same-time group + seq precedence"]
-    M3 --> M4["outOrderRecIter.init(ready batch)"]
+    T --> N["Next → nextLazy"]
+    N --> P1{"Phase 1: unordered allDone?"}
+    P1 -- "no" --> P1a{"outOrderRecIter has remain?"}
+    P1a -- "yes" --> P1b["mergeData → emit unordered batch"]
+    P1a -- "no" --> P1c["lazyMerger.nextBatch(nil, maxRowCnt)"]
+    P1c --> P1d["heap K-way merge maxRowCnt rows"]
+    P1d --> P1b
+    P1b --> OUT["record to seriesCursor"]
+    P1 -- "yes" --> P2{"Phase 2: orderRecIter has remain?"}
+    P2 -- "no" --> P2a["read next ordered batch"]
+    P2a --> P2b{"ordered nil?"}
+    P2b -- "yes" --> P2c["return nil (done)"]
+    P2b -- "no" --> P2d["mergeData → emit ordered"]
+    P2 -- "yes" --> P2d
+    P2d --> OUT
 
     S:::hot
     R:::amp
-    M2:::io
-    M3:::hot
-    L6:::amp
+    P1d:::hot
     classDef hot fill:#ffd6d6,stroke:#c62828,stroke-width:2px,color:#111;
     classDef amp fill:#fff0c2,stroke:#b26a00,stroke-width:2px,color:#111;
-    classDef io fill:#d9e8ff,stroke:#1565c0,stroke-width:2px,color:#111;
 ```
 
 标注：
 - eager 分支（默认）保留原 `FirstTimeInit` 全量读 + 链式合并。
-- 惰性分支在 `FirstTimeInit` 只建 `lazyMerger`，**不读乱序数据**；乱序按 ordered watermark 分批读。
-- 有序耗尽走 `nextUnorderedOnlyLazy` drain 剩余乱序。
+- lazy 分支：Phase 1 堆合并乱序按 `maxRowCnt` 流式输出（每批只合并 `maxRowCnt` 行，非全量）；Phase 2
+  乱序耗尽后读有序（disjoint，`mergeData` 走 NonOverlap 廉价分支）。
 
-#### 5.6.2 惰性堆式 K 路合并数据流
+#### 5.6.2 堆式 K 路合并数据流
 
 ```mermaid
 flowchart LR
@@ -175,76 +173,66 @@ flowchart LR
     U2["unordered file 2"] --> L2["Location 2"]
     UN["unordered file N"] --> LN["Location N"]
 
-    L1 --> W["ReadDataBeforeWatermark (segment minT <= watermark)"]
+    L1 --> W["ReadDataBeforeWatermark (逐 segment, 每文件持当前段)"]
     L2 --> W
     LN --> W
     W --> H["heap K-way: pop min time, same-time group by seq desc"]
     H --> SG["appendMergedSameTimeRow: newest non-nil wins"]
-    SG --> RB["outOrderRecIter (ready batch, <= watermark)"]
+    SG --> RB["outOrderRecIter (ready batch, ≤ maxRowCnt)"]
 
-    OF["ordered file stream"] --> OC["ordered LocationCursor.ReadData"]
+    RB --> MD["mergeData(outOrderRecIter, orderRecIter=nil)"]
+    MD --> OUT1["unordered batch → seriesCursor"]
+
+    OF["ordered file stream (Phase 2)"] --> OC["ordered LocationCursor.ReadData"]
     OC --> OR["orderRecIter"]
-    OR --> WM["watermark = ordered batch max time"]
-    WM --> W
-    RB --> MD["mergeData(outOrderRecIter, orderRecIter)"]
-    OR --> MD
-    MD --> OUT["record to seriesCursor"]
+    OR --> MD2["mergeData(outOrderRecIter=nil, orderRecIter)"]
+    MD2 --> OUT2["ordered batch → seriesCursor"]
 
     W:::io
     H:::hot
     SG:::cpu
     RB:::mem
     MD:::cpu
-    WM:::amp
     classDef hot fill:#ffd6d6,stroke:#c62828,stroke-width:2px,color:#111;
     classDef io fill:#d9e8ff,stroke:#1565c0,stroke-width:2px,color:#111;
     classDef cpu fill:#e5ffd8,stroke:#2e7d32,stroke-width:2px,color:#111;
     classDef mem fill:#f3e5ff,stroke:#6a1b9a,stroke-width:2px,color:#111;
-    classDef amp fill:#fff0c2,stroke:#b26a00,stroke-width:2px,color:#111;
 ```
 
 标注（对比 §4.3 旧路径）：
 - 旧：`LocationCursor.ReadData` 读到 EOF，链式 `MergeRecord(rec, outRec)` 累计拷贝 `O(N²R)`，`outRec` = 全部乱序。
-- 新：`ReadDataBeforeWatermark` 只读 `minT <= watermark` 的 segment；堆 K 路合并 `O(M·logK)`；ready batch 仅含 `<= watermark` 的行。
-- watermark 由 ordered batch 驱动；超过 watermark 的 segment 保留不动，延迟到下个 batch。
+- 新：堆 K 路合并 `O(M·logK)`；每源只持当前 segment（多段文件下 K 段 << 全量）；输出按 `maxRowCnt` 分批。
+- 乱序与有序 disjoint，Phase 1 全部输出乱序后再 Phase 2 输出有序，无交错。
 
-#### 5.6.3 watermark 推进与乱序延迟（eager vs lazy 对比）
+#### 5.6.3 eager vs lazy 对比（disjoint 真实布局）
 
 ```mermaid
 flowchart TD
     subgraph OLD["eager（旧）"]
-        OA["ordered batch 1"] --> OB["FirstTimeInit: 读全部 N 个乱序文件"]
-        OB --> OC["chain merge O(N²R)"]
-        OC --> OD["outRec = 全部乱序"]
-        OD --> OE["mergeData batch 1"]
+        OB["FirstTimeInit: 读全部 N 个乱序文件"] --> OC["chain merge O(N²R)"]
+        OC --> OD["outRec = 全部乱序 (一次性)"]
+        OD --> OE["mergeData: 乱序 + 有序"]
     end
     subgraph NEW["lazy（优化后）"]
-        NA["ordered batch 1 (watermark = maxT1)"] --> NB["admit unordered segments <= maxT1"]
-        NB --> NC["heap K-way merge (仅 admitted)"]
-        NC --> ND["mergeData batch 1"]
-        ND --> NE["ordered batch 2 (watermark = maxT2 > maxT1)"]
-        NE --> NF["admit unordered in (maxT1, maxT2]"]
-        NF --> NG["heap merge"]
-        NG --> NH["mergeData batch 2"]
-        NH --> NI["ordered exhausted"]
-        NI --> NJ["drain remaining unordered"]
+        NB["Phase 1: nextBatch(nil, maxRowCnt)"] --> NC["heap K-way merge maxRowCnt 行"]
+        NC --> ND["emit 乱序 batch"]
+        ND --> NE{"allDone?"}
+        NE -- "no" --> NB
+        NE -- "yes" --> NF["Phase 2: 读有序 batch"]
+        NF --> NG["mergeData: 有序 (NonOverlap)"]
     end
     OB:::hot
     OC:::hot
     OD:::mem
-    NB:::io
     NC:::hot
-    NF:::io
-    NJ:::amp
     classDef hot fill:#ffd6d6,stroke:#c62828,stroke-width:2px,color:#111;
-    classDef io fill:#d9e8ff,stroke:#1565c0,stroke-width:2px,color:#111;
     classDef mem fill:#f3e5ff,stroke:#6a1b9a,stroke-width:2px,color:#111;
-    classDef amp fill:#fff0c2,stroke:#b26a00,stroke-width:2px,color:#111;
 ```
 
 标注：
-- eager 在首批前读完全部乱序、构造完整 `outRec`（内存峰值 = 全部乱序 `O(F·U)`）。
-- lazy 按 ordered watermark 分批准入，峰值 = 当前 watermark 内乱序 + batch；乱序多在后续时段时首批收益最大（见 §8 benchmark：N=1000 时 5.2× 更快、58× 省内存）。
+- eager 首批前读完全部乱序、链式合并构造完整 `outRec`（`O(N²R)` + 全量内存）。
+- lazy 按 `maxRowCnt` 流式堆合并，首批只合并 `maxRowCnt` 行；乱序全部输出后读有序（disjoint）。
+- 见 §8 benchmark：N=1000 总耗时 5.4× 更快、分配量 64× 更少、首包 28× 更快。
 
 ## 6. 生命周期：ReInit 修复
 
@@ -272,19 +260,30 @@ flowchart TD
 ## 8. 性能（benchmark）
 
 `engine/tsm_merge_cursor_bench_test.go`，mock 读（无 I/O，反映 CPU/分配；真实 I/O 节省另算）。阈值
-置 0 以测量纯 lazy 路径。
+置 0 以测量纯 lazy 路径。数据布局为**真实布局**（乱序旧、有序新，disjoint）。
 
-`BenchmarkTotal_NoOverlap`（drain 到完成 = 真实查询指标）：
+`BenchmarkRealLayout_Total`（drain 到完成 = 真实查询指标）+ `BenchmarkRealLayout_FirstPacket`（首包）：
 
-| N | Eager | Lazy | 时间 | 峰值内存 |
-|---|---|---|---|---|
-| 10 | 19.8 µs | 43.6 µs | lazy 慢（小 N → 生产由阈值路由到 eager） | 42 KB vs 28 KB |
-| 100 | 589 µs | 618 µs | **持平** | 2.1 MB → 302 KB（**7×**） |
-| 1000 | 43.7 ms | 8.45 ms | **5.2× 更快** | 175 MB → 3 MB（**58×**） |
+| N | Eager Total | Lazy Total | Eager 首包 | Lazy 首包 | B/op (N=1000) |
+|---|---|---|---|---|---|
+| 10 | 20.5 µs | 42.6 µs（慢，阈值路由 eager） | 22.0 µs | 42.7 µs | — |
+| 100 | 574 µs | 613 µs（持平） | 599 µs | 392 µs | — |
+| 1000 | 44.0 ms | 8.14 ms（**5.4×**） | 44.4 ms | **1.57 ms（28×）** | 175 MB → 2.75 MB（**64×**） |
 
-- 目标 1（内存/GC）：N≥100 时峰值内存降 7–58×。
-- 目标 2（总性能）：N=1000 快 5.2×；小 N 由阈值保护不退化。
-- 惰性路径首包/内存随 N 近线性，eager 随 N 超线性（全量预读 + O(N²) 链式合并）。
+`BenchmarkRealLayout_MultiSeg`（N=100, S=10 段/文件, R=20, M=20000）：
+
+| 指标 | Eager | Lazy |
+|---|---|---|
+| 总耗时 | 57.9 ms | 7.1 ms（**8×**） |
+| B/op（分配量） | 175 MB | 3.1 MB（**56×**） |
+| maxHeapInuse | 24.0 MB | 14.5 MB（1.7×） |
+
+- 目标 1（内存/GC）：N≥100 时分配量降 56–64×（GC 压力）；峰值 live 内存多段下 1.7× 降低
+  （HeapInuse 被分配量主导，live 峰值降低需真实大 M 才显著）。
+- 目标 2（总性能）：N=1000 快 5.4×；多段（真实文件）快 8×；小 N 由阈值保护不退化。
+- 首包：N=1000 快 28×（流式分批每批只合并 `maxRowCnt` 行，非首批全量）。
+- lazy 随 N 近线性（每行一次 `O(logK)`），eager 随 N 超线性（`O(N²R)` 链式重拷）；多段文件
+  eager 更差（N×S 次链式迭代），lazy 与段数无关。
 
 ### 8.1 复杂度对比图
 
@@ -522,8 +521,8 @@ fallback（lazy 路径发现首批即准入大部分乱序时切回 eager）。
 
 | 文件 | 改动 |
 |---|---|
-| `engine/tsm_merge_cursor.go` | 计数、`unorderPool`、`lazyMerger`/`nextLazy`/`ensureUnorderedReadyUntil`/`nextUnorderedOnlyLazy`、flag、阈值、ReInit 重置 |
-| `engine/unordered_lazy_merge.go` | 新增：堆 K 路 merger |
+| `engine/tsm_merge_cursor.go` | 计数、`unorderPool`、`lazyMerger`/`nextLazy`（两阶段流式）、flag、阈值、ReInit 重置 |
+| `engine/unordered_lazy_merge.go` | 堆 K 路 merger（`nextBatch` + `appendMergedSameTimeRow`） |
 | `engine/immutable/location.go` | `ReadDataBeforeWatermark`、`HasNext`、`Sequence` |
 | `engine/immutable/location_cursor.go` | `LocationAt` |
 | `engine/immutable/tssp_file_meta.go` | `NewChunkMetaWithSegs`（测试用多段构造） |
@@ -547,3 +546,12 @@ fallback（lazy 路径发现首批即准入大部分乱序时切回 eager）。
 10. `test(engine): benchmarks for lazy vs eager unordered merge`
 11. `perf(engine): heap K-way merge + small-N threshold for lazy unordered merge`
 12. `revert(engine): remove no-op nil-outRec guard (RowNums is nil-safe)`
+13. `docs: add unordered merge design, limit-cut analysis, and reorganize`
+14. `docs: correct nil-outRec panic claim in unordered merge design`
+15. `docs: add optimized-flow mermaid diagrams to unordered merge design`
+16. `docs: add complexity comparison chart (chain O(N²R) vs heap O(M·logK))`
+17. `docs: add end-to-end performance test plan for unordered merge optimization`
+18. `docs: analyze eager Overlap/NonOverlap branches vs lazy merge`
+19. `test(engine): add real-layout benchmark (ordered newer, unordered older)`
+20. `test(engine): add multi-segment + single-segment real-layout peak benchmarks`
+21. `refactor(engine): simplify ascending lazy path (no watermark, heap + maxRowCnt streaming)`
