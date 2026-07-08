@@ -286,6 +286,17 @@ flowchart TD
 - 目标 2（总性能）：N=1000 快 5.2×；小 N 由阈值保护不退化。
 - 惰性路径首包/内存随 N 近线性，eager 随 N 超线性（全量预读 + O(N²) 链式合并）。
 
+### 8.1 复杂度对比图
+
+链式 `O(N²·R)` 与堆式 `O(M·logK)=O(N·R·log₂N)` 在同一对数纵轴上随 N 的增长对比
+（R=20，理论常数=1；交互版见 `unordered_merge_complexity_chart.html`）：
+
+![乱序合并复杂度对比](unordered_merge_complexity_chart.png)
+
+纯复杂度比 `N/log₂N`：N=100 约 15×、N=1000 约 100×；实测（`Total_NoOverlap`）因常数因子
+（链式 `MergeRecord` 向量化双指针 vs 堆 per-row 堆操作 + 同时间组列合并）差距更小——N=100 基本持平、
+N=1000 约 5.2×——但发散趋势一致：N 越大堆式优势越明显。
+
 ## 9. 关键前提与风险
 
 **segment timeRange 必须在文件内按 segPos 单调有序**，否则 watermark 延迟会漏数据：
