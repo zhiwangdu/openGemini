@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -57,6 +58,7 @@ const (
 	verifyNode            = "verifynode"
 	memUsageLimit         = "memusagelimit"
 	BackgroundReadLimiter = "backgroundReadLimiter"
+	lazyUnorderedMerge    = "lazy_unordered_merge"
 )
 
 var (
@@ -168,6 +170,14 @@ func (e *EngineImpl) processReq(req *msgservice.SysCtrlRequest) (map[string]stri
 		}
 		setMemUsageLimit(int32(limit))
 		return nil, nil
+	case lazyUnorderedMerge:
+		switchOn, err := syscontrol.GetBoolValue(req.Param(), "switchon")
+		if err != nil {
+			return nil, err
+		}
+		SetLazyUnorderedMergeEnabled(switchOn)
+		log.Info("set lazy unordered merge switch", zap.Bool("switchon", switchOn))
+		return map[string]string{"lazy_unordered_merge": strconv.FormatBool(switchOn)}, nil
 	case BackgroundReadLimiter:
 		limit, err := syscontrol.GetBytesValue(req.Param(), "limit")
 		if err != nil {

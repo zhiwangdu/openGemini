@@ -46,7 +46,7 @@ STORE_HTTP_URLS = [                                         # for /debug/ctrl?mo
 DB_NAME = "benchdb"
 RP_NAME = "autogen"
 MST_NAME = "mst"
-FLAG_API = f"{SQL_URL}/debug/ctrl?mod=sysctrl&key=lazy_unordered_merge&value="  # toggle endpoint
+FLAG_API = f"{SQL_URL}/debug/ctrl?mod=lazy_unordered_merge"  # POST with &switchon=true/false
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -131,14 +131,16 @@ class Cluster:
         time.sleep(self._flush_wait if hasattr(self, '_flush_wait') else 2.0)
 
     def set_lazy_flag(self, enabled: bool):
-        """Toggle the lazy unordered merge flag via sysctrl endpoint."""
+        """Toggle the lazy unordered merge flag via sysctrl endpoint (POST)."""
         val = "true" if enabled else "false"
         try:
-            resp = self.session.get(f"{FLAG_API}{val}", timeout=5)
+            resp = self.session.post(f"{FLAG_API}&switchon={val}", timeout=5)
             if resp.status_code != 200:
-                print(f"  [flag] set to {val} returned {resp.status_code} (endpoint may not exist yet)")
+                print(f"  [flag] set to {val} returned {resp.status_code}: {resp.text}")
+            else:
+                print(f"  [flag] set to {val} OK")
         except requests.ConnectionError:
-            print(f"  [flag] endpoint not available (flag toggle requires sysctrl wiring)")
+            print(f"  [flag] endpoint not available")
 
     def get_span_metrics(self) -> dict:
         """Try to fetch span/metrics info (if available)."""
@@ -157,8 +159,17 @@ class DataWriter:
 
     def _ensure_db(self):
         """Create database and retention policy."""
-        self.session.post(f"{SQL_URL}/query", data={"q": f"CREATE DATABASE {DB_NAME}"})
-        print(f"[data] database {DB_NAME} ready")
+        for attempt in range(5):
+            resp = self.session.post(f"{SQL_URL}/query", data={"q": f"CREATE DATABASE {DB_NAME}"})
+            if resp.status_code == 200:
+                # Verify the database exists
+                check = self.session.post(f"{SQL_URL}/query", data={"q": f"SHOW DATABASES"})
+                dbs = check.json().get("results", [{}])[0].get("series", [{}])[0].get("values", [])
+                if any(DB_NAME in (v if isinstance(v, list) else [v]) for v in dbs):
+                    print(f"[data] database {DB_NAME} ready")
+                    return
+            time.sleep(1)
+        raise RuntimeError(f"failed to create database {DB_NAME}")
 
     def _write_batch(self, lines: List[str]):
         """Write a batch of Line Protocol lines."""
