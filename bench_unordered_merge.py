@@ -23,6 +23,7 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -37,6 +38,7 @@ from urllib3.util.retry import Retry
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 CLUSTER_SH = "/home/duzhiwang/workspace/data/openGeminiCluster/cluster.sh"
+CLUSTER_DIR = "/home/duzhiwang/workspace/data/openGeminiCluster"
 SQL_URL = "http://127.0.0.1:8086"                          # InfluxDB-compatible API
 STORE_HTTP_URLS = [                                         # for /debug/ctrl?mod=flush
     "http://127.0.0.1:8091",
@@ -47,6 +49,19 @@ DB_NAME = "benchdb"
 RP_NAME = "autogen"
 MST_NAME = "mst"
 FLAG_API = f"{SQL_URL}/debug/ctrl?mod=lazy_unordered_merge"  # POST with &switchon=true/false
+
+# Config snippet to disable compaction/merge — written as a separate override file that
+# the cluster.sh render_config merges into the final config. We modify the [data.merge]
+# section in-place since the config already has one.
+DISABLE_COMPACTION_OVERRIDES = {
+    "data.memtable.write-cold-duration": "2s",
+    "data.memtable.shard-mutable-size-limit": "1m",
+    "data.compact.max-concurrent-compactions": "0",
+    "data.compact.compact-full-write-cold-duration": "9999h",
+    "data.merge.max-unordered-file-number": "99999",
+    "data.merge.max-unordered-file-size": "999g",
+    "data.merge.min-interval": "9999h",
+}
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -87,8 +102,67 @@ def make_session() -> requests.Session:
 class Cluster:
     def __init__(self):
         self.session = make_session()
+        self._flush_wait = 2.0
+        self._config_patched = False
 
-    def start(self):
+    def patch_configs(self):
+        """Modify config files to disable compaction/merge.
+
+        The config has [data.merge] as an active section, but [data.memtable] and
+        [data.compact] are commented out (# [data.memtable]). For commented sections
+        we append new active sections at the end. For [data.merge] we modify in-place.
+        """
+        if self._config_patched:
+            return
+        for i in (1, 2, 3):
+            conf_path = os.path.join(CLUSTER_DIR, "config", f"openGemini-{i}.conf")
+            backup = conf_path + ".bak"
+            if not os.path.exists(backup):
+                shutil.copy2(conf_path, backup)
+
+            with open(backup, "r") as f:
+                content = f.read()
+
+            # 1. Modify [data.merge] fields in-place (uncomment + override)
+            merge_overrides = {
+                "max-unordered-file-number": "99999",
+                "max-unordered-file-size": '"999g"',
+                "min-interval": '"9999h"',
+            }
+            for field, val in merge_overrides.items():
+                # Replace commented line like: "  # max-unordered-file-number = 64"
+                import re
+                pattern = rf'(\s*)#\s*{re.escape(field)}\s*=.*'
+                replacement = rf'\g<1>{field} = {val}'
+                content = re.sub(pattern, replacement, content)
+
+            # 2. Append new active sections for memtable + compact (they're commented in original)
+            content += "\n# --- bench: disable compaction ---\n"
+            content += "[data.memtable]\n"
+            content += "  write-cold-duration = \"2s\"\n"
+            content += "  shard-mutable-size-limit = \"1m\"\n"
+            content += "[data.compact]\n"
+            content += "  max-concurrent-compactions = 0\n"
+            content += "  compact-full-write-cold-duration = \"9999h\"\n"
+
+            with open(conf_path, "w") as f:
+                f.write(content)
+            print(f"[cluster] patched config {i}: compaction/merge disabled")
+        self._config_patched = True
+
+    def restore_configs(self):
+        """Restore original config files from .bak."""
+        for i in (1, 2, 3):
+            conf_path = os.path.join(CLUSTER_DIR, "config", f"openGemini-{i}.conf")
+            backup = conf_path + ".bak"
+            if os.path.exists(backup):
+                os.rename(backup, conf_path)
+                print(f"[cluster] restored config {i}")
+        self._config_patched = False
+
+    def start(self, patch_compaction=True):
+        if patch_compaction:
+            self.patch_configs()
         print("[cluster] starting...")
         subprocess.run([CLUSTER_SH, "start"], check=True)
         self._wait_ready(timeout=60)
@@ -128,7 +202,7 @@ class Cluster:
                     print(f"  [flush] {url} returned {resp.status_code}")
             except requests.ConnectionError as e:
                 print(f"  [flush] {url} failed: {e}")
-        time.sleep(self._flush_wait if hasattr(self, '_flush_wait') else 2.0)
+        time.sleep(self._flush_wait)
 
     def set_lazy_flag(self, enabled: bool):
         """Toggle the lazy unordered merge flag via sysctrl endpoint (POST)."""
@@ -141,6 +215,62 @@ class Cluster:
                 print(f"  [flag] set to {val} OK")
         except requests.ConnectionError:
             print(f"  [flag] endpoint not available")
+
+    def count_tssp_files(self, db_name: str = DB_NAME, mst: str = MST_NAME) -> dict:
+        """Count ordered + out-of-order TSSP files across all store nodes.
+
+        Returns {"ordered": int, "out_of_order": int, "total": int, "details": [...]}.
+        """
+        result = {"ordered": 0, "out_of_order": 0, "total": 0, "details": []}
+        store_data = os.path.join(CLUSTER_DIR, "data", "store")
+        for store_idx in (1, 2, 3):
+            store_path = os.path.join(store_data, str(store_idx), "data", db_name)
+            if not os.path.isdir(store_path):
+                continue
+            for root, dirs, files in os.walk(store_path):
+                for f in files:
+                    if not f.endswith(".tssp"):
+                        continue
+                    rel = os.path.relpath(os.path.join(root, f), store_path)
+                    is_ooo = "out-of-order" in rel
+                    if is_ooo:
+                        result["out_of_order"] += 1
+                    else:
+                        result["ordered"] += 1
+                    result["total"] += 1
+                    result["details"].append({
+                        "store": store_idx,
+                        "path": rel,
+                        "type": "ooo" if is_ooo else "ord",
+                    })
+        return result
+
+    def verify_file_count(self, expected_ooo: int, expected_ord_min: int = 1,
+                          db_name: str = DB_NAME) -> bool:
+        """Verify TSSP file count matches expectations."""
+        counts = self.count_tssp_files(db_name)
+        ord_n = counts["ordered"]
+        ooo_n = counts["out_of_order"]
+        total = counts["total"]
+        print(f"[files] ordered={ord_n}  out-of-order={ooo_n}  total={total}  "
+              f"(expected: ooo={expected_ooo}, ord>={expected_ord_min})")
+
+        if ooo_n != expected_ooo:
+            print(f"[files] WARNING: out-of-order count {ooo_n} != expected {expected_ooo}")
+            print(f"  Possible causes: compaction merged some files, or flush didn't create separate files.")
+            print(f"  Details:")
+            for d in counts["details"][:20]:
+                print(f"    store{d['store']} [{d['type']}] {d['path']}")
+            if len(counts["details"]) > 20:
+                print(f"    ... and {len(counts['details']) - 20} more")
+            return False
+
+        if ord_n < expected_ord_min:
+            print(f"[files] WARNING: ordered count {ord_n} < expected min {expected_ord_min}")
+            return False
+
+        print(f"[files] OK: file count verified")
+        return True
 
     def get_span_metrics(self) -> dict:
         """Try to fetch span/metrics info (if available)."""
@@ -229,21 +359,23 @@ class DataWriter:
 
     def write_all(self):
         self._ensure_db()
-        # Write unordered FIRST (older timestamps), then ordered (newer).
-        # In real openGemini, ordered is written first (ascending), then unordered (older).
-        # But for the disjoint layout, the write ORDER doesn't matter — what matters is
-        # the timestamp relationship. Writing unordered first then ordered ensures
-        # ordered data has timestamps > flushTime at flush time.
-        # Actually: to match real behavior, write ordered first (establishes flushTime),
-        # then unordered (older than flushTime).
         self.write_ordered()
         self.write_unordered()
         print("[data] all data written and flushed")
 
+        # Verify file count
+        cfg = self.config
+        expected_ooo = cfg.n_unordered  # each flush should produce 1 unordered file
+        ok = self.cluster.verify_file_count(expected_ooo=expected_ooo, expected_ord_min=1)
+        if not ok:
+            print("[data] WARNING: file count mismatch — compaction may have run during write")
+        return ok
+
     def cleanup(self):
-        """Drop the measurement for re-runs."""
-        self.session.post(f"{SQL_URL}/query", data={"q": f"DROP MEASUREMENT {MST_NAME}"})
-        print("[data] cleaned up")
+        """Drop the database for clean re-runs."""
+        self.session.post(f"{SQL_URL}/query", data={"q": f"DROP DATABASE {DB_NAME}"}, timeout=30)
+        time.sleep(2)
+        print("[data] cleaned up (database dropped)")
 
 # ── Query Runner ───────────────────────────────────────────────────────────────
 
@@ -468,7 +600,10 @@ def run_custom(cluster: Cluster, output_dir: str, args):
     print(f"{'='*60}")
 
     writer = DataWriter(cluster, config)
-    writer.write_all()
+    file_ok = writer.write_all()
+
+    if not file_ok:
+        print("[WARN] file count mismatch — results may be unreliable. Continuing...")
 
     runner = QueryRunner(cluster, config)
 
@@ -540,9 +675,9 @@ def main():
 
     cluster = Cluster()
 
-    # Start cluster
+    # Start cluster (with compaction disabled)
     if not args.no_cluster_start:
-        cluster.start()
+        cluster.start(patch_compaction=True)
     else:
         cluster._wait_ready(timeout=30)
 
@@ -558,6 +693,7 @@ def main():
     finally:
         if not args.no_cluster_start:
             cluster.stop()
+            cluster.restore_configs()
 
 if __name__ == "__main__":
     main()
