@@ -264,29 +264,25 @@ class QueryRunner:
         """Run one query, return (total_ms, first_row_ms, row_count)."""
         q = self._build_query(direction)
         url = f"{SQL_URL}/query"
-        params = {"db": DB_NAME, "rp": RP_NAME, "q": q, "chunked": "true", "chunk_size": str(self.config.max_rows)}
+        params = {"db": DB_NAME, "rp": RP_NAME, "q": q}
 
         t_start = time.perf_counter()
-        resp = self.session.post(url, data=params, timeout=300, stream=True)
-        t_first = None
-        row_count = 0
-
-        # Stream chunks (chunked=true returns JSON lines)
-        for line in resp.iter_lines():
-            if line:
-                if t_first is None:
-                    t_first = time.perf_counter()
-                try:
-                    data = json.loads(line)
-                    series = data.get("results", [{}])[0].get("series", [])
-                    for s in series:
-                        row_count += len(s.get("values", []))
-                except json.JSONDecodeError:
-                    pass
-
+        resp = self.session.post(url, data=params, timeout=300)
         t_end = time.perf_counter()
+
         total_ms = (t_end - t_start) * 1000
-        first_ms = (t_first - t_start) * 1000 if t_first else total_ms
+        first_ms = total_ms  # non-streaming: first row = total
+
+        row_count = 0
+        try:
+            data = resp.json()
+            results = data.get("results", [])
+            for r in results:
+                for s in r.get("series", []):
+                    row_count += len(s.get("values", []))
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"  [query] JSON parse error: {e}")
+
         return total_ms, first_ms, row_count
 
     def run_benchmark(self, direction: str, lazy: bool) -> List[QueryResult]:
@@ -451,6 +447,53 @@ def run_nsweep(cluster: Cluster, output_dir: str):
     report_results(all_results, output_dir)
     print_summary(all_results)
 
+def run_custom(cluster: Cluster, output_dir: str, args):
+    """Custom benchmark with CLI-specified parameters."""
+    config = BenchConfig(
+        n_unordered=args.n,
+        rows_per_file=args.r,
+        n_series=args.s,
+        n_fields=args.f,
+        repeat=args.repeat,
+        warmup=2,
+        overlap=args.overlap,
+    )
+    cluster._flush_wait = config.flush_wait
+
+    total_rows = config.n_unordered * config.rows_per_file * config.n_series + config.rows_per_file * config.n_series
+    print(f"\n{'='*60}")
+    print(f"CUSTOM BENCHMARK: N={config.n_unordered} R={config.rows_per_file} "
+          f"S={config.n_series} F={config.n_fields} overlap={config.overlap}")
+    print(f"Total rows: ~{total_rows}")
+    print(f"{'='*60}")
+
+    writer = DataWriter(cluster, config)
+    writer.write_all()
+
+    runner = QueryRunner(cluster, config)
+
+    # Verify correctness
+    for direction in config.directions:
+        ok = runner.verify_results(direction)
+        if not ok:
+            print(f"  [FAIL] {direction} results mismatch — aborting")
+            writer.cleanup()
+            return
+
+    # Benchmark
+    all_results = []
+    for direction in config.directions:
+        for lazy in [False, True]:
+            cluster.set_lazy_flag(lazy)
+            results = runner.run_benchmark(direction, lazy)
+            all_results.extend(results)
+
+    cluster.set_lazy_flag(False)
+    writer.cleanup()
+    report_results(all_results, output_dir)
+    print_summary(all_results)
+
+
 def run_cross(cluster: Cluster, output_dir: str):
     """Multi-dimensional cross at N=1000."""
     all_results = []
@@ -481,7 +524,7 @@ def run_cross(cluster: Cluster, output_dir: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Unordered merge e2e benchmark")
-    parser.add_argument("--mode", choices=["smoke", "nsweep", "cross"], default="smoke",
+    parser.add_argument("--mode", choices=["smoke", "nsweep", "cross", "custom"], default="smoke",
                         help="Benchmark mode (default: smoke)")
     parser.add_argument("--output", default="./bench_results",
                         help="Output directory for results (default: ./bench_results)")
@@ -510,6 +553,8 @@ def main():
             run_nsweep(cluster, args.output)
         elif args.mode == "cross":
             run_cross(cluster, args.output)
+        elif args.mode == "custom":
+            run_custom(cluster, args.output, args)
     finally:
         if not args.no_cluster_start:
             cluster.stop()
