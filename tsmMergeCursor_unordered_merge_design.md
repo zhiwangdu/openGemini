@@ -483,7 +483,8 @@ fallback（lazy 路径发现首批即准入大部分乱序时切回 eager）。
 | `engine/iterators.go` | 计数常量、`unorderRecordNum` |
 | `engine/tsm_merge_cursor_test.go` | 差分测试、多段测试、mock |
 | `engine/tsm_merge_cursor_bench_test.go` | benchmark |
-| `limit_cut_cursor_analysis.md` | limit-cut 机制详细分析（本文 §10.2 摘要） |
+| `limit_cut_cursor_analysis.md` | limit-cut 机制详细分析（本文 §10.3 摘要） |
+| `unordered_merge_e2e_perf_plan.md` | 端到端性能压测方案（数据模型/写入/查询全链路，对照理论曲线） |
 
 ## 12. 提交历史（branch `merge-optimize`）
 
