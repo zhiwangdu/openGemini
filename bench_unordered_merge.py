@@ -144,6 +144,9 @@ class Cluster:
             content += "[data.compact]\n"
             content += "  max-concurrent-compactions = 0\n"
             content += "  compact-full-write-cold-duration = \"9999h\"\n"
+            # Uncomment unordered-only in the existing [data] section (can't append [data] again)
+            content = re.sub(r'(\s*)#\s*unordered-only\s*=\s*false',
+                           r'\g<1>unordered-only = true', content)
 
             with open(conf_path, "w") as f:
                 f.write(content)
@@ -167,6 +170,18 @@ class Cluster:
         subprocess.run([CLUSTER_SH, "start"], check=True)
         self._wait_ready(timeout=60)
         print("[cluster] ready")
+        # Disable unordered merge via sysctrl (max-concurrent-compactions=0 only stops
+        # compaction, NOT the unordered merge which runs in a separate background goroutine).
+        if patch_compaction:
+            try:
+                resp = self.session.post(
+                    f"{SQL_URL}/debug/ctrl?mod=merge&switchon=false&allshards=true", timeout=10)
+                if resp.status_code == 200:
+                    print("[cluster] unordered merge disabled via sysctrl")
+                else:
+                    print(f"[cluster] WARN: disable merge returned {resp.status_code}")
+            except requests.ConnectionError:
+                print("[cluster] WARN: could not disable unordered merge")
 
     def stop(self):
         print("[cluster] stopping...")
@@ -194,14 +209,18 @@ class Cluster:
         raise RuntimeError(f"cluster not ready within {timeout}s")
 
     def flush_memtable(self):
-        """Flush all memtables to TSSP files via /debug/ctrl?mod=flush on each store."""
-        for url in STORE_HTTP_URLS:
-            try:
-                resp = self.session.get(f"{url}/debug/ctrl?mod=flush", timeout=10)
-                if resp.status_code != 200:
-                    print(f"  [flush] {url} returned {resp.status_code}")
-            except requests.ConnectionError as e:
-                print(f"  [flush] {url} failed: {e}")
+        """Flush all memtables to TSSP files via POST /debug/ctrl?mod=flush on the SQL node.
+
+        The SQL node forwards the flush command to all store nodes via RPC.
+        Must use POST (GET returns 405). After flush, sleep to let the background
+        TSSP file creation and Sequencer/mmsIdTime update complete.
+        """
+        try:
+            resp = self.session.post(f"{SQL_URL}/debug/ctrl?mod=flush", timeout=15)
+            if resp.status_code != 200:
+                print(f"  [flush] SQL returned {resp.status_code}: {resp.text}")
+        except requests.ConnectionError as e:
+            print(f"  [flush] SQL failed: {e}")
         time.sleep(self._flush_wait)
 
     def set_lazy_flag(self, enabled: bool):
@@ -342,10 +361,12 @@ class DataWriter:
         return f"{MST_NAME},{tags} {fields} {timestamp_ns}"
 
     def write_ordered(self):
-        """Write ordered data (newer timestamps, AFTER all unordered)."""
+        """Write ordered data (newer timestamps, AFTER all unordered).
+
+        shard-mutable-size-limit=1k ensures each batch auto-flushes to a separate TSSP file.
+        After writing, sleep to let the background flush complete.
+        """
         cfg = self.config
-        # Use true ns precision from system clock. Row spacing = 1ms (1_000_000 ns).
-        # Ordered: [now, now + R*1ms]
         now_ns = time.time_ns()
         row_step_ns = 1_000_000  # 1ms per row
         lines = []
@@ -355,17 +376,22 @@ class DataWriter:
                 vals = [s * 1000 + r + 1] * cfg.n_fields
                 lines.append(self._make_line(s, ts, vals))
         self._write_batch(lines)
+        # Force flush + wait for background TSSP file creation
         self.cluster.flush_memtable()
-        span_ms = cfg.rows_per_file * 1  # 1ms per row
+        time.sleep(5)  # wait > write-cold-duration (2s) for flush + mmsIdTime update
+        span_ms = cfg.rows_per_file * 1
         print(f"[data] ordered: {len(lines)} rows, span={span_ms}ms "
               f"({cfg.n_series} series × {cfg.rows_per_file} rows)")
 
     def write_unordered(self):
-        """Write N unordered batches (older timestamps), each flush = 1 unordered file."""
+        """Write N unordered batches (older timestamps), each flush = 1 unordered file.
+
+        Each batch writes S×R rows, then flush + sleep to ensure separate TSSP file.
+        shard-mutable-size-limit=1m ensures the whole batch fits in one memtable (no mid-write
+        auto-flush). The 5s sleep after flush ensures the background TSSP file creation and
+        mmsIdTime update complete before the next batch.
+        """
         cfg = self.config
-        # Unordered: timestamps before ordered. Row spacing = 1ms.
-        # File i occupies [base + i*R*1ms, base + (i+1)*R*1ms - 1ms].
-        # base = now - N*R*1ms - 1s (1s gap before ordered for clean disjoint).
         now_ns = time.time_ns()
         row_step_ns = 1_000_000  # 1ms per row
         gap_ns = 1_000_000_000   # 1s gap between unordered end and ordered start
@@ -375,34 +401,55 @@ class DataWriter:
             for s in range(cfg.n_series):
                 for r in range(cfg.rows_per_file):
                     if cfg.overlap == "disjoint":
-                        # Each file: distinct time range, no overlap with other files
                         ts = t_base_ns + (i * cfg.rows_per_file + r) * row_step_ns
                     else:
-                        # Overlapping: all files write to the same time range
                         ts = t_base_ns + r * row_step_ns
                     vals = [i * 10000 + s * 100 + r] * cfg.n_fields
                     lines.append(self._make_line(s, ts, vals))
             self._write_batch(lines)
+            # Force flush + wait for background TSSP file creation + mmsIdTime update
             self.cluster.flush_memtable()
+            time.sleep(5)
             if (i + 1) % 10 == 0 or i == 0:
                 print(f"[data] unordered file {i+1}/{cfg.n_unordered} written ({len(lines)} rows)")
-        total_ms = cfg.n_unordered * cfg.rows_per_file  # 1ms per row
+        total_ms = cfg.n_unordered * cfg.rows_per_file
         print(f"[data] unordered: {cfg.n_unordered} files × {cfg.rows_per_file} rows × "
               f"{cfg.n_series} series, span={total_ms}ms")
 
     def write_all(self):
         self._ensure_db()
-        self.write_ordered()
-        self.write_unordered()
+        # With unordered-only=true, ALL data goes to unordered files regardless of timestamps.
+        # This bypasses SplitRecordByTime entirely, avoiding the Sequencer isFree issue where
+        # the sequencer can't reload after the first (empty) load on a fresh database.
+        # We write all batches (no separate ordered/unordered) and each flush creates 1 ooo file.
+        cfg = self.config
+        now_ns = time.time_ns()
+        row_step_ns = 1_000_000  # 1ms per row
+        for i in range(cfg.n_unordered + 1):  # N+1 batches: N "unordered" + 1 "ordered"
+            lines = []
+            for s in range(cfg.n_series):
+                for r in range(cfg.rows_per_file):
+                    if cfg.overlap == "disjoint":
+                        ts = now_ns + (i * cfg.rows_per_file + r) * row_step_ns
+                    else:
+                        ts = now_ns + r * row_step_ns
+                    vals = [i * 10000 + s * 100 + r] * cfg.n_fields
+                    lines.append(self._make_line(s, ts, vals))
+            self._write_batch(lines)
+            self.cluster.flush_memtable()
+            time.sleep(5)
+            label = "ordered" if i == cfg.n_unordered else f"unordered {i+1}/{cfg.n_unordered}"
+            print(f"[data] {label}: {len(lines)} rows written + flushed")
+
         print("[data] all data written and flushed")
 
         # Verify single shard group
         self._verify_single_shard_group()
 
-        # Verify file count
-        cfg = self.config
-        expected_ooo = cfg.n_unordered  # each flush should produce 1 unordered file
-        ok = self.cluster.verify_file_count(expected_ooo=expected_ooo, expected_ord_min=1)
+        # Verify file count (all files should be out-of-order with unordered-only=true)
+        # Each batch creates ~1 file per shard per store (6 shards × 3 stores = up to 18 per batch)
+        # but data is distributed, so actual count varies. We check ooo > 0 and ooo >= N.
+        ok = self.cluster.verify_file_count(expected_ooo=cfg.n_unordered, expected_ord_min=0)
         if not ok:
             print("[data] WARNING: file count mismatch — compaction may have run during write")
         return ok
