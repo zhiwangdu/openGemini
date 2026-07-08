@@ -16,7 +16,9 @@ package engine
 
 import (
 	"fmt"
+	"runtime"
 	"testing"
+	"time"
 
 	"github.com/openGemini/openGemini/engine/executor"
 	"github.com/openGemini/openGemini/engine/immutable"
@@ -249,4 +251,114 @@ func BenchmarkRealLayout_FirstPacket(b *testing.B) {
 		b.Run(fmt.Sprintf("Eager_N%d", n), func(b *testing.B) { benchFirstPacket(b, ordered, unordered, false) })
 		b.Run(fmt.Sprintf("Lazy_N%d", n), func(b *testing.B) { benchFirstPacket(b, ordered, unordered, true) })
 	}
+}
+
+// makeRealLayoutMultiSegFiles builds multi-segment files under the real layout (unordered older,
+// ordered newer). Each unordered file has segsPerFile segments of rowsPerSeg rows; the lazy heap
+// merger holds only ONE segment per file at a time, so its source memory is K*rowsPerSeg (= M/S)
+// rather than all M rows. Ordered is a single newer file.
+func makeRealLayoutMultiSegFiles(nUnordered, segsPerFile, rowsPerSeg int, orderedStart int64) ([]immutable.TSSPFile, []immutable.TSSPFile) {
+	orderedRows := make([]mocRow, rowsPerSeg)
+	for i := 0; i < rowsPerSeg; i++ {
+		orderedRows[i] = mocRow{t: orderedStart + int64(i), v: int64(i + 1)}
+	}
+	ordered := []immutable.TSSPFile{mocTsspFileWithData{rows: orderedRows, order: true, seq: 1}}
+
+	unordered := make([]immutable.TSSPFile, nUnordered)
+	tBase := int64(1)
+	for i := 0; i < nUnordered; i++ {
+		segs := make([][]mocRow, segsPerFile)
+		for s := 0; s < segsPerFile; s++ {
+			rows := make([]mocRow, rowsPerSeg)
+			for j := 0; j < rowsPerSeg; j++ {
+				rows[j] = mocRow{t: tBase, v: int64(i*100000 + s*1000 + j)}
+				tBase++ // distinct ascending times across all segments/files (< orderedStart)
+			}
+			segs[s] = rows
+		}
+		unordered[i] = mocTsspFileMultiSeg{segs: segs, seq: uint64(i + 1)}
+	}
+	return ordered, unordered
+}
+
+// benchTotalWithPeak drains the cursor (GC enabled) while a sampler goroutine records the max
+// runtime HeapInuse seen during the run. Reports both B/op (allocation volume) and the peak
+// HeapInuse (live-heap proxy). ns/op is skewed by sampling and should be ignored; compare
+// maxHeapInuse between eager and lazy to judge peak-live memory.
+func benchTotalWithPeak(b *testing.B, ordered, unordered []immutable.TSSPFile, lazy bool) {
+	SetLazyUnorderedMergeEnabled(lazy)
+	prevThr := lazyUnorderedMergeMinLocations
+	if lazy {
+		lazyUnorderedMergeMinLocations = 0
+	}
+	defer func() {
+		SetLazyUnorderedMergeEnabled(false)
+		lazyUnorderedMergeMinLocations = prevThr
+	}()
+	b.ReportAllocs()
+	ctx := benchCtx(ordered, unordered)
+
+	var peak uint64
+	done := make(chan struct{})
+	go func() {
+		var ms runtime.MemStats
+		ticker := time.NewTicker(150 * time.Microsecond)
+		defer ticker.Stop()
+		for {
+			runtime.ReadMemStats(&ms)
+			if ms.HeapInuse > peak {
+				peak = ms.HeapInuse // only this goroutine writes peak
+			}
+			select {
+			case <-ticker.C:
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < b.N; i++ {
+		runtime.GC()
+		cursor, err := newTsmMergeCursor(ctx, 0527, nil, nil, nil, false, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if cursor == nil {
+			b.Skip("cursor is nil")
+		}
+		for {
+			rec, err := cursor.Next()
+			if err != nil {
+				b.Fatal(err)
+			}
+			if rec == nil {
+				break
+			}
+		}
+		cursor.Close()
+	}
+	close(done)
+	b.ReportMetric(float64(peak), "maxHeapInuse")
+}
+
+// BenchmarkRealLayout_MultiSeg measures multi-segment files under the real layout. With S>1
+// segments per file the lazy heap merger holds only one segment per file (K*rowsPerSeg = M/S),
+// so its peak live heap should be well below eager's outRec (M rows). Reports B/op (allocation
+// volume / GC pressure) and maxHeapInuse (sampled peak live heap; noisy, ignore ns/op).
+func BenchmarkRealLayout_MultiSeg(b *testing.B) {
+	// N=100 files, S=10 segments/file, R=20 rows/seg -> M=20000 unordered rows.
+	ordered, unordered := makeRealLayoutMultiSegFiles(100, 10, 20, 1<<20)
+	b.Run("Eager", func(b *testing.B) { benchTotalWithPeak(b, ordered, unordered, false) })
+	b.Run("Lazy", func(b *testing.B) { benchTotalWithPeak(b, ordered, unordered, true) })
+}
+
+// BenchmarkRealLayout_SingleSeg is the single-segment counterpart to MultiSeg with the same
+// total row count (N=100, R=200 -> M=20000, one segment per file). Here the heap holds K*R = M
+// source rows (the whole file per source), so lazy's source memory == eager's outRec size; the
+// peak difference vs eager comes only from avoiding the chain-merge intermediate. Compare with
+// MultiSeg (K*R = M/S) to isolate the source-segment effect on peak.
+func BenchmarkRealLayout_SingleSeg(b *testing.B) {
+	ordered, unordered := makeRealLayoutBenchFiles(100, 200, 1<<20) // N=100, R=200, M=20000
+	b.Run("Eager", func(b *testing.B) { benchTotalWithPeak(b, ordered, unordered, false) })
+	b.Run("Lazy", func(b *testing.B) { benchTotalWithPeak(b, ordered, unordered, true) })
 }
