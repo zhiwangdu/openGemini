@@ -27,8 +27,8 @@
 ## 1. 背景与目标
 
 openGemini 是云原生分布式时序数据库，采用 LSM 存储引擎。写入数据按时间戳分为**有序（ordered）**和
-**乱序（out-of-order）**两类，分别落盘为不同的 TSSP 文件。查询时需要将有序与乱序数据合并后按时间
-有序返回。
+**乱序（out-of-order）**两类，分别落盘为不同的 TSSP 文件。本文按**同一 series** 粒度讨论查询合并：
+查询时需要将该 series 命中的有序与乱序数据合并后按时间有序返回。
 
 优化针对两个核心问题：
 
@@ -37,7 +37,15 @@ openGemini 是云原生分布式时序数据库，采用 LSM 存储引擎。写�
 2. **总查询性能差**：链式合并“读一个 record，与累计 outRec 合并一次”，每次 merge 重扫/重拷累计
    `outRec`，复杂度 `O(N²·R)`（N 个乱序文件、每文件 R 行）。乱序文件多时查询明显变慢。
 
-**成功指标**：乱序文件较多的场景下，总查询耗时下降、峰值内存下降；乱序文件少时不退化。
+最初的问题信号来自查询 span 中 `unorder_duration`（常量 `unorderDuration = "unorder_duration"`）异常偏高：
+大量时间消耗在 `FirstTimeInit` 的 unordered 读取与链式合并阶段，而非 ordered 读取或上层算子。
+
+**核心目标场景**：大 field（尤其 KB 级 string 字段）+ 多 unordered 文件 + unordered 文件间时间范围高重叠
+但实际数据/timestamp 不大量重复 + 全局多 segment、单文件通常 1-2 segment。在该场景下，eager
+`MergeRecord` 频繁进入 overlap 分支并反复重拷贝大 string 累计 `outRec`，`unorder_duration` 被显著放大；
+lazy heap merge 的主要收益是避免链式累计重拷贝和降低分配/GC。
+
+**成功指标**：乱序文件较多的场景下，总查询耗时下降、分配/GC 下降，峰值内存持平或下降；乱序文件少时不退化。
 
 ---
 
@@ -122,13 +130,22 @@ N 越大，链式合并的累计重扫越严重，内存峰值 = 全部乱序行
 
 ---
 
-## 3. openGemini 数据布局
+## 3. 同一 series 的数据文件前提
 
-### 3.1 有序/乱序的时间关系
+### 3.1 文件间有序性与重叠关系
+
+本方案的正确性以同一 series 的以下文件级前提为基础：
+
+1. **ordered 文件之间全局有序**：ordered 文件按文件 seq 顺序即可得到该 series 的全局时间顺序；
+   文件之间无时间重叠、无重复 timestamp。ordered 侧因此可视为一个已经排好序的单调流。
+2. **unordered 与 ordered 之间无重叠**：同一 series 的 unordered 时间范围与 ordered 时间范围不重叠。
+   在当前 TSStore flush 语义下，unordered 是更旧的一侧，ordered 是更新的一侧。
+3. **unordered 文件之间无全局顺序**：同一 series 的 unordered 文件之间可能时间交错、重叠、重复；
+   unordered 文件集合必须做归并、去重和同 timestamp 覆盖处理。
 
 写路径 `mutable.tsMemTableImpl.WriteRows` → `appendFields` 追加行到 `WriteRec.rec`，跟踪
-`lastAppendTime`/`firstAppendTime`/`timeAsd`。flush 时 `SplitRecordByTime(rec, flushTime)` 按已落盘
-有序最大时间 `flushTime`（来自 `mmsIdTime.Get(sid)`）切分：
+`lastAppendTime`/`firstAppendTime`/`timeAsd`。flush 前按时间排序；flush 时
+`SplitRecordByTime(rec, flushTime)` 按已落盘有序最大时间 `flushTime`（来自 `mmsIdTime.Get(sid)`）切分：
 
 - `time > flushTime` → **ordered**（更新）
 - `time <= flushTime` → **unordered**（更旧）
@@ -138,7 +155,10 @@ N 越大，链式合并的累计重扫越严重，内存峰值 = 全部乱序行
 
 ### 3.2 对查询输出的影响
 
-升序查询 `[A, B]` 的合并输出顺序：**乱序(旧) → 有序(新)**（disjoint，无交错）。
+在上述前提下，升序查询 `[A, B]` 的输出顺序是：**先输出归并去重后的 unordered(旧)，再输出 ordered(新)**。
+ordered 侧不需要参与 K 路堆合并；堆只负责把 unordered 文件集合归并成一个与 eager `MergeRecord`
+语义等价的有序去重流。
+
 降序查询：**有序(新) → 乱序(旧)**。
 
 ---
@@ -147,7 +167,7 @@ N 越大，链式合并的累计重扫越严重，内存峰值 = 全部乱序行
 
 | 层 | 范围 | 说明 |
 |---|---|---|
-| **核心优化** | 堆式 K 路合并 + `maxRowCnt` 流式分批 | 替换链式 `O(N²R)` 为 `O(M·logK)`；乱序按簇流式输出 |
+| **核心优化** | 堆式 K 路合并 + `maxRowCnt` 流式分批 | 替换链式 `O(N²R)` 为 `O(M·logK)`；乱序流式归并输出 |
 | **辅助优化** | dst 内存复用 + 观测指标 + ReInit 修复 | 降低分配/GC 压力；增加可观测性；修复 cursor 复用 bug |
 
 核心优化通过 feature flag 控制（默认关），仅对升序非聚合非 limit-cut 非 Prom 查询生效。
@@ -158,12 +178,14 @@ N 越大，链式合并的累计重扫越严重，内存峰值 = 全部乱序行
 
 ### 5.1 核心思路
 
-openGemini 的乱序数据比有序数据**更旧**（§3），升序查询输出 = **乱序(旧) → 有序(新)**，无需交错合并
-或 watermark 延迟。
+在 §3 的同一 series 文件前提下，ordered 侧已经是按 seq 排好的全局有序流，且与 unordered
+不重叠。当前 TSStore flush 语义下 unordered 比 ordered **更旧**，所以升序查询输出 =
+**归并去重后的 unordered(旧) → ordered(新)**，无需 ordered/unordered 交错合并或 watermark 延迟。
 
-基于此，优化方案为：**用堆 K 路合并乱序文件，按 `maxRowCnt` 流式分批输出，全部乱序输出完再读有序**。
-合并复杂度 `O(M·logK)`（M = N·R 总行数），替换链式 `O(N²·R)`；输出按 `maxRowCnt` 分批，每批只合并
-`maxRowCnt` 行（而非首批全量），降低首包延迟与分配峰值。
+基于此，优化方案为：**只对 unordered 文件集合做堆式 K 路归并，按 `maxRowCnt` 流式分批输出，
+全部 unordered 输出完再读 ordered**。合并复杂度 `O(M·logK)`（M = unordered 总行数，K = 命中的
+unordered location 数），替换链式 `O(N²·R)`；输出按 `maxRowCnt` 分批，每批只合并最多
+`maxRowCnt` 个输出行（而非构造完整 unordered `outRec`），降低累计拷贝和分配峰值。
 
 ### 5.2 组件设计
 
@@ -175,7 +197,7 @@ openGemini 的乱序数据比有序数据**更旧**（§3），升序查询输�
   每源只持当前 1 个 segment，耗尽才读下一个 → 堆 live = K × segmentSize。
 - 堆序：当前行时间升序，同时间 `seq` 降序（最新者先 pop）。
 - `appendMergedSameTimeRow`：同时间组按 newest→oldest 折叠，每列取最新非 nil 值，等价于 `mergeRecRow`
-  折叠。所有输入 record 共享 `ctx.schema`，按列下标对齐。
+  折叠。所有输入 record 共享 `ctx.schema` 时可按列下标对齐；否则必须按字段名对齐。
 - `isAborted` 回调：合并循环顶检查，abort 时 `return nil, nil`（丢弃半成品）。
 
 **`ReadDataBeforeWatermark`**（`engine/immutable/location.go`）：
@@ -191,18 +213,26 @@ openGemini 的乱序数据比有序数据**更旧**（§3），升序查询输�
 
 ### 5.3 正确性不变式
 
-1. **Disjoint 布局**：乱序 `time <= flushTime`、有序 `time > flushTime`，不相交。升序输出 =
-   乱序(旧) → 有序(新)，Phase 1 全部输出乱序后再 Phase 2 输出有序，顺序正确，无需交错去重。
-2. **同时间覆盖（乱序间）**：多个乱序文件同 timestamp 时，堆按 `seq` 降序 pop 同时间组，
-   `appendMergedSameTimeRow` newest 非 nil 胜出，与链式 `MergeRecord(newRec=高seq, oldRec=累计)`
-   语义等价。
-3. **终止**：堆空且所有源 `done` 时 `nextBatch` 返回 nil；`allDone()` 判定 Phase 1 完成，转 Phase 2；
-   有序也读完返回 nil。无死循环。
-4. **abort**：`nextBatch` 循环顶检查 `isAborted`，abort 时丢弃半成品返回 nil。
+1. **ordered 全局有序**：同一 series 的 ordered 文件按 seq 顺序全局有序，文件间无重叠、无重复。
+   ordered 侧可作为单调流在 Phase 2 直接输出。
+2. **unordered/ordered disjoint**：同一 series 的 unordered 与 ordered 不重叠。当前 TSStore 语义下
+   unordered 旧、ordered 新，升序输出 = Phase 1 全部 unordered → Phase 2 ordered，顺序正确。
+   若未来存在 unordered 更新于 ordered 的布局，需要按两侧时间范围选择 phase 顺序，不能固定
+   unordered-first。
+3. **unordered 文件间 K 路归并**：unordered 文件之间可能乱序、重叠、重复。heap key 必须是当前行
+   时间；文件 seq 只用于同 timestamp 覆盖优先级，不能作为归并顺序。
+4. **同 timestamp 完整合并**：输出 timestamp `t` 前，必须收齐所有可能产生 `t` 的 unordered row，
+   按 newest→oldest 做列级 nil 合并，并只输出一行。若同一 source 可能在后续 segment/batch 继续
+   产生 timestamp `t`，必须继续 admit/advance 该 source 后再输出；否则需要把“同一 source 内无重复
+   timestamp 跨 segment”作为明确文件前提。
+5. **字段对齐**：同 timestamp 合并若按列下标读取，必须证明所有输入 record 都按 `ctx.schema` 构建且
+   字段顺序一致；否则必须像 `mergeRecRow(newRec, oldRec, ...)` 一样按字段名归并。
+6. **终止**：堆空且所有源 `done` 时 `nextBatch` 返回 nil；`allDone()` 判定 Phase 1 完成，转 Phase 2；
+   ordered 也读完返回 nil。无死循环。
+7. **abort**：`nextBatch` 循环顶检查 `isAborted`，abort 时丢弃半成品返回 nil。
 
-> **前提**：disjoint 布局是 `SplitRecordByTime` 的 flush 语义保证的（正常写）。若乱序与有序时间重叠
-> （非正常场景），Phase 1/2 顺序会错。`lazyUnorderedEnabled()` 限制仅升序非聚合非 limit-cut 非 Prom，
-> 作为额外保护。
+> **保护范围**：`lazyUnorderedEnabled()` 限制仅升序非聚合非 limit-cut 非 Prom。其余查询形状保留 eager，
+> 避免把上述前提之外的路径纳入灰度。
 
 ### 5.4 小 N 阈值（防退化）
 
@@ -284,7 +314,8 @@ flowchart TD
 ```
 
 - eager 分支（默认）保留原 `FirstTimeInit` 全量读 + 链式合并。
-- 核心优化分支：Phase 1 堆合并乱序按 `maxRowCnt` 流式输出；Phase 2 乱序耗尽后读有序（disjoint）。
+- 核心优化分支：Phase 1 只对 unordered 文件集合做堆式归并并按 `maxRowCnt` 流式输出；Phase 2 在
+  unordered 耗尽后读 ordered（ordered 侧已全局有序且与 unordered disjoint）。
 
 ### 7.2 堆式 K 路合并数据流
 
@@ -321,7 +352,7 @@ flowchart LR
 ```
 
 - 旧：`ReadData` 读到 EOF，链式 `MergeRecord` 累计拷贝 `O(N²R)`，`outRec` = 全部乱序。
-- 新：堆 K 路合并 `O(M·logK)`；每源只持当前 segment；输出按 `maxRowCnt` 分批。
+- 新：堆 K 路合并 unordered 文件集合，`O(M·logK)`；每源只持当前 segment；输出按 `maxRowCnt` 分批。
 
 ### 7.3 eager vs 优化方案对比
 
@@ -349,7 +380,8 @@ flowchart TD
 ```
 
 - eager 首批前读完全部乱序、链式合并构造完整 `outRec`（`O(N²R)` + 全量内存）。
-- 优化方案按 `maxRowCnt` 流式堆合并，首批只合并 `maxRowCnt` 行；乱序全部输出后读有序（disjoint）。
+- 优化方案按 `maxRowCnt` 流式堆合并 unordered。首批需要准入各 active source 的当前 segment，但只
+  产出最多 `maxRowCnt` 个输出行；unordered 全部输出后再读 ordered（disjoint）。
 
 ---
 
@@ -358,7 +390,10 @@ flowchart TD
 ### 8.1 链式 `O(N²R)` vs 堆式 `O(M·logK)`
 
 链式：每次 `MergeRecord(rec_k, outRec)` 重扫累计 `outRec`（~k·R 行），k=1..N 求和 = `O(N²·R·F)`。
-堆式：每源行处理一次（pop/push `O(logK)` + 列合并 `O(F)`），总计 `O(M·(logK + F))` = `O(N·R·(logN + F))`。
+堆式：每个 unordered 输出行处理一次（pop/push `O(logK)` + 列合并 `O(F)`），总计
+`O(M·(logK + F))` = `O(N·R·(logN + F))`。此外，按 batch admit idle source 会带来
+`O(K·B)` 的扫描成本（B = 输出 batch 数）；通常 `maxRowCnt` 足够大时该项小于逐行 heap 成本，但
+小 `maxRowCnt` + 大 K 场景需要纳入压测。
 
 复杂度对比图（R=20，理论常数=1）：
 
@@ -383,6 +418,32 @@ eager `MergeRecord` 在 `MergeRecordLimitRows` 按时间范围分两个分支：
 |---|---|---|---|---|
 | 不重叠（g≈1） | NonOverlap | `O(NR(logN+F))` | ~100 | 5.4× 更快 |
 | 全重叠（g=K=N） | Overlap | `O(NR(logN+F))`（常数↑） | >100 | 大 N 理论反超 |
+
+### 8.3 核心场景：大 string + 范围高重叠但数据不重复
+
+本次优化的核心线上场景不是“timestamp 大量重复后去重行数很小”，而是：
+
+- 字段值很大：string field 常见 KB 级。
+- unordered 文件多：K（命中的 unordered location 数）大，通常接近文件数 N。
+- unordered 文件之间 **segment 时间范围高重叠**，eager 容易进入 `MergeRecord` 的 overlap 分支。
+- 实际数据/timestamp 并不大量重复，去重后行数 `U` 接近总 unordered 行数 `M`。
+- 当前查询范围内全局有多个 segment，但单文件通常只有 1-2 个 segment。
+
+该场景下，eager 的主要放大点是：每读一个 unordered record，就与累计 `outRec` 做 overlap merge，
+累计 `outRec` 中的 KB 级 string 会被反复 `AppendColVal` 拷贝，导致 `unorder_duration` 和分配/GC
+显著升高。lazy heap merge 每个输出行只进入最终输出批次一次，避免链式累计重拷贝，因此对总耗时和
+分配量有直接收益。
+
+峰值内存判断也要按“范围重叠但数据不重复”区分：
+
+| 情况 | eager live | lazy live | 判断 |
+|---|---|---|---|
+| 高范围重叠、数据不重复、单文件 1 segment | 完整 unordered `outRec`（≈M）+ merge scratch | K 个当前 segment（≈M）+ 输出 batch | 持平或 lazy 略低 |
+| 高范围重叠、数据不重复、单文件 2 segment | 完整 unordered `outRec`（≈M）+ merge scratch | 约 1/2 unordered 输入 + 输出 batch | lazy 下降明显 |
+| 高范围重叠、timestamp 大量重复（U << M） | 去重后 `outRec` 较小 | K 个当前 segment 仍可能接近 M/S | lazy 可能内存不占优，需 fallback |
+
+因此，本方案对“范围高重叠但数据不重复”的大 string 场景是核心收益场景；对“真实 timestamp 大量重复”
+则需要用 same-time group 规模和估算内存判断是否回退 eager。
 
 ---
 
@@ -409,7 +470,9 @@ eager `MergeRecord` 在 `MergeRecordLimitRows` 按时间范围分两个分支：
 | 100 | 599 µs | 392 µs | 1.5× |
 | 1000 | 44.4 ms | **1.57 ms** | **28×** |
 
-首包大幅改善：流式分批每批只合并 `maxRowCnt` 行，非首批全量合并。
+首包改善来自避免构造完整 unordered `outRec` 和链式累计拷贝。需要注意：首批仍可能准入每个 active
+source 的当前 segment，因此“首包只合并 `maxRowCnt` 行”指最多产出 `maxRowCnt` 个输出行，不代表只读
+`maxRowCnt` 行。
 
 ### 9.2 多段 vs 单段（峰值内存分析）
 
@@ -421,7 +484,8 @@ eager `MergeRecord` 在 `MergeRecordLimitRows` 按时间范围分两个分支：
 关键发现：
 - **多段文件放大优化优势**：eager 随段数增长变差（N×S 次链式迭代），优化方案与段数无关（每行一次）。
   真实 TSSP 文件是多段的，所以这是实际场景。
-- **峰值（maxHeapInuse）**：~1.7× 降低，但被分配量主导。激进 GC 实验确认多段 live-peak（13.6 MB）
+- **峰值（maxHeapInuse）**：~1.7× 降低，但被运行时基线和分配量影响。优化路径的主要 live 数据约为
+  `K × 当前 segment 行数 + 输出 batch`，不是 `maxRowCnt`。激进 GC 实验确认多段 live-peak（13.6 MB）
   < 单段（15.7 MB），源段效应存在但 M=20000 时数据峰值相对运行时基线太小。真实大 M（百万行）下
   峰值收益才显著。
 - **单段不相交文件**：堆持 K 段 = M（全部数据），峰值无收益——这是当前方案的盲区，见 §12.5。
@@ -449,6 +513,10 @@ deferral（升序真实布局下 deferral 不生效——乱序更旧，先输�
 - **3000 个随机用例**：1-3 有序文件、1-4 乱序文件、**disjoint 布局**（乱序时间 [1,20]、有序时间
   [21,40]，匹配 `SplitRecordByTime` 的 flush 边界）、含 nil 值、`maxRowCnt` 1-4 强制分批。
 - **多段用例**：`mocTsspFileMultiSeg` + `NewChunkMetaWithSegs`，覆盖 segment 逐段读取。
+- **same-time 完整性用例**：同 timestamp 横跨多个 unordered 文件、横跨 `maxRowCnt` batch 边界；
+  若文件格式允许同一 source 内重复 timestamp，还必须覆盖同 timestamp 横跨同一 source 的 segment 边界。
+- **schema 对齐用例**：查询字段缺失、不同字段集合、字段过滤后 record schema 变化时，验证 lazy 输出
+  与 eager 按字段名合并结果一致，或证明该路径所有输入 record 均严格按 `ctx.schema` 构建。
 
 差分测试覆盖**新增逻辑**（堆合并、同时间组、流式分批）；文件 I/O/过滤复用 eager 路径未改。
 
@@ -457,6 +525,8 @@ deferral（升序真实布局下 deferral 不生效——乱序更旧，先输�
 - 仅有序、仅乱序（有序耗尽 fallback）
 - 乱序间同时间高 seq 覆盖
 - nil 列由旧源填补
+- 同 timestamp group 不被 batch/segment 拆散
+- 字段顺序与字段集合对齐
 - disjoint 不重叠
 - 小批 `maxRowCnt` 流式
 - 乱序跨多个有序文件
@@ -638,7 +708,14 @@ crossover 推后、内存收益消失 → 回退 eager。
 
 - **有序区**：S series × T 点，升序写入 `[t0, t0+T)`。
 - **乱序区**：N 批次，每批次 R 行/series，时间戳早于有序区，每批次 flush = 1 乱序文件。
-- **重叠度**：no-overlap / partial / full（三组数据集）。
+- **重叠度**：no-overlap / partial / full（三组数据集）。full-overlap 需拆成两类：
+  - **范围重叠但 timestamp 不重复**：segment timeRange 高重叠，但每个文件写同一时间窗口内不同时间点
+    （例如按 offset/interleave 分布）；
+    这是大 string 核心收益场景。
+  - **timestamp 大量重复**：同一 timestamp 在大量 unordered 文件中重复，用于验证 same-time group 常数和
+    fallback 条件。
+- **大 field 场景**：增加 KB 级 string 字段（例如 1KB/4KB/16KB），单文件 1-2 segment，同时全局有多
+  segment，用于复现 `unorder_duration` 偏高问题。
 - 变量：N∈{1,10,32,64,100,200,500,1000}、R∈{20,100,1000}、S∈{1,100,10000}、F∈{1,5,20}。
 
 ### 13.3 查询负载
@@ -648,32 +725,42 @@ crossover 推后、内存收益消失 → 回退 eager。
 
 ### 13.4 指标
 
-总耗时 p50/p95/p99、峰值堆（pprof + RSS）、GC、CPU profile、磁盘 I/O、span 计数。flag on/off 对照。
+总耗时 p50/p95/p99、峰值堆（pprof + RSS）、GC、CPU profile、磁盘 I/O、span 计数。重点观察
+`unorder_duration`、`unordered_location_count`、`unordered_merge_count`。flag on/off 对照。
 
 ### 13.5 预期
 
 | 场景 | 预期 |
 |---|---|
 | N=1000, no-overlap, 升序非聚合 | 总耗时 ↓ ~5×、峰值堆 ↓（多段显著） |
+| 大 string + 多 unordered + 范围高重叠但数据不重复 + 单文件 1-2 segment | `unorder_duration` 明显下降；分配/GC 明显下降；峰值堆持平或下降 |
 | N=100 | 持平 |
 | N<64 | 走 eager 不退化 |
-| full-overlap | 无收益（记录为 fallback 依据） |
+| timestamp 大量重复的 full-overlap | 收益不确定，记录 same-time group 常数和 fallback 依据 |
 | 降序/聚合/limit-cut | flag on 与 off 一致 |
 
 ---
 
 ## 14. 关键前提与风险
 
-### 14.1 segment timeRange 排序前提
+### 14.1 文件前提必须可验证
 
-堆合并的 `ReadDataBeforeWatermark` 逐 segment 读，依赖 segment timeRange 在文件内按 segPos 单调有序。
-openGemini 的 memtable 落盘前按时间排序，ordered/unordered 文件内部 segment 应当时间有序（“out-of-order”
-是文件间相对概念）。需用真实落盘文件 + 多段差分测试验证。
+本方案不是通用替换，必须在同一 series 粒度满足 §3 的文件前提：
+
+- ordered 文件按 seq 全局有序，文件间无重叠、无重复。
+- unordered 与 ordered 不重叠；当前 TSStore 语义下 unordered 更旧。
+- unordered 文件之间可能重叠、重复，因此必须由 heap path 完整归并去重。
+
+堆合并的 `ReadDataBeforeWatermark` 逐 segment 读，还依赖单个 location 内部按时间推进。openGemini 的
+memtable 落盘前按时间排序，segment timeRange 应按 segPos 单调有序（“out-of-order”是文件间相对概念）。
+需用真实落盘文件 + 多段差分测试验证。
 
 ### 14.2 disjoint 布局前提
 
 核心优化正确性依赖乱序旧、有序新、disjoint（`SplitRecordByTime` 保证）。若乱序与有序时间重叠
 （非正常场景），Phase 1/2 顺序会错。`lazyUnorderedEnabled()` 限制仅升序非聚合非 limit-cut 非 Prom。
+灰度期建议额外采样 ChunkMeta：若发现当前 series/query 范围内 unordered 与 ordered 重叠，则回退 eager
+并记录指标。
 
 ### 14.3 ReInit 复用
 
@@ -682,3 +769,15 @@ cursor 复用时必须重置 `locationInit`/`lazyMerger`，否则跨 series 数�
 ### 14.4 全重叠退化
 
 全重叠（同时间组 = K）时优化方案常数升高、crossover 推后、内存收益消失。需 fallback 机制（§12.6）。
+
+### 14.5 same timestamp 完整性
+
+旧 eager 路径由 `MergeRecord(newRec, oldRec)` 自然保证同 timestamp 去重和列级 nil 覆盖；heap path 必须
+显式保证输出 timestamp `t` 前已经收齐所有 unordered candidate。尤其要确认同 timestamp 不会被
+`maxRowCnt` batch 边界、segment 边界或同一 source 的后续读取拆成多行输出。上线前必须有差分测试覆盖。
+
+### 14.6 schema 对齐风险
+
+`appendMergedSameTimeRow` 若按列下标合并，必须证明所有输入 record 都按 `ctx.schema` 构建且字段顺序一致。
+如果查询字段过滤、schema 演进或 reader 返回子 schema 可能改变字段集合，则必须改为按字段名归并，否则
+同 timestamp 覆盖会把错误字段合在一起。
