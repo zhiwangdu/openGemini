@@ -33,8 +33,8 @@ var tsmCursorPool = &sync.Pool{}
 
 // lazyUnorderedMergeEnabled gates the lazy out-of-order merge path (Phase 3 of
 // tsmMergeCursor_FirstTimeInit_unordered_analysis.md). Default off: the eager FirstTimeInit
-// full-read path is used. Enable to defer reading out-of-order data until the ordered
-// watermark advances, reducing first-packet latency and the chain-merge cost.
+// full-read path is used. Enable to stream out-of-order data through a segment-at-a-time heap
+// merge, reducing first-packet latency and the chain-merge cost.
 //
 // It is an atomic because the setter may be called from a config/admin goroutine while query
 // goroutines read it in lazyUnorderedEnabled; prefer setting it once at startup.
@@ -84,7 +84,7 @@ type tsmMergeCursor struct {
 	init           bool
 	lazyInit       bool
 	// lazyMerger, when non-nil, drives the lazy out-of-order merge path: out-of-order data is
-	// read and merged in watermark-bounded batches instead of all up front in FirstTimeInit.
+	// read and merged in maxRowCnt-sized batches instead of all up front in FirstTimeInit.
 	lazyMerger *lazyUnorderedMerger
 }
 
@@ -471,8 +471,8 @@ func (c *tsmMergeCursor) Next() (*record.Record, error) {
 		c.locationInit = true
 	}
 
-	// Lazy out-of-order merge path: defer reading out-of-order data until the ordered watermark
-	// advances. Falls back to the eager path below when not active.
+	// Lazy out-of-order merge path: stream out-of-order data in heap-merged batches. Falls back
+	// to the eager path below when not active.
 	if c.lazyMerger != nil {
 		return c.nextLazy()
 	}
@@ -502,7 +502,7 @@ func (c *tsmMergeCursor) Next() (*record.Record, error) {
 }
 
 // nextLazy drives the lazy out-of-order merge path: heap K-way merge of the out-of-order
-// locations, streamed in maxRowCnt-sized batches, with no watermark.
+// locations, streamed in maxRowCnt-sized batches.
 //
 // openGemini's out-of-order data is older than the ordered data (SplitRecordByTime at flush).
 // The two are time-disjoint. For ascending, output = unordered(older) -> ordered(newer), so
@@ -546,7 +546,7 @@ func (c *tsmMergeCursor) nextLazyUnorderedBatch() (*record.Record, error) {
 	}
 	c.ctx.decs.Set(c.ctx.decs.Ascending, c.ctx.tr, c.onlyFirstOrLast, c.ops)
 	c.ctx.decs.SetClosedSignal(c.ctx.closedSignal)
-	rec, err := c.lazyMerger.nextBatch(nil, c.ctx.maxRowCnt)
+	rec, err := c.lazyMerger.nextBatch(c.ctx.maxRowCnt)
 	if err != nil {
 		return nil, err
 	}
@@ -677,7 +677,7 @@ func (c *tsmMergeCursor) FirstTimeInit() error {
 	}
 
 	// Lazy path: prepare the merger but do not read out-of-order data up front. Data is read in
-	// watermark-bounded batches from Next(). Falls back to the eager path below for any query
+	// maxRowCnt-sized heap batches from Next(). Falls back to the eager path below for any query
 	// shape not supported by the lazy merger.
 	if c.lazyUnorderedEnabled() {
 		if c.outOfOrderLocations.Len() > 1 {

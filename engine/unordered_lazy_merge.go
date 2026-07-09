@@ -22,12 +22,12 @@ import (
 )
 
 // lazyUnorderedMerger K-way merges the records read from a set of out-of-order locations into a
-// single time-sorted, deduplicated stream, producing batches bounded by an ordered watermark.
+// single time-sorted, deduplicated stream, producing maxRowCnt-sized batches.
 //
 // It replaces the eager chain merge in FirstTimeInit (which reads every matched out-of-order
 // location up front and folds them with repeated MergeRecord calls, O(N^2 * R) for N files of R
-// rows) with a heap K-way merge that is O(M * log K) in the row count M = N*R, and that only
-// reads segments at or before the current watermark.
+// rows) with a heap K-way merge that is O(M * log K) in the row count M = N*R, while keeping
+// only the current segment from each source live.
 //
 // Same-timestamp precedence matches the eager path: out-of-order files are sorted by sequence,
 // and at a duplicate timestamp the higher-sequence (newer) record's non-nil column wins, with
@@ -103,36 +103,33 @@ func newLazyUnorderedMerger(schema record.Schemas, filterOpts *immutable.FilterO
 	return m
 }
 
-// readNext reads the next segment of the source whose time range is at or before watermark.
-// Returns a non-nil record when a qualifying segment is read, nil when the source is deferred
-// (next segment is beyond the watermark) or exhausted.
-func (s *unorderedSource) readNext(filterOpts *immutable.FilterOptions, schema record.Schemas, watermark int64) (*record.Record, error) {
+// readNext reads the next qualifying segment of the source. Returns nil when the source is
+// exhausted or the query was aborted.
+func (s *unorderedSource) readNext(filterOpts *immutable.FilterOptions, schema record.Schemas) (*record.Record, error) {
 	if !s.loc.HasNext() {
 		s.done = true
 		return nil, nil
 	}
 	dst := record.NewRecordBuilder(schema)
-	return s.loc.ReadDataBeforeWatermark(filterOpts, dst, watermark)
+	return s.loc.ReadData(filterOpts, dst, nil)
 }
 
 func (s *unorderedSource) curTime() int64 {
 	return s.rec.Times()[s.pos]
 }
 
-// nextBatch merges up to maxRows rows. If watermark is non-nil, only rows with time <= watermark
-// are emitted; if nil, all available rows are emitted (unordered-only fallback path).
-func (m *lazyUnorderedMerger) nextBatch(watermark *int64, maxRows int) (*record.Record, error) {
+// nextBatch merges up to maxRows rows from the unordered sources.
+func (m *lazyUnorderedMerger) nextBatch(maxRows int) (*record.Record, error) {
 	out := record.NewRecordBuilder(m.schema)
-	wm := m.watermarkOrMax(watermark)
 
 	// Admit once per call: read the next qualifying segment for every source that is idle (not in
-	// the heap, not done) and whose next segment is at or before the watermark. This is O(K) per
-	// call, not per row; per-row work below is O(log K) via the heap.
+	// the heap, not done). This is O(K) per call, not per row; per-row work below is O(log K) via
+	// the heap.
 	for _, s := range m.sources {
 		if s.inHeap || s.done || s.rec != nil {
 			continue
 		}
-		if err := m.admit(s, wm); err != nil {
+		if err := m.admit(s); err != nil {
 			return nil, err
 		}
 	}
@@ -145,13 +142,10 @@ func (m *lazyUnorderedMerger) nextBatch(watermark *int64, maxRows int) (*record.
 			return nil, nil
 		}
 		if m.heap.Len() == 0 {
-			break // all sources done or deferred beyond the watermark
+			break // all sources done or currently have no readable segment
 		}
 		top := m.heap.items[0]
 		t := top.curTime()
-		if watermark != nil && t > *watermark {
-			break // remaining rows are beyond the watermark; defer to a later batch
-		}
 
 		// Pop the same-time group (all heap-top sources whose current row == t). The heap's
 		// seq-desc tie-break makes group[0] the newest, matching mergeRecRow folded newest-to-oldest.
@@ -170,7 +164,7 @@ func (m *lazyUnorderedMerger) nextBatch(watermark *int64, maxRows int) (*record.
 			s.pos++
 			if s.pos >= s.rec.RowNums() {
 				s.rec = nil
-				if err := m.admit(s, wm); err != nil {
+				if err := m.admit(s); err != nil {
 					return nil, err
 				}
 			} else {
@@ -186,10 +180,9 @@ func (m *lazyUnorderedMerger) nextBatch(watermark *int64, maxRows int) (*record.
 }
 
 // admit reads the next qualifying segment for a source and pushes it into the heap. If the
-// source is deferred (next segment beyond the watermark) it is left idle for a later call; if
-// exhausted it is marked done.
-func (m *lazyUnorderedMerger) admit(s *unorderedSource, watermark int64) error {
-	rec, err := s.readNext(m.filterOpts, m.schema, watermark)
+// source is exhausted it is marked done.
+func (m *lazyUnorderedMerger) admit(s *unorderedSource) error {
+	rec, err := s.readNext(m.filterOpts, m.schema)
 	if err != nil {
 		return err
 	}
@@ -201,16 +194,7 @@ func (m *lazyUnorderedMerger) admit(s *unorderedSource, watermark int64) error {
 	} else if !s.loc.HasNext() {
 		s.done = true
 	}
-	// else: deferred beyond the watermark; leave idle (inHeap=false, rec=nil).
 	return nil
-}
-
-func (m *lazyUnorderedMerger) watermarkOrMax(watermark *int64) int64 {
-	if watermark == nil {
-		// unordered-only path: admit every remaining segment regardless of time.
-		return 1<<63 - 1
-	}
-	return *watermark
 }
 
 // allDone reports whether every source is exhausted (no more data to admit).

@@ -179,8 +179,7 @@ ordered 侧不需要参与 K 路堆合并；堆只负责把 unordered 文件集�
 ### 5.1 核心思路
 
 在 §3 的同一 series 文件前提下，ordered 侧已经是按 seq 排好的全局有序流，且与 unordered
-不重叠。当前 TSStore flush 语义下 unordered 比 ordered **更旧**，所以两侧不需要交错合并或
-watermark/deferral：
+不重叠。当前 TSStore flush 语义下 unordered 比 ordered **更旧**，所以两侧不需要交错合并或跨两侧延迟准入：
 
 - 升序输出 = **归并去重后的 unordered(旧) → ordered(新)**。
 - 降序输出 = **ordered(新) → 归并去重后的 unordered(旧)**。
@@ -196,7 +195,7 @@ watermark/deferral：
 - 持有 `sources []*unorderedSource`（每个乱序 location 一个）和 `heap lazyMergerHeap`（`container/heap`）。
 - `unorderedSource`：`loc`（`immutable.Location`）、`seq`（文件序列号，越大越新）、`rec`（当前 segment
   的 record）、`pos`、`done`、`inHeap`。
-- `nextBatch(watermark, maxRows)`：watermark 为 nil（乱序-only，准入全部），按 `maxRows` cap 输出。
+- `nextBatch(maxRows)`：unordered-only 归并，按 `maxRows` cap 输出。
   每源只持当前 1 个 segment，耗尽才读下一个 → 堆 live = K × segmentSize。
 - 堆序：随查询方向切换；升序按当前行时间最小优先，降序按当前行时间最大优先；同时间 `seq` 降序
   （最新者先 pop）。
@@ -204,16 +203,16 @@ watermark/deferral：
   折叠。所有输入 record 共享 `ctx.schema` 时可按列下标对齐；否则必须按字段名对齐。
 - `isAborted` 回调：合并循环顶检查，abort 时 `return nil, nil`（丢弃半成品）。
 
-**`ReadDataBeforeWatermark`**（`engine/immutable/location.go`）：
-- 读下一个与查询时间范围重叠的 segment，应用 `FilterByTime`/`FilterByField`。
-- 核心优化传 watermark=maxInt64（不延迟），逐 segment 读。
-- 另暴露 `Location.HasNext()`、`Location.Sequence()`、`LocationCursor.LocationAt(i)`。
+**逐 segment lazy read**：
+- `unorderedSource.readNext` 通过 `Location.ReadData` 读取下一个与查询时间范围重叠的 segment，
+  应用 `FilterByTime`/`FilterByField`。
+- `Location.HasNext()` 判断 source 是否耗尽；`Location.Sequence()` 提供同 timestamp 覆盖优先级；
+  `LocationCursor.LocationAt(i)` 用于构建 source 列表。
 
 **`nextLazy`**（`engine/tsm_merge_cursor.go`）两阶段：
-- 升序：先 `lazyMerger.nextBatch(nil, maxRowCnt)` 流式输出 unordered，再读 ordered。
-- 降序：先读 ordered，ordered 耗尽后再 `lazyMerger.nextBatch(nil, maxRowCnt)` 流式输出 unordered。
-- ordered 与 unordered disjoint，不需要用 ordered.min/ordered.max 做 watermark 延迟；`nextBatch(nil, ...)`
-  表示 unordered-only 归并，准入当前可读 segment。
+- 升序：先 `lazyMerger.nextBatch(maxRowCnt)` 流式输出 unordered，再读 ordered。
+- 降序：先读 ordered，ordered 耗尽后再 `lazyMerger.nextBatch(maxRowCnt)` 流式输出 unordered。
+- ordered 与 unordered disjoint，不需要用 ordered.min/ordered.max 做跨两侧延迟准入。
 
 ### 5.3 正确性不变式
 
@@ -221,7 +220,7 @@ watermark/deferral：
    ordered 侧可作为单调流在对应 phase 直接输出。
 2. **unordered/ordered disjoint**：同一 series 的 unordered 与 ordered 不重叠。当前 TSStore 语义下
    unordered 旧、ordered 新，升序输出 = unordered → ordered，降序输出 = ordered → unordered。
-   两种方向都只需要切换 phase 顺序，不需要 deferral。若未来存在 unordered/ordered 时间范围交错，
+   两种方向都只需要切换 phase 顺序，不需要跨两侧延迟准入。若未来存在 unordered/ordered 时间范围交错，
    则需要重新引入跨两侧的时间归并，不能固定两段式输出。
 3. **unordered 文件间 K 路归并**：unordered 文件之间可能乱序、重叠、重复。heap key 必须是当前行
    时间；文件 seq 只用于同 timestamp 覆盖优先级，不能作为归并顺序。
@@ -325,7 +324,7 @@ flowchart LR
     U2["unordered file 2"] --> L2["Location 2"]
     UN["unordered file N"] --> LN["Location N"]
 
-    L1 --> W["ReadDataBeforeWatermark (逐 segment, 每文件持当前段)"]
+    L1 --> W["Location.ReadData (逐 segment, 每文件持当前段)"]
     L2 --> W
     LN --> W
     W --> H["heap K-way: pop min/max time by direction, same-time group by seq desc"]
@@ -364,7 +363,7 @@ flowchart TD
         OD --> OE["mergeData: 乱序 + 有序"]
     end
     subgraph NEW["优化方案"]
-        NB["unordered phase: nextBatch(nil, maxRowCnt)"] --> NC["heap K-way merge maxRowCnt 行"]
+        NB["unordered phase: nextBatch(maxRowCnt)"] --> NC["heap K-way merge maxRowCnt 行"]
         NC --> ND["emit unordered batch"]
         ND --> NE{"allDone?"}
         NE -- "no" --> NB
@@ -498,7 +497,7 @@ source 的当前 segment，因此“首包只合并 `maxRowCnt` 行”指最多�
 | 旧布局（ordered 旧/unordered 新） | 42.4 ms | 8.30 ms（5.1×） |
 
 两种布局结果几乎一致 → **收益与布局无关**，来自堆合并算法 `O(M·logK)` vs 链式 `O(N²R)`。当前核心
-路径不依赖 deferral：ordered/unordered 已经 disjoint，按查询方向输出两个 phase 即可。
+路径不依赖跨两侧延迟准入：ordered/unordered 已经 disjoint，按查询方向输出两个 phase 即可。
 
 ---
 
@@ -555,7 +554,7 @@ source 的当前 segment，因此“首包只合并 `maxRowCnt` 行”指最多�
 
 降序输出 = ordered(新) → unordered(旧)。由于同一 series 的 ordered 与 unordered 无交集，ordered
 任一命中段的最小时间都在 unordered 最大时间之后，天然就是 unordered 侧的时间上界；因此
-ordered/unordered 之间不需要 deferral，也不需要用 `ordered.min` 做 watermark。
+ordered/unordered 之间不需要跨两侧延迟准入。
 
 当前代码已经按这个模型实现：
 
@@ -565,9 +564,8 @@ ordered/unordered 之间不需要 deferral，也不需要用 `ordered.min` 做 w
   重排；unordered locations 不依赖 location 顺序决定时间顺序，由 heap 按当前行时间归并。
 - `lazyMergerHeap.Less` 已按 `ascending` 切换：升序 `ti < tj`，降序 `ti > tj`；同 timestamp 仍按
   `seq` 降序保证 newest wins。
-- `ReadDataBeforeWatermark` 在降序下直接 fallback 到 `ReadData`，由 `Location`/reader 的
-  `ctx.Ascending=false` 分支处理 segment 与 record 方向；lazy 路径传 `nextBatch(nil, ...)`，不做跨
-  ordered/unordered 的 watermark 延迟。
+- lazy unordered source 直接通过 `Location.ReadData` 逐 segment 读取；`ctx.Ascending=false` 时由
+  `Location`/reader 处理 segment 与 record 方向。
 - `TestLazyUnorderedMergeDifferential` 的固定用例和 3000 个随机 disjoint 用例同时覆盖 asc/desc，并以
   eager 为 oracle。
 
@@ -589,7 +587,7 @@ limit-cut 机制（`CanLimitCut`）：`itrsInitWithLimit` + `topNLinkedList` 按
 `fileLoopCursor.initMergeIters` eager drain 全部乱序文件到 `mergeRecIters`。
 
 fileCursor 的“消费一次”模型（sid 在首个 ordered 文件处消费并删除）与堆式流式合并不同。需重构为
-per-sid 流式 watermark 合并。先做 `readData`（非 pre-agg）子路径，`readPreAggData`（meta 成本低）
+per-sid 流式 unordered heap 合并。先做 `readData`（非 pre-agg）子路径，`readPreAggData`（meta 成本低）
 后做。
 
 ### 12.4 schema/field 预过滤
@@ -605,10 +603,10 @@ count(time)/aux/Prom 语义需验证。
 #### 设计：区间并集 flood-fill
 
 ```
-1. 取所有源中 minT 最小的 segment A，初始化 watermark = A.timeRange [t1, t2]
+1. 取所有源中 minT 最小的 segment A，初始化 clusterRange = A.timeRange [t1, t2]
 2. 扫描所有源的下一个未读 segment，若 timeRange 与 [t1, t2] 重叠：
    a. 读入该 segment，加入堆
-   b. watermark = union(watermark, segment.timeRange) → 扩展 [t1, t2]
+   b. clusterRange = union(clusterRange, segment.timeRange) → 扩展 [t1, t2]
    c. 回到步骤 2
 3. 无新 segment 重叠 → 簇稳定，heap K-way merge 输出 [t1, t2] 内的行（≤ maxRowCnt/批）
 4. 簇内所有行输出完 → 回到步骤 1，从下一个未读 segment 开始新簇
@@ -619,12 +617,12 @@ count(time)/aux/Prom 语义需验证。
 ```mermaid
 flowchart TD
     subgraph CLUSTER["时间簇增量准入"]
-        A1["取 minT 最小的未读 segment A"] --> A2["watermark = A.timeRange"]
-        A2 --> A3["扫描所有源: 下一个 segment 与 watermark 重叠?"]
+        A1["取 minT 最小的未读 segment A"] --> A2["clusterRange = A.timeRange"]
+        A2 --> A3["扫描所有源: 下一个 segment 与 clusterRange 重叠?"]
         A3 -- "有重叠" --> A4["读入该 segment → 堆"]
-        A4 --> A5["watermark = union(watermark, seg.timeRange)"]
+        A4 --> A5["clusterRange = union(clusterRange, seg.timeRange)"]
         A5 --> A3
-        A3 -- "无重叠 (簇稳定)" --> A6["heap K-way merge: 输出 watermark 内行"]
+        A3 -- "无重叠 (簇稳定)" --> A6["heap K-way merge: 输出 clusterRange 内行"]
         A6 --> A7{"簇内行全部输出?"}
         A7 -- "no" --> A6
         A7 -- "yes" --> A8{"还有未读 segment?"}
@@ -765,7 +763,7 @@ crossover 推后、内存收益消失 → 回退 eager。
 - unordered 与 ordered 不重叠；当前 TSStore 语义下 unordered 更旧。
 - unordered 文件之间可能重叠、重复，因此必须由 heap path 完整归并去重。
 
-堆合并的 `ReadDataBeforeWatermark` 逐 segment 读，还依赖单个 location 内部按时间推进。openGemini 的
+堆合并逐 segment 读，还依赖单个 location 内部按时间推进。openGemini 的
 memtable 落盘前按时间排序，segment timeRange 应按 segPos 单调有序（“out-of-order”是文件间相对概念）。
 需用真实落盘文件 + 多段差分测试验证。
 

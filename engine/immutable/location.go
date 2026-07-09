@@ -270,58 +270,6 @@ func (l *Location) HasNext() bool {
 	return l.hasNext()
 }
 
-// CurrentSegMinMax returns the time range of the current segment. It is read-only and does not
-// advance the segment cursor.
-func (l *Location) CurrentSegMinMax() (int64, int64) {
-	return l.getCurSegMinMax()
-}
-
-// ReadDataBeforeWatermark reads the next segment whose time range falls at or before watermark
-// and overlaps the query time range, applying the same FilterByTime/FilterByField as ReadData.
-// For ascending, segments with minT > watermark are deferred (left in place). For descending,
-// falls back to ReadData (which handles direction internally). The lazy merge path passes
-// watermark=maxInt64 (no deferral), so this is effectively a segment-by-segment ReadData.
-func (l *Location) ReadDataBeforeWatermark(filterOpts *FilterOptions, dst *record.Record, watermark int64) (*record.Record, error) {
-	if l.meta == nil || !l.ctx.Ascending {
-		return l.ReadData(filterOpts, dst, nil)
-	}
-	if !l.ctx.tr.Overlaps(l.meta.MinMaxTime()) {
-		l.nextSegment(true)
-		return nil, nil
-	}
-	var rec *record.Record
-	var err error
-	for rec == nil && l.hasNext() {
-		if l.ctx.IsAborted() {
-			return nil, nil
-		}
-		minT, maxT := l.getCurSegMinMax()
-		// Defer segments that start beyond the watermark; they may affect later batches only.
-		if minT > watermark {
-			return nil, nil
-		}
-		if (!l.ctx.tr.Overlaps(minT, maxT)) || (!l.overlapsForRowFilter(filterOpts.rowFilters)) {
-			l.nextSegment(false)
-			continue
-		}
-		rec, err = l.r.ReadAt(l.meta, l.segPos, dst, l.ctx, fileops.IO_PRIORITY_ULTRA_HIGH)
-		if err != nil {
-			return nil, err
-		}
-		l.nextSegment(false)
-		if l.isPreAggRead() {
-			return rec, nil
-		}
-		if rec != nil {
-			rec = FilterByTime(rec, l.ctx.tr)
-			if rec != nil {
-				rec = FilterByField(rec, nil, filterOpts.options, filterOpts.cond, filterOpts.rowFilters, filterOpts.pointTags, nil, &filterOpts.colAux)
-			}
-		}
-	}
-	return rec, nil
-}
-
 func (l *Location) readData(filterOpts *FilterOptions, dst, filterRec *record.Record, filterBitmap *bitmap.FilterBitmap,
 	unnestOperator UnnestOperator) (*record.Record, int, error) {
 	var rec *record.Record

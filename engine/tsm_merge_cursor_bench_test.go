@@ -34,10 +34,9 @@ var benchSchema = record.Schemas{
 	{Type: influx.Field_Type_Int, Name: record.TimeField},
 }
 
-// makeBenchFiles builds one ordered file with rows at times [1..rowsPerFile] (so the first
-// ordered batch watermark = rowsPerFile) and nUnordered out-of-order files whose rows all start
-// at unorderedStart (well beyond the first watermark when unorderedStart >> rowsPerFile), so the
-// lazy path defers all of them on the first packet while the eager path reads every one up front.
+// makeBenchFiles builds one ordered file with rows at times [1..rowsPerFile] and nUnordered
+// out-of-order files whose rows all start at unorderedStart. This is an algorithmic no-overlap
+// micro-bench layout, not openGemini's real ordered-newer/unordered-older layout.
 func makeBenchFiles(nUnordered, rowsPerFile int, unorderedStart int64) ([]immutable.TSSPFile, []immutable.TSSPFile) {
 	orderedRows := make([]mocRow, rowsPerFile)
 	for i := 0; i < rowsPerFile; i++ {
@@ -57,9 +56,8 @@ func makeBenchFiles(nUnordered, rowsPerFile int, unorderedStart int64) ([]immuta
 	return ordered, unordered
 }
 
-// makeOverlapBenchFiles builds unordered files whose rows overlap the ordered file's time range,
-// so the lazy path must read all of them for the first packet (no deferral benefit); this
-// isolates the merge-algorithm cost (lazy K-way vs eager chain merge).
+// makeOverlapBenchFiles builds unordered files whose rows overlap the ordered file's time range.
+// This isolates the merge-algorithm cost (lazy K-way vs eager chain merge).
 func makeOverlapBenchFiles(nUnordered, rowsPerFile int) ([]immutable.TSSPFile, []immutable.TSSPFile) {
 	orderedRows := make([]mocRow, rowsPerFile)
 	for i := 0; i < rowsPerFile; i++ {
@@ -167,10 +165,9 @@ func benchTotal(b *testing.B, ordered, unordered []immutable.TSSPFile, lazy bool
 	}
 }
 
-// BenchmarkFirstPacket_NoOverlap measures first-packet latency when out-of-order files are all
-// beyond the first ordered watermark. The eager path reads every out-of-order file up front
-// (O(N) reads + chain merge); the lazy path defers them all and reads only the ordered batch.
-// This is the optimization's headline scenario (first-packet latency vs N unordered files).
+// BenchmarkFirstPacket_NoOverlap measures first-packet latency for the non-real no-overlap
+// micro-bench layout. The eager path reads every out-of-order file up front; the lazy path
+// streams unordered data through the heap in maxRowCnt-sized batches.
 func BenchmarkFirstPacket_NoOverlap(b *testing.B) {
 	for _, n := range []int{10, 100, 1000} {
 		ordered, unordered := makeBenchFiles(n, 20, 1000)
@@ -180,8 +177,7 @@ func BenchmarkFirstPacket_NoOverlap(b *testing.B) {
 }
 
 // BenchmarkFirstPacket_FullOverlap measures first-packet latency when out-of-order files fully
-// overlap the ordered time range. The lazy path cannot defer any data, so both paths read all
-// out-of-order files for the first packet; this isolates the per-iteration merge/alloc cost.
+// overlap the ordered time range. This isolates the per-iteration merge/alloc cost.
 func BenchmarkFirstPacket_FullOverlap(b *testing.B) {
 	for _, n := range []int{10, 100} {
 		ordered, unordered := makeOverlapBenchFiles(n, 20)
@@ -231,9 +227,7 @@ func makeRealLayoutBenchFiles(nUnordered, rowsPerFile int, orderedStart int64) (
 
 // BenchmarkRealLayout_Total measures total drain time under openGemini's real layout (unordered
 // older, ordered newer). For an ascending query the output is unordered(older) -> ordered(newer);
-// the lazy watermark = ordered batch max covers ALL older unordered, so lazy admits everything in
-// the first batch -> no deferral. Expected: lazy ~= eager (no 5x win; possibly worse from heap
-// overhead), confirming the ascending watermark design is broken for the real layout.
+// lazy streams unordered data first and then reads ordered data.
 func BenchmarkRealLayout_Total(b *testing.B) {
 	for _, n := range []int{10, 100, 1000} {
 		ordered, unordered := makeRealLayoutBenchFiles(n, 20, 1<<20) // ordered far in the future
@@ -242,9 +236,8 @@ func BenchmarkRealLayout_Total(b *testing.B) {
 	}
 }
 
-// BenchmarkRealLayout_FirstPacket measures the first Next() under the real layout. The lazy path
-// reads the ordered batch first (watermark = its max, which is the newest time), admits all older
-// unordered, and merges -> first packet cost ~= eager (reads all unordered up front).
+// BenchmarkRealLayout_FirstPacket measures the first Next() under the real layout. For ascending
+// queries, the lazy path emits the first heap-merged unordered batch before ordered data.
 func BenchmarkRealLayout_FirstPacket(b *testing.B) {
 	for _, n := range []int{10, 100, 1000} {
 		ordered, unordered := makeRealLayoutBenchFiles(n, 20, 1<<20)

@@ -399,7 +399,7 @@ func NewChunkMeta(sid uint64, minT, maxT int64, count int) *ChunkMeta {
 }
 
 // NewChunkMetaWithSegs is a test constructor that builds a chunk meta with one segment range
-// per entry, so segment-level skip/defer logic (e.g. ReadDataBeforeWatermark) can be exercised.
+// per entry, so segment-level read logic can be exercised.
 // Each SegmentRange is {min, max} for that segment; segCount is len(segRanges).
 func NewChunkMetaWithSegs(sid uint64, segRanges []SegmentRange) *ChunkMeta {
 	b := newPreAggBuilders()

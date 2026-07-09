@@ -459,7 +459,7 @@ func randomRows(rng *rand.Rand, n, minT, maxT int) []mocRow {
 }
 
 // mocTsspFileMultiSeg models a file with multiple segments, each with its own rows and time
-// range, so ReadDataBeforeWatermark's per-segment skip/defer logic can be exercised.
+// range, so the lazy unordered path's segment-at-a-time reads can be exercised.
 type mocTsspFileMultiSeg struct {
 	MocTsspFile
 	segs  [][]mocRow
@@ -509,10 +509,9 @@ func (m mocTsspFileMultiSeg) ReadAt(cm *immutable.ChunkMeta, segment int, dst *r
 	return dst, nil
 }
 
-// TestLazyUnorderedMergeMultiSegment exercises ReadDataBeforeWatermark's per-segment skip/defer
-// behavior with multi-segment files, where some segments fall at or before the ordered
-// watermark and later segments must be deferred until the watermark advances. The eager path
-// (oracle) reads every segment up front; the lazy path must produce identical output.
+// TestLazyUnorderedMergeMultiSegment exercises segment-at-a-time lazy reads with multi-segment
+// files. The eager path (oracle) reads every segment up front; the lazy path must produce
+// identical output while keeping only the current segment from each source active.
 func TestLazyUnorderedMergeMultiSegment(t *testing.T) {
 	schema := record.Schemas{
 		{Type: influx.Field_Type_Int, Name: "value"},
