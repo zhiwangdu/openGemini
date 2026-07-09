@@ -20,6 +20,7 @@
 11. [查询路径覆盖矩阵](#11-查询路径覆盖矩阵)
 12. [未来演进](#12-未来演进)
 13. [端到端压测方案](#13-端到端压测方案)
+    - [13.6 lazyUnorderedMergeMinLocations 阈值测试](#136-lazyunorderedmergeminlocations-阈值测试)
 14. [关键前提与风险](#14-关键前提与风险)
 
 ---
@@ -241,7 +242,8 @@ ordered 侧不需要参与 K 路堆合并；堆只负责把 unordered 文件集�
 
 `lazyUnorderedMergeMinLocations`（默认 64，`atomic.Int32`，可调）：命中的乱序 location 数低于阈值时
 回退 eager。benchmark 显示交叉点约 N=100（N=10 惰性慢 2.1×，N=100 持平，N=1000 快 5.4×）。阈值保证
-开启 flag **不退化**小 N 常见场景。0 表示禁用阈值（测试用）。
+开启 flag **不退化**小 N 常见场景。0 表示禁用阈值（测试用）。默认值需通过 §13.6 的 eager/lazy
+对照压测按生产 workload 校准。
 
 ### 5.5 Feature flag 与适用范围
 
@@ -750,6 +752,165 @@ crossover 推后、内存收益消失 → 回退 eager。
 | N<64 | 走 eager 不退化 |
 | timestamp 大量重复的 full-overlap | 收益不确定，记录 same-time group 常数和 fallback 依据 |
 | 聚合/limit-cut/Prom | flag on 与 off 一致，继续走 eager |
+
+### 13.6 `lazyUnorderedMergeMinLocations` 阈值测试
+
+`lazyUnorderedMergeMinLocations` 只按命中的 unordered location 数 K 决策，不能感知 field 大小、segment
+数、重叠度或查询方向。因此“最佳值”不是单点真理，而是生产 workload 加权后的保守阈值：小 K 不退化，
+核心大 string 场景尽早走 lazy。
+
+#### 13.6.1 测试方法
+
+不要直接扫描 threshold 配置测结果，而是先强制 eager/lazy 各跑完整矩阵，再离线推导 threshold：
+
+1. eager baseline：关闭 `lazyUnorderedMergeEnabled`。
+2. lazy baseline：开启 `lazyUnorderedMergeEnabled`，并设置 `lazyUnorderedMergeMinLocations=0`，强制所有
+   非聚合 TS 查询走 lazy。
+3. 对每个 case 记录 K、首包延迟、总耗时、分配、峰值内存和 GC。
+4. 离线模拟任意候选阈值 T：
+   - `K < T` 使用 eager baseline 结果。
+   - `K >= T` 使用 lazy baseline 结果。
+5. 用生产 K 分布和慢查询权重加权，选择收益最大且小 K 不退化的 T。
+
+这种方法可以避免每换一个 threshold 都重跑全量数据，也能清晰看到每个 K 的 eager/lazy crossover。
+
+#### 13.6.2 K 与候选阈值
+
+K 取值覆盖小 N、拐点区和大 N：
+
+| 类型 | 取值 |
+|---|---|
+| K 矩阵 | 0, 1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024 |
+| 候选 threshold | 0, 16, 32, 48, 64, 96, 128, 192, 256, disabled |
+
+`0` 表示 flag on 后总是 lazy；`disabled` 表示总是 eager。最终默认值优先从 `32/64/96/128` 中选择，
+便于解释和灰度。
+
+#### 13.6.3 场景矩阵
+
+阈值测试必须覆盖 guardrail 场景和核心收益场景：
+
+| 维度 | 取值 |
+|---|---|
+| field 类型 | int-only、small string、1KB string、4KB string、16KB string |
+| field 数 | 1、5、20 |
+| 每文件行数 R | 20、100、1000 |
+| 单文件 segment 数 | 1、2、8 |
+| unordered 范围关系 | no-overlap、partial-overlap、range full-overlap 但 timestamp 不重复、timestamp 大量重复 |
+| 查询方向 | asc、desc |
+| `maxRowCnt` | 100、1000、10000 |
+| 查询范围 | 全范围、只命中部分 unordered |
+| nil 情况 | 无 nil、稀疏 nil、同 timestamp 字段互补 |
+
+核心场景需要单独加权，不应被 int-only microbenchmark 稀释：
+
+```text
+大 string + K 大 + 范围高重叠但 timestamp 不大量重复 + 全局多 segment + 单文件 1-2 segment
+```
+
+#### 13.6.4 指标与判定
+
+每个 case 至少记录：
+
+- 首包延迟 p50/p95/p99
+- 总耗时 p50/p95/p99
+- `B/op`、`allocs/op`
+- peak heap / RSS
+- GC 次数与 pause
+- `unorder_duration`
+- `unordered_location_count`
+- `unordered_merge_count`
+
+对每个 K 计算：
+
+```text
+first_packet_ratio = lazy_first_packet_p95 / eager_first_packet_p95
+total_ratio        = lazy_total_p95 / eager_total_p95
+alloc_ratio        = lazy_alloc_bytes / eager_alloc_bytes
+peak_ratio         = lazy_peak_heap / eager_peak_heap
+```
+
+建议判定规则：
+
+```text
+lazy_win:
+  total_ratio <= 0.95
+  且 first_packet_ratio <= 1.00
+  且 peak_ratio <= 1.10
+
+lazy_not_regress:
+  total_ratio <= 1.03
+  且 first_packet_ratio <= 1.05
+  且 peak_ratio <= 1.15
+```
+
+单个场景的 crossover：
+
+```text
+K_cross = 最小 K，使 lazy 在该 K 及后续连续 2 个 K 点都满足 lazy_not_regress
+```
+
+#### 13.6.5 生产加权与推荐值
+
+上线前需要采集 3-7 天生产分布：
+
+- `unordered_location_count` 的 P50/P75/P90/P95/P99
+- `unorder_duration` 按 K 的贡献占比
+- 查询方向、field 类型、field 数、返回行数、时间范围
+- 慢查询中 K 与大 string 的相关性
+
+离线评分：
+
+```text
+score(T) =
+  Σ workload_weight(case) * latency_p95(case, T)
+  + regression_penalty(T)
+  + memory_penalty(T)
+```
+
+推荐阈值选择：
+
+1. 对 guardrail 场景取满足 `lazy_not_regress` 的最大 `K_cross`。
+2. 若该值会错过核心大 string 慢查询的大部分收益，用生产权重下的 `score(T)` 修正。
+3. 向上取整到 `32/64/96/128` 中的一个值。
+
+报告输出格式：
+
+| 场景 | K_cross | 结论 |
+|---|---:|---|
+| int-only, 1 segment | 96 | guardrail |
+| int-only, 8 segments | 64 | guardrail |
+| 1KB string, range overlap no duplicate | 32 | core |
+| 4KB string, range overlap no duplicate | 16 | core |
+| timestamp 大量重复 | 128+ | fallback/guardrail |
+| desc 查询 | 与 asc 接近 | confirm |
+
+示例结论格式：
+
+```text
+推荐 lazyUnorderedMergeMinLocations = 64
+原因：
+- K < 64 的 int-only/small-field 场景 lazy 无稳定收益或轻微退化；
+- K >= 64 的核心大 string 场景 lazy p95 总耗时下降 X%，unorder_duration 下降 Y%，alloc 下降 Z%；
+- 生产 K>=64 覆盖主要慢查询，占 unorder_duration 总量 A%。
+```
+
+#### 13.6.6 执行命令
+
+microbenchmark：
+
+```bash
+go test ./engine -run '^$' -bench 'Benchmark.*(FirstPacket|Total|Peak)' -benchmem -count=10
+```
+
+对比：
+
+```bash
+benchstat eager.txt lazy.txt
+```
+
+真实文件压测必须额外覆盖 KB string，因为 mock benchmark 无法完整反映真实 string copy、record 过滤和
+TSSP reader 行为。
 
 ---
 
