@@ -128,6 +128,42 @@ func (c *tsmMergeCursor) lazyUnorderedEnabled() bool {
 	return true
 }
 
+// lazyUnorderedDisjointWithOrdered reports whether the matched locations prove the layout needed
+// by the lazy two-phase iterator: all unordered data is older than all ordered data. When metadata
+// is missing or the ranges touch/overlap, return false so the cursor falls back to the eager
+// cross-side merge path that can handle abnormal overlap defensively.
+func (c *tsmMergeCursor) lazyUnorderedDisjointWithOrdered() bool {
+	if c.locations == nil || c.locations.Len() == 0 || c.outOfOrderLocations == nil || c.outOfOrderLocations.Len() == 0 {
+		return true
+	}
+
+	var orderedMin int64
+	for i := 0; i < c.locations.Len(); i++ {
+		loc := c.locations.LocationAt(i)
+		if loc == nil || loc.GetChunkMeta() == nil {
+			return false
+		}
+		minT, _ := loc.GetChunkMeta().MinMaxTime()
+		if i == 0 || minT < orderedMin {
+			orderedMin = minT
+		}
+	}
+
+	var unorderedMax int64
+	for i := 0; i < c.outOfOrderLocations.Len(); i++ {
+		loc := c.outOfOrderLocations.LocationAt(i)
+		if loc == nil || loc.GetChunkMeta() == nil {
+			return false
+		}
+		_, maxT := loc.GetChunkMeta().MinMaxTime()
+		if i == 0 || maxT > unorderedMax {
+			unorderedMax = maxT
+		}
+	}
+
+	return unorderedMax < orderedMin
+}
+
 // newFilterOpts builds the FilterOptions used by both the eager and lazy read paths.
 func (c *tsmMergeCursor) newFilterOpts() *immutable.FilterOptions {
 	return immutable.NewFilterOpts(c.filter, &c.ctx.filterOption, c.tags, c.rowFilters)
@@ -684,14 +720,20 @@ func (c *tsmMergeCursor) FirstTimeInit() error {
 		if c.outOfOrderLocations.Len() > 1 {
 			sort.Sort(c.outOfOrderLocations)
 		}
-		c.ctx.decs.Set(c.ctx.decs.Ascending, c.ctx.tr, c.onlyFirstOrLast, c.ops)
-		c.lazyMerger = newLazyUnorderedMerger(c.ctx.schema, c.newFilterOpts(), c.outOfOrderLocations, c.ctx.IsAborted, c.ctx.decs.Ascending)
-		if c.span != nil {
-			c.span.Count(tsmIterCount, 1)
-			c.span.CreateCounter(unorderedLocationCount, "")
-			c.span.Count(unorderedLocationCount, int64(c.outOfOrderLocations.Len()))
+		if c.lazyUnorderedDisjointWithOrdered() {
+			c.ctx.decs.Set(c.ctx.decs.Ascending, c.ctx.tr, c.onlyFirstOrLast, c.ops)
+			c.lazyMerger = newLazyUnorderedMerger(c.ctx.schema, c.newFilterOpts(), c.outOfOrderLocations, c.ctx.IsAborted, c.ctx.decs.Ascending)
+			if c.span != nil {
+				c.span.Count(tsmIterCount, 1)
+				c.span.CreateCounter(unorderedLocationCount, "")
+				c.span.Count(unorderedLocationCount, int64(c.outOfOrderLocations.Len()))
+			}
+			return nil
 		}
-		return nil
+		if c.span != nil {
+			c.span.CreateCounter(lazyUnorderedOverlapFallbackCount, "")
+			c.span.Count(lazyUnorderedOverlapFallbackCount, 1)
+		}
 	}
 
 	if c.outOfOrderLocations.Len() > 1 {

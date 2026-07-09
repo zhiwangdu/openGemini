@@ -256,6 +256,10 @@ func runMergeCursorForTest(t *testing.T, schema record.Schemas, ordered, unorder
 }
 
 func runMergeCursorForTestDir(t *testing.T, schema record.Schemas, ordered, unordered []immutable.TSSPFile, maxRowCnt int, ascending bool) []mergeRow {
+	return runMergeCursorForTestDirWithSpan(t, schema, ordered, unordered, maxRowCnt, ascending, nil)
+}
+
+func runMergeCursorForTestDirWithSpan(t *testing.T, schema record.Schemas, ordered, unordered []immutable.TSSPFile, maxRowCnt int, ascending bool, span *tracing.Span) []mergeRow {
 	t.Helper()
 	opt := &query.ProcessorOptions{Ascending: ascending, StartTime: 0, EndTime: 1 << 30}
 	qs := &executor.QuerySchema{}
@@ -277,6 +281,9 @@ func runMergeCursorForTestDir(t *testing.T, schema record.Schemas, ordered, unor
 	}
 	if cursor == nil {
 		return nil
+	}
+	if span != nil {
+		cursor.StartSpan(span)
 	}
 	var out []mergeRow
 	for {
@@ -430,6 +437,59 @@ func TestLazyUnorderedMergeDifferential(t *testing.T) {
 				t.Errorf("[%s] random case %d mismatch (ordered=%v unordered=%v maxRows=%d)\neager: %v\nlazy:  %v",
 					dir.name, iter, c.ordered, c.unordered, c.maxRows, eager, lazy)
 			}
+		}
+	}
+}
+
+func TestLazyUnorderedMergeFallsBackOnOrderedOverlap(t *testing.T) {
+	schema := record.Schemas{
+		{Type: influx.Field_Type_Int, Name: "value"},
+		{Type: influx.Field_Type_Int, Name: record.TimeField},
+	}
+
+	cases := []struct {
+		name      string
+		ordered   [][]mocRow
+		unordered [][]mocRow
+	}{
+		{
+			name:      "equal_timestamp_boundary",
+			ordered:   [][]mocRow{{{t: 2, v: 20}, {t: 3, v: 30}}},
+			unordered: [][]mocRow{{{t: 1, v: 10}, {t: 2, v: 99}}},
+		},
+		{
+			name:      "unordered_newer_than_ordered",
+			ordered:   [][]mocRow{{{t: 1, v: 1}, {t: 2, v: 2}}},
+			unordered: [][]mocRow{{{t: 10, v: 10}, {t: 11, v: 11}}},
+		},
+	}
+
+	prevThr := lazyUnorderedMergeMinLocations
+	lazyUnorderedMergeMinLocations = 0
+	defer func() {
+		lazyUnorderedMergeMinLocations = prevThr
+		SetLazyUnorderedMergeEnabled(false)
+	}()
+
+	for _, c := range cases {
+		for _, dir := range []struct {
+			name string
+			asc  bool
+		}{{"asc", true}, {"desc", false}} {
+			ordered := buildFiles(c.ordered, true)
+			unordered := buildFiles(c.unordered, false)
+
+			SetLazyUnorderedMergeEnabled(false)
+			eager := runMergeCursorForTestDir(t, schema, ordered, unordered, 2, dir.asc)
+
+			_, span := tracing.NewTrace("root")
+			SetLazyUnorderedMergeEnabled(true)
+			lazy := runMergeCursorForTestDirWithSpan(t, schema, ordered, unordered, 2, dir.asc, span)
+
+			if !reflect.DeepEqual(eager, lazy) {
+				t.Errorf("[%s] case %q mismatch\neager: %v\nlazy:  %v", dir.name, c.name, eager, lazy)
+			}
+			assert2.Equal(t, "1", span.CreateCounter(lazyUnorderedOverlapFallbackCount, "").Value())
 		}
 	}
 }

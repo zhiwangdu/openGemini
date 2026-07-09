@@ -269,6 +269,8 @@ lazy unordered merger，只是 `nextLazy` 的 phase 顺序相反。其余形状�
 新增 span 计数（`FirstTimeInit` 内 `CreateCounter` 幂等创建）：
 - `unordered_location_count`：命中的乱序 location 数（放大因子 K）。
 - `unordered_merge_count`：非聚合路径的链式合并次数。
+- `lazy_unordered_overlap_fallback_count`：lazy 初始化前无法用 ChunkMeta 证明
+  `unorderedMax < orderedMin`，本 cursor 回退 eager 的次数。
 
 ### 6.3 ReInit 生命周期修复
 
@@ -820,6 +822,7 @@ K 取值覆盖小 N、拐点区和大 N：
 - `unorder_duration`
 - `unordered_location_count`
 - `unordered_merge_count`
+- `lazy_unordered_overlap_fallback_count`
 
 对每个 K 计算：
 
@@ -933,8 +936,22 @@ memtable 落盘前按时间排序，segment timeRange 应按 segPos 单调有序
 核心优化正确性依赖乱序旧、有序新、disjoint（`SplitRecordByTime` 保证）。若乱序与有序时间重叠
 （非正常场景），固定两段式 phase 顺序会错；升序/降序都需要重新退化为跨两侧时间归并。
 `lazyUnorderedEnabled()` 限制非聚合、非 limit-cut、非 Prom。
-灰度期建议额外采样 ChunkMeta：若发现当前 series/query 范围内 unordered 与 ordered 重叠，则回退 eager
-并记录指标。
+
+已实现的降级策略放在 lazy 初始化前：
+
+1. 扫描当前 cursor 命中的 ordered/unordered `Location.GetChunkMeta().MinMaxTime()`，不读取数据。
+2. 计算 `orderedMin = min(ordered.minTime)` 与 `unorderedMax = max(unordered.maxTime)`。
+3. 仅当 ordered 或 unordered 为空，或严格满足 `unorderedMax < orderedMin` 时启用 lazy。
+4. 若 metadata 缺失，或 `unorderedMax >= orderedMin`，本 cursor 不创建 `lazyUnorderedMerger`，直接落回
+   eager `FirstTimeInit`，并计数 `lazy_unordered_overlap_fallback_count`。
+
+`unorderedMax >= orderedMin` 同时覆盖三类异常：真实时间重叠、相同 timestamp 边界、unordered 比 ordered
+更新。相同 timestamp 也必须回退，因为 lazy 的固定 phase 拼接无法做跨侧去重/列级覆盖；eager 的
+`mergeData`/`MergeRecordByMaxTimeOfOldRec` 能在这些异常下继续做通用时间归并。
+
+该检查是保守判断：ChunkMeta 是粗粒度范围，查询过滤后实际数据可能已经 disjoint；这种 false positive 只会
+损失本 cursor 的性能收益，不会改变结果。降序不需要额外逻辑，仍然使用同一组 locations 和同一条
+`unorderedMax < orderedMin` 前提，只是 `nextLazy` 的 ordered/unordered 输出顺序相反。
 
 ### 14.3 ReInit 复用
 

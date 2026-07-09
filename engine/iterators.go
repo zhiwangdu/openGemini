@@ -56,10 +56,12 @@ const (
 	aggIterCount     = "agg_iter"
 	// unorderedLocationCount records how many out-of-order locations were matched for a
 	// series (the K amplification factor in the analysis). unorderedMergeCount records how
-	// many chain-merge iterations the non-aggregate FirstTimeInit performed. Both surface the
-	// unordered-read/merge cost that dominates total query time and allocation under eager.
-	unorderedLocationCount = "unordered_location_count"
-	unorderedMergeCount    = "unordered_merge_count"
+	// many chain-merge iterations the non-aggregate FirstTimeInit performed.
+	// lazyUnorderedOverlapFallbackCount records lazy attempts that fell back to eager because
+	// metadata could not prove unorderedMax < orderedMin.
+	unorderedLocationCount            = "unordered_location_count"
+	unorderedMergeCount               = "unordered_merge_count"
+	lazyUnorderedOverlapFallbackCount = "lazy_unordered_overlap_fallback_count"
 
 	createTagSetCursorDuration = "create_lazy_tagset_cursor"
 )
