@@ -146,6 +146,10 @@ const (
 	disableRead           = "disableread"
 	BackgroundReadLimiter = "backgroundReadLimiter"
 	LazyUnorderedMerge    = "lazy_unordered_merge"
+	// LazyUnorderedMergeMinLocations tunes the minimum out-of-order location count required to
+	// activate the lazy out-of-order merge path. Forwarded to store nodes alongside the on/off
+	// switch (mod=lazy_unordered_merge).
+	LazyUnorderedMergeMinLocations = "lazy_unordered_merge_min_locations"
 
 	NodeInterruptQuery = "interruptquery"
 	UpperMemUsePct     = "uppermemusepct"
@@ -412,7 +416,7 @@ func ProcessRequest(req msgservice.SysCtrlRequest, resp *bufio.Writer) (err erro
 		for n, s := range metaRes {
 			WriteString(resp, fmt.Sprintf("\n\t%v: %s,", n, s))
 		}
-	case DataFlush, compactionEn, compmerge, snapshot, DownSampleInOrder, verifyNode, memUsageLimit, BackgroundReadLimiter, LazyUnorderedMerge:
+	case DataFlush, compactionEn, compmerge, snapshot, DownSampleInOrder, verifyNode, memUsageLimit, BackgroundReadLimiter, LazyUnorderedMerge, LazyUnorderedMergeMinLocations:
 		// store SysCtrl cmd
 		dataNodes, err := SysCtrl.MetaClient.DataNodes()
 		if err != nil {

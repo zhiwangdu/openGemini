@@ -44,6 +44,8 @@ import (
  curl -i -XPOST 'http://127.0.0.1:8086/debug/ctrl?mod=downsample_in_order&order=true'
  curl -i -XPOST 'http://127.0.0.1:8086/debug/ctrl?mod=verifynode&switchon=false'
  curl -i -XPOST 'http://127.0.0.1:8086/debug/ctrl?mod=memusagelimit&limit=85'
+ curl -i -XPOST 'http://127.0.0.1:8086/debug/ctrl?mod=lazy_unordered_merge&switchon=true'
+ curl -i -XPOST 'http://127.0.0.1:8086/debug/ctrl?mod=lazy_unordered_merge_min_locations&min=64'
 */
 
 const (
@@ -178,6 +180,17 @@ func (e *EngineImpl) processReq(req *msgservice.SysCtrlRequest) (map[string]stri
 		SetLazyUnorderedMergeEnabled(switchOn)
 		log.Info("set lazy unordered merge switch", zap.Bool("switchon", switchOn))
 		return map[string]string{"lazy_unordered_merge": strconv.FormatBool(switchOn)}, nil
+	case syscontrol.LazyUnorderedMergeMinLocations:
+		min, err := syscontrol.GetIntValue(req.Param(), "min")
+		if err != nil {
+			return nil, err
+		}
+		if min < 0 {
+			return nil, fmt.Errorf("lazy_unordered_merge_min_locations must be >= 0, got %d", min)
+		}
+		SetLazyUnorderedMergeMinLocations(int32(min))
+		log.Info("set lazy unordered merge min locations", zap.Int64("min", min))
+		return map[string]string{"lazy_unordered_merge_min_locations": strconv.FormatInt(min, 10)}, nil
 	case BackgroundReadLimiter:
 		limit, err := syscontrol.GetBytesValue(req.Param(), "limit")
 		if err != nil {
