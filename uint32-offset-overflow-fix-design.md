@@ -1,304 +1,466 @@
-# `ColVal.Offset` uint32 溢出修复方案设计(低风险优先 · 兼容历史数据)
+# `ColVal.Offset` uint32 溢出修复方案设计（TSStore）
 
 > 关联文档:
-> - `uint32-offset-overflow-panic-analysis-tsstore.md`(问题与 panic 点分析)
-> - `uint32-offset-overflow-fix-codex-dialogue.md`(与 Codex 三轮讨论记录,本方案据此修订)
+> - `uint32-offset-overflow-panic-analysis-tsstore.md`
+> - `uint32-offset-overflow-fix-codex-dialogue.md`
 >
-> 目标:消除 TSStore 下 String/Tag 列 `len(ColVal.Val) > 4GB` 引发的数组越界 panic,**不破坏历史生产数据文件的可读性**,按风险从低到高分阶段推进。
->
-> **本版相对初版的关键修订(经 Codex 评审)**:主线从「内存 `Offset` 升 uint64」改为「**保持 uint32 全域,用 bounded append 闸口 + 字节阈值切分 + 流式 merge/compact + ingest 预检**建立『单 ColVal.Val 不超阈值』不变量」。uint64 类型变更降为 **future non-goal**。
+> 目标:在不改变 TSSP/WAL 线格式的前提下，消除 TSStore 中 String field 列跨 record、segment 累积后导致的 `ColVal.Offset` 回绕、数组越界 panic 和坏数据落盘；同时把 `ChunkMeta.size` 作为不可信元数据处理，避免读/compact/merge 依赖已回绕的 chunk size。
 
 ---
 
-## 一、问题与约束
+## 一、范围与前提
 
-`lib/record/column.go:32` 的 `ColVal.Offset` 为 `[]uint32`。所有写路径用 `uint32(len(cv.Val))` 记录偏移。当某 String/Tag 列在内存中累积的 `Val` 跨过 4GB,offset 回绕成小值,后续切片越界 panic。涉及 snapshot(`commitSnapshot`)、compact(`Compact`)、merge(`mergeOutOfOrder`)。
+只考虑 TSStore（ts）路径。ColumnStore（cs）、colstore compact、detached primary key/data/index 等路径不在本方案范围内。
 
-**约束**:已有大量生产实例与历史数据文件;需灰度、可回滚;不改任何线格式。
+明确前提:
 
----
-
-## 二、关键事实(决定兼容性策略)
-
-经代码核实,`uint32` 边界**远不止 `ColVal.Offset` 一处**。任何方案都必须同时守住下表所有边界:
-
-| 载体 / 边界 | 代码位置 | 宽度 | 是否会溢出 |
-|------------|----------|:--:|:--:|
-| 内存 `ColVal.Offset` | `lib/record/column.go:32` | uint32 | 是(根因) |
-| TSSP string segment offset(`packStringV1/V2`) | `lib/encoding/encoding.go:423-521` | uint32 | 否(切分后 < 阈值) |
-| TSSP `Segment.size`(编码后 segment block) | `engine/immutable/tssp_file_meta.go:64,78`;写 `column_builder.go:292`、`stream_compact.go:1204` | uint32 | 否(segment < 阈值) |
-| WAL `Record.Marshal` 子块大小 | `lib/record/record_codec.go:34` | uint32 | 是(须拆 batch) |
-| WAL `ColVal.Marshal` 的 `Val`(`AppendBytes`) | `lib/record/column_codec.go:25` → `lib/codec/binary_encoder.go:218` | uint32 | 是(须拆 batch) |
-| WAL physical record header `uint32(len(compData))` | `engine/wal.go:52,232` | uint32 | 是(须拆 batch) |
-| executor `ColumnImpl.offset` | `engine/executor/column.gen.go:120,412` | uint32 | 否(查询侧 chunk 受限) |
-| chunk codec `AppendUint32Slice(c.offset)` | `engine/executor/chunk_codec.gen.go:238` | uint32 | 否 |
-| shelf WAL `Bytes2Uint32Slice`/`Uint32Slice2byte` | `engine/shelf/wal_codec.go:151,239` | uint32 | 否 |
-| protobuf `Column.Offset` | `lib/util/lifted/influx/query/proto/internal.pb.go:1656` | uint32 | 否(wire) |
-| unsafe 转换 `Bytes2Uint32Slice`/`Uint32Slice2byte` | `lib/util/util.go:246` | uint32 | 否 |
-
-**关键判断**:
-1. **TSSP 落盘前已切成小 segment**。正常 workload 下单 segment ~8MB;但 TSStore segment 切分是**按行数(`DefaultMaxRowsPerSegment4TsStore = 1000`)而非字节**,大 string 下单 segment 仍可能逼近 4GB。须给切分**加字节上界**。
-2. **WAL 是唯一「整列 uint32 落盘」载体**,且有多处 uint32 长度(offset、`Val`、子块大小、physical record header)。须在写入前**拆 batch**,保证每个 uint32 长度字段 < 上限。
-3. **`ColVal` 是共享核心类型**,波及 executor / shelf / protobuf / 多种 WAL。这决定了「改类型」的爆炸半径(见 §三)。
-4. **`unpackStringV2` 存在独立读侧越界漏洞**(`lib/encoding/encoding.go:503-518`:`offLen` 是元素个数却只查 `len(src) < offLen`,漏 `*4`),与 4GB 问题独立,**Phase 0 必先修**。
-
-### 兼容性矩阵(目标:线格式全不变)
-
-| 读 / 写 | 旧二进制 | 新二进制 |
-|---------|:--:|:--:|
-| 旧 TSSP 文件(V1/V2 uint32) | ✅ | ✅ |
-| 新 TSSP 文件(仍 V1/V2 uint32) | ✅ | ✅ |
-| 旧 WAL(uint32) | ✅ | ✅ |
-| 新 WAL(uint32,拆 batch) | ✅ | ✅ |
-
-> TSSP 与 WAL 线格式都不变 → **双向兼容**,可灰度、可回滚。
+1. 不考虑单 segment 超过 4GB。行协议受 `max-line-size` 限制，TSStore 默认单 segment 行数有限，本方案不为“1000 个点组成的单 segment 超过 4GB”设计主线。
+2. `decodeColumnData` / `DecodeStringBlock` / `unpackStringV1/V2` 收到的是 segment 级编码块。在上述前提下，它不是本次跨 segment 累积溢出的主修点。
+3. TSStore 时序写入路径中，tag 不作为数据列 append 到持久化 `Record.ColVals`。`tsMemTableImpl.WriteRows` 只把 `row.Fields` 传给 `appendFields` / `AppendFieldsToRecord`；tag 通过 series key / `tagSets` 参与 series 定位、过滤和结果附加信息。
+4. 查询侧按 series 迭代数据。`shard.createGroupCursors` 接收 `tagSets` 创建 group / series cursor，`seriesCursor.ReInit` 将 `TagSetItem.TagsVec` 放入 `seriesInfo`，tag filter 从 `PointTags` 取值，不依赖 TSSP 数据列。
+5. 查询结果中的 aux tag 可在 `tagSetCursor.TagAuxHandler` 中 append 到结果 `Record`，但它不是 TSStore 落盘、snapshot、compact、merge 的数据路径，不作为本方案主保护对象。
+6. 不支持单个 String field 值超过产品写入上限。超限单值应在进入 memtable / WAL 前拒写。
+7. 线格式保持不变。`ColVal.Offset`、TSSP string block offset/length、`Segment.size`、`ChunkMeta.size`、WAL physical header 仍保持现有 uint32 表达。
+8. 不把 `ColVal.Offset` 改成 uint64。`ColVal` 是共享核心结构，改类型会扩大到大量读写边界；本方案采用 bounded append 和流程降级控制风险。
 
 ---
 
-## 三、路线抉择:A vs B
+## 二、核心策略
 
-| 路线 | 做法 | 风险评估 |
-|------|------|----------|
-| **A. 内存 `Offset` 升 uint64**(初版主线) | 改 `ColVal.Offset` 类型;TSSP/WAL 线格式不变,边界窄化 uint32 | `ColVal` 是共享类型,改它制造「双 offset 宽度世界」;`uint32(len(buf))`、WAL 长度、TSSP `Segment.size`、executor、protobuf、unsafe、generated code 等 uint32 边界**编译器捕获不到**,漏一处即截断/panic/静默破坏。回滚须证明所有新旧节点交界无 uint64 内存态被窄化写入旧格式——证明脆弱。 |
-| **B. 保持 uint32 + bounded 不变量**(本版主线) | 不改类型;用 bounded append 闸口 + 字节阈值切分 + 流式 merge/compact + ingest 预检,保证「单内存 `ColVal.Val` ≤ 阈值」 | 须找齐所有「把列累加进同一 ColVal」的入口并改为字节阈值;但入口数远少于 A 要证明的 uint32 边界数,且可用「bounded API + CI analyzer + 断言 + fuzz」闭环。 |
+### 0. 两个数据大小维度
 
-**结论**:**采路线 B**。A 降为 **future non-goal**(仅当产品明确要支持「单内存 `ColVal.Val > 4GB`」才有意义,但这与 B 核心不变量冲突,且带来巨大内存/GC/查询风险)。
+本问题可以拆成两个不同粒度的数据大小维度:
 
-> 详见 `uint32-offset-overflow-fix-codex-dialogue.md` Round 2/3。
+| 维度 | 对应字段 | 含义 | 本方案定位 |
+|------|----------|------|------------|
+| 单列变长数据大小 | `ColVal.Offset` | String field 单列的 `ColVal.Val` 字节大小；`Offset` 记录每个值在该列 `Val` 中的位置 | 主保护对象，必须通过 append 前预算避免回绕 |
+| 单 chunk 数据大小 | `ChunkMeta.size` | 一个 `ChunkMeta` 描述的 chunk data 区大小，包含同一 series chunk 内 time 列和各 field 列的 segment 数据 | 输出侧维持现状；读、compact、merge 侧把它视为不可信元数据 |
 
----
+在当前 TSStore TSSP 组织下，一个 `ChunkMeta` 对应一个 series 在一个 TSSP 文件中的一个 chunk data 区，通常可理解为该 series 在该文件内的数据块。若未来同一 series 在同一文件内被拆成多个 chunk meta，本维度仍按“单 chunk”计算，而不是按全文件或全 measurement 计算。
 
-## 四、核心不变量与四层保证
+这两个维度不能相互替代:`ChunkMeta.size` 描述的是落盘后的 chunk data 字节范围，通常是压缩/编码后的数据；`ColVal.Offset` 描述的是 decode 后单列 `ColVal.Val` 内部的偏移。即使 `ChunkMeta.size` 看起来可信，decode 后的 String field `ColVal.Offset` 仍可能越界，必须单独校验。
 
-**不变量**:
+### 1. 主保护对象:`ColVal.Offset`
 
-> TSStore 写入 / flush / compact / merge 全过程中,任何 String/Tag 列的 `ColVal.Val` 长度不得超过 `MaxVarColValBytes`(默认 **256MiB**,可配至 512MiB);且所有变长列追加必须经过 bounded append 闸口。
+真正必须阻止的是 String field `ColVal.Val` 在内存中跨 record / segment 累积到 uint32 上限以上。所有会把 String field 追加到目标 `ColVal` 的路径，都必须在 mutation 前做 bytes 预算。
 
-阈值远小于 4GB,给所有 uint32 边界(offset、`Val`、`Segment.size`、WAL 各长度字段)留足余量,且避免 4GB+ 连续内存的 OOM/GC/编码双缓冲风险。
+核心不变量:
 
-**完整性不靠编译器(A 的弱点),靠四层闭环**:
+> 任意 TSStore String field 列追加到目标 `ColVal` 前，必须保证追加后 `len(dst.Val) <= MaxVarColValBytes`。
 
-| 层 | 机制 | 作用 |
-|----|------|------|
-| 1. 集中 bounded API | `lib/record` 提供 `TryAppendString/Tag`、`TryAppendColVal`、`SplitByRowsAndVarBytes`,超限返回 `ErrNeedFlush`/`ErrValueTooLarge` | 把「构造大 ColVal」收敛到少数入口 |
-| 2. CI analyzer(自定义 `go vet`) | 禁止非 allowlist 代码写 `cv.Val=append(...)`、`cv.Offset=append(...)`、`uint32(len(x.Val))`、未带 budget 的 `AppendColVal`/`AppendFieldsToRecord`、writer 路径只按行数的 `Split` | 静态闸口,防绕过 |
-| 3. 编码断言(fail-closed) | TSSP/WAL/record codec 写盘前断言所有 uint32 长度字段 ≤ 上限,违例返回 error | 兜底,绝不让 corrupt 数据落盘 |
-| 4. fuzz + 回归 | malformed offset block fuzz、大列端到端 | 动态验证 |
+建议阈值:
 
-> `ColVal.Val`/`Offset` 是 exported 字段,Go 编译器无法禁止绕过——这正是需要第 2/3 层的原因。
+- `MaxVarColValBytes`:默认 256MiB，可配置到 512MiB。
+- 测试阈值:支持 1KiB / 64KiB 等小阈值，用于验证 flush、split、降级和 fail-closed 行为。
 
----
+### 2. `ChunkMeta.size` 策略:输出将错就错，读侧不可信
 
-## 五、分阶段计划
+`ChunkMeta.size` 是 uint32，表示一个 series chunk 的 data 区总长度。当前依赖点不多，本方案不把它作为输出侧强保护目标:
 
-```mermaid
-flowchart TD
-    P0["Phase 0 · 读侧加固 + 漏洞修复<br/>unpackStringV2 offLen 边界<br/>PadColVal/sliceValAndOffset 补 Tag<br/>CheckCol 完整校验 → 返回 error 不 panic"]
-    P1["Phase 1 · Ingest 预检 + WAL 拆 batch<br/>appendFields 前按列字节预算预检<br/>超限 → flush/retry;单值超限 → 拒写<br/>WAL 写前拆 batch 避免 uint32 超限"]
-    P2["Phase 2 · 集中 bounded append API<br/>TryAppendString/Tag/TryAppendColVal<br/>SplitByRowsAndVarBytes<br/>TSStore 写路径迁移;旧 API 仅 allowlist"]
-    P3["Phase 3 · 字节阈值切分 + 高危路径处置<br/>WriteRecord/EncodeColumn/stream compact/merge writer<br/>加行数+字节双阈值<br/>禁用/绕开 mergeSelfFastMode 与非流式 compact"]
-    P4["Phase 4 · 历史损坏数据修复<br/>先靠 Phase 0 可读不 panic<br/>后台限速 repair/recompact 重写超阈值 segment"]
-    P0 --> P1 --> P2 --> P3 --> P4
-    P0 -.->|零写路径风险| G1[灰度]
-    P1 -.-> G2[灰度]
-    P2 -.-> G3[灰度]
-    P3 -.-> G4[灰度]
-    P4 -.->|按需| G5[执行]
-    style P0 fill:#c8e6c9
-    style P1 fill:#fff9c4
-    style P2 fill:#bbdefb
-    style P3 fill:#bbdefb
-    style P4 fill:#ffe0b2
-```
+- compact / merge 等后台流程写新文件时，`ChunkMeta.size` 维持现状，仍可能按 uint32 回绕写入。
+- 不引入 `MaxChunkDataBytes` 作为必须切分新 chunk 的硬约束。
+- 但所有后续流程不得无条件相信源 `ChunkMeta.size` 是真实 chunk data 长度。
 
-| 阶段 | 不变量 | 可独立发布 |
-|------|--------|:--:|
-| Phase 0 读侧加固 | 解码坏 string/tag block 只返回 error,不 panic | ✅ |
-| Phase 1 ingest 预检 + WAL 拆 batch | ingest 后 memtable 内任意 String/Tag `ColVal.Val ≤ MaxVarColValBytes` | ✅ |
-| Phase 2 集中 bounded API | 所有 String/Tag 追加先做 byte budget 判断(mutation 前) | ✅ |
-| Phase 3 字节阈值切分 + 高危路径处置 | flush/compact/merge 输出任意 String/Tag segment/block < 阈值 | ✅ |
-| Phase 4 历史修复 | repair 后历史 TSSP 满足新 segment byte cap | ✅(按需) |
+判断源 `ChunkMeta.size` 是否可信时，先计算不依赖 `cm.size` 的 `expectedChunkDataSize`。实际落地可按场景选择算法:
+
+1. 相邻 chunk offset 差值:
+   - 若能拿到同一文件中下一个 chunk meta，使用 `nextChunkMeta.offset - currentChunkMeta.offset`。
+   - 该方式能直接得到当前 chunk data 到下一个 chunk data 起点之间的真实跨度，适合 chunk meta 顺序完整、相邻 chunk 可访问的场景。
+2. segment entry 覆盖范围:
+   - 使用 `max(entry.offset + entry.size) - cm.offset`。
+   - 该方式不依赖下一个 chunk meta，适合单 chunk 校验、最后一个 chunk、或只拿到当前 chunk meta 的场景。
+
+若 `expectedChunkDataSize > int64(cm.size)`，说明源 `ChunkMeta.size` 已截断、回绕或元数据损坏。此时:
+
+- 非流式 compact / merge 不能继续用 `cm.size` 整 chunk 读取。
+- 查询路径不能继续依赖 `cm.size` 做整 chunk 预读。
+- `WriteOriginal` 不能用 `meta.size` 作为 fast-copy 的复制长度。
+
+### 3. 重要约束:writer 内部 offset 不能依赖回绕 size
+
+虽然输出的 `ChunkMeta.size` 可以将错就错，但 writer 内部推进 offset 不能依赖已回绕的 `chunkMeta.size`。否则会把后续 chunk 的 `offset` 写错，问题就不再只是 size metadata 不准，而是文件布局损坏。
+
+因此:
+
+- stream compact / stream merge 当前主要用 `writer.DataSize()` 定位新 chunk，方向是合理的。
+- snapshot / flush builder 中如使用 `chunkMeta.size` 推进 `dataOffset`，需要改为使用实际编码/写入字节数。
 
 ---
 
-## 六、各阶段详细设计
+## 三、模块风险总览
 
-### Phase 0 · 读侧加固 + 漏洞修复(最先发,零写路径风险)
-
-**目的**:历史生产中可能已有 corrupt string segment(回绕 offset 落盘);当前读/compact/merge 它们会 panic。先让读路径 fail-safe;同时修两个独立漏洞。
-
-**改动点**:
-- **修 `unpackStringV2` 边界**(`lib/encoding/encoding.go:503-518`):`offLen` 为元素个数,须按 `len(src) < offLen*util.Uint32SizeBytes` 校验;校验 offset 单调非递减、`offset[i]+length[i] <= len(in)`;违例返回 `errCorruptStringColumn`。
-- **补 Tag 一致性**:`PadColVal`(`lib/record/column.go:172`)、`sliceValAndOffset`(`column.go:336`)目前只判 `Field_Type_String`,改为 `isStringLike`(String + Tag)统一处理,避免 Tag 列 padding/切片逻辑错乱。
-- **`CheckCol`/`CheckRecord`**(`lib/record/record_check.go:98`):对 String/Tag 做完整 offset 单调性、边界、长度校验;**新增 `Validate*() error` 而非全局把 panic 改 error**(现有调用点如 `compact.go:203` 无 error 传播路径),先替换 reader/compact/merge 的可恢复路径。
-- **`BytesUnsafe`/`StringValue*`**:切片前校验 `start <= end && end <= len(cv.Val)`;违例返回 error,不 panic。**不可用「坏 offset 当 nil」替代**(会导致查询静默错)。
-
-**静态闸口**:decoder fuzz 覆盖 malformed offset block;string/tag decoder 禁止直接 panic。
-
-### Phase 1 · Ingest 预检 + WAL 拆 batch(止血)
-
-**目的**:杜绝新 corrupt 数据进 memtable/WAL;把「静默回绕 → 随机 panic」转为「mutation 前显式失败」。
-
-**改动点**:
-- **ingest 预检**(在 mutation 前):`engine/mutable/ts_table.go:346` `appendFields` 进入 `record.AppendFieldsToRecord`(`ts_table.go:380`)前,按列计算「当前 `Val` 长度 + 本次 string/tag 增量」,超 `MaxVarColValBytes` → 触发 flush/换 memtable/retry;**单值超限 → 直接拒写**(见 §七)。底层追加点 `column.go:143`、`column_string.go:51,143` 仍保留,但被预检兜住。
-- **WAL 拆 batch**:`Record.Marshal` 子块大小(`record_codec.go:34`)、`ColVal.Marshal` 的 `Val`(`column_codec.go:25` → `binary_encoder.go:218`)、physical record header(`engine/wal.go:52,232`)均为 uint32;写 WAL 前估算单 record 压缩前/后大小,超限**拆成多个 WAL physical record**。flush 只清 memtable,不能缩小当前 WAL binary——拆 batch 是必要补充。
-
-**静态闸口**:TSStore ingest 路径禁止直接调未预检的 `AppendFieldsToRecord`。
-
-### Phase 2 · 集中 bounded append API(不变量闸口)
-
-**目的**:把所有 String/Tag 列追加收敛到带 budget 的入口,使「单 ColVal.Val ≤ 阈值」可静态校验。
-
-**改动点**:
-- `lib/record` 新增 bounded API:
-  - `TryAppendString(v string) error` / `TryAppendTag` / `TryAppendStringNull()`
-  - `TryAppendColVal(src *ColVal, typ, start, end int) error`
-  - `SplitByRowsAndVarBytes(dst []ColVal, maxRows int, maxVarBytes int, refType int) []ColVal`(行数 + 变长列字节双阈值切分)
-  - 超限返回 `ErrNeedFlush`(可恢复,触发 flush/retry)或 `ErrValueTooLarge`(不可恢复,拒写)。
-- 迁移 TSStore 写路径的 `AppendColVal`、`AppendString`、`appendStringCol`、sort/merge 中的变长列追加至 bounded API。
-- 旧无错误 append API 保留,但仅限 numeric / 小对象 / 测试 / allowlist 使用。
-- **不让 `lib/record` 直接触发 flush**:收到 `ErrNeedFlush` 由 `engine/mutable`、`MsBuilder`、stream compact、merge writer 负责 flush/split/retry。
-
-**静态闸口**:CI analyzer allowlist——仅 bounded append 文件可写 `Val/Offset` 与做 offset 窄化。
-
-```mermaid
-flowchart LR
-    subgraph CALL["TSStore 写路径 (ingest/flush/compact/merge)"]
-        C1["调用方"] -->|"TryAppendString/Tag<br/>TryAppendColVal"| GATE{"byte budget 检查<br/>(mutation 前)"}
-    end
-    GATE -- "未超限" --> OK["追加成功"]
-    GATE -- "超限(可恢复)" --> E1["ErrNeedFlush"] --> F["调用方 flush/split/retry"]
-    GATE -- "单值超限" --> E2["ErrValueTooLarge"] --> R["拒写, 返回客户端错误"]
-    OK --> ENC["编码断言 (Phase 3)<br/>uint32 长度 ≤ 上限"]
-    ENC -- fail --> REJ["fail-closed, 不落盘"]
-    style GATE fill:#fff9c4
-    style E2 fill:#ef9a9a
-    style REJ fill:#ef9a9a
-    style ENC fill:#c8e6c9
-```
-
-### Phase 3 · 字节阈值切分 + 高危路径处置
-
-**目的**:保证 flush/compact/merge 输出的任意 String/Tag segment/block < 阈值;处置会构造 4GB+ 单 ColVal 的高危路径。
-
-**改动点(加行数 + 字节双阈值)**:
-- `MsBuilder.WriteRecord`(`engine/immutable/msbuilder.go:1151,1170`,现按行拆)→ 用 `SplitByRowsAndVarBytes`。
-- `ColumnBuilder.EncodeColumn`(`column_builder.go:353`,现按 `segRowsLimit`)→ 加字节阈值。
-- stream compact 追加点(`stream_compact.go:765,1429`)、`continueMerge`(`stream_compact.go:1440`,现只看 `Len<maxRows`)、`splitColumn`(`stream_compact.go:1033`,现按 `maxRows`)→ 追加前估字节,达阈值先 `writeSegment`;注意 `splitColumn` 现期望只切 2 段会 panic(`stream_compact.go:1037`),须改「追加前判断」而非事后多段切。
-- merge writer `columnWriter.write`(`merge_performer.go:433,446`,结果累进 `cw.remain`)→ `cw.remain` 按字节 flush。
-- merge 时间窗口(`unordered_reader.go:394,522`、`merge_performer.go:93` 现可能 `MaxInt64`)→ 须 byte-bounded,合并结果超阈值时分段写。
-
-**高危路径处置**:
-- **`mergeSelfFastMode`**(`merge_tool.go:217` → `merge_self.go:48,69,72`):整 record sort/write,不符合 bounded 不变量。**先禁用/绕开**(string/tag 大列场景不走 fast mode),或改造为已具 byte split 的流式。
-- **非流式 compact**(`chunk_iterators.go:149` `Merge` + `compact.go:215` `WriteRecord`):整列 merge 到单 record。**先禁用/绕开**大 string/tag 路径,统一走流式 compact;或改成增量产出 bounded record。
-
-**静态闸口**:writer 路径禁止只按行数的 `Split`,必须走 rows+bytes splitter;CI analyzer 强制。
-
-### Phase 4 · 历史损坏数据修复(按需)
-
-**目的**:Phase 0 让读路径不 crash,但损坏的历史 segment 仍是坏数据。
-
-**做法**:
-- 诊断:遍历 TSSP,对 string segment 跑 `unpackString` 校验(复用 Phase 0),输出 corrupt / 超阈值 segment 清单。
-- 修复:低优先级 background repair/recompact 重写超阈值 segment;**限速、可中断、可回滚**(会放大 IO)。优先级低,仅对确认异常的文件执行。
-- **不默认「跳过坏行继续 compact」**(静默丢数据);repair 须审计记录丢弃量。
-- 历史文件可能合法但超大,repair/compact/query 仍可能内存压力 → 查询侧也加 chunk byte cap,大列处理走流式。
+| 模块 | 主要流程 | 风险点 | 处理原则 |
+|------|----------|--------|----------|
+| 写入 / memtable | 行协议解析 -> record append -> memtable mutation | String field `ColVal` 持续累积，append 前无 bytes 预算会形成回绕 offset | mutation 前预算，超限 flush/retry 或拒写 |
+| WAL | batch -> snappy physical record -> WAL header | WAL 长度失败不能晚于 memtable mutation 暴露 | WAL 长度前置检查，拆 batch 或拒写 |
+| snapshot / flush | memtable record -> `MsBuilder` -> TSSP chunk | 只按 rows 切分不足以约束 String field bytes；内部 `dataOffset` 不能依赖回绕的 `chunkMeta.size` | rows + var-bytes 切分；offset 用真实写入大小推进 |
+| 非流式 compact / merge fastmode | chunk 整块读取 -> decodeRecord -> record merge -> 写新文件 | 整 chunk 读取依赖源 `ChunkMeta.size`；decode 后 `ColVal.Offset` 仍可能越界；record merge 会继续累积 `ColVal` | 源 size 不可信或 decode 后 offset 越界时降级 streamMode；merge 使用 bounded append |
+| stream compact | segment 读取 -> compactColumn -> writeSegment -> writeMeta | 源读按 segment 安全；合并条件仍需 bytes 边界 | rows + bytes merge 条件；输出 `ChunkMeta.size` 维持现状 |
+| stream merge | ordered/unordered segment merge 或 `WriteOriginal` fast-copy | `columnWriter` 可能累积过大；`WriteOriginal` 当前信任源 `meta.size` | remain byte-bounded；fast-copy 长度改用 next chunk offset 或 segment entry 覆盖范围 |
+| 查询 / 诊断 | chunk meta -> segment data -> decode | `defaultIoSize` 整 chunk 预读依赖 `cm.size`；历史坏 offset 不能 panic | 预读失败/校验不通过时降级按 segment 读；fail-closed |
 
 ---
 
-## 七、单值超阈值策略
+## 四、共享能力
 
-- **明确拒绝写入**:不截断、不拆分、不落 WAL;错误发生在 memtable/WAL mutation 前。
-- `MaxVarColValBytes` 默认 **256MiB**,可配至 512MiB,不建议更高。
-- 返回非重试型客户端错误:`string/tag value too large: size=X limit=Y`。
-- batch 写入若无 per-row error 语义,拒绝整个 batch,避免部分成功造成语义混乱。
+### 1. String field 预算 API
 
----
+新增或收敛到一组 bounded append 能力:
 
-## 八、WAL 策略
+- `isStringField(typ int) bool`
+- `VarBytes`
+- `VarBytesRange`
+- `CanAppendVarBytes`
+- `TryAppendColVal`
+- `TryAppendString`
+- `TryAppendStringNull`
+- `SplitByRowsAndVarBytes`
+- `ValidateCol`
+- `ValidateRecord`
 
-采 **W1(严格版)**:保持 WAL 旧格式(uint32),强制每个 WAL physical record、每个 `Record.Marshal` 子块、每个 `ColVal.Val` 与 offset 都 < uint32 上限;超限**拆 batch 或拒写**。
+错误语义:
 
-```mermaid
-flowchart LR
-    W["写 WAL batch"] --> E{"单 record 估算<br/>(Val/子块/压缩后)"} 
-    E -- "任一 > uint32 上限" --> S["拆成多个 physical record"]
-    E -- "均安全" --> M["正常写入"]
-    S --> M
-    ING["ingest 预检 (Phase 1)"] -.->|"保证单列 Val ≤ 256MiB"| W
-    style E fill:#fff9c4
-    style S fill:#bbdefb
-    style ING fill:#c8e6c9
-```
+- `ErrNeedFlush`:追加本身合法，但目标对象接近阈值，需要调用方先 flush/split/writeSegment 后重试。
+- `ErrValueTooLarge`:单值或不可拆单次追加超过产品上限，拒写。
+- `ErrCorruptColumn`:源 offset 或源 meta 不可信，不能继续 append 或 fast-copy。
 
-- W2(WAL 升 uint64 + 版本标志)**近期不做**:仅加版本位不够,还须版本化物理 header、`AppendBytes` 长度、record/column codec;会破坏滚动升级与回滚。
-- WAL 是短时日志,Phase 1 的 ingest 预检 + 拆 batch 已足够保证其 < 4GB。
+### 2. 源 chunk size 校验
 
----
+新增 `ValidateChunkMetaDataRange(cm *ChunkMeta, next *ChunkMeta, fileDataSize int64) (expectedSize int64, err error)`:
 
-## 九、测试策略
+- 优先在可取得 `next` 时使用 `next.offset - cm.offset` 计算 expected size。
+- 没有 `next` 或需要校验 segment 覆盖范围时，遍历所有 column/time segment entry。
+- segment entry 算法需要校验 `entry.offset >= cm.offset`。
+- 校验 `entry.offset + int64(entry.size)` 不溢出且不超过文件 data 区。
+- 计算 `expectedSize = max(entry.offset + entry.size) - cm.offset`。
+- 若 `expectedSize > int64(cm.size)`，返回 size 不可信错误。
 
-1. **读侧 / fuzz**:`unpackStringV2` malformed(`offLen=0`、offset 区不足、非单调、超 value 区)均不 panic;Tag 与 String 在 `PadColVal`/`sliceValAndOffset`/`Split` 行为一致。
-2. **ingest 预检**:列接近阈值再写小 string/tag 触发 flush/retry,最终无超限 `ColVal`;单值超限返回客户端错误且 memtable/WAL 无副作用。
-3. **WAL 拆分**:大 batch 拆成多个安全 WAL physical record;回放一致。
-4. **切分**:行数少但 string bytes 超阈值,能按字节拆 segment;stream compact 多小 segment 合并超阈值时提前 `writeSegment`;merge normal path 合并超阈值时 `columnWriter` 分段写。
-5. **高危路径**:`mergeSelfFastMode`/非流式 compact 大 string/tag 列不走 fast mode 或已具 byte split;非流式 compact 不整列 merge 到单 `ColVal`。
-6. **编码断言**:超 uint32 或超阈值的 string/tag block 写盘前失败。
-7. **CI analyzer golden**:TSStore 写路径中直接 `cv.Val=append(...)`、`uint32(len(cv.Val))`、未 bounded 的 `AppendColVal`/`AppendFieldsToRecord`、只按行数的 `Split` 必须报错。
-8. **兼容性**:旧二进制生成的 TSSP/WAL 由新二进制读一致;新二进制生成的(仍 uint32)由旧二进制读一致(回滚可行性);含 corrupt offset 的旧文件新二进制读不 panic。
-9. **回归**:全量现有 `lib/record` 与 `engine/immutable` 测试套件通过。
+该校验不要求输出方修正 `ChunkMeta.size`，只用于读、compact、merge 入口判断是否可使用整 chunk 读取或 fast-copy。
 
 ---
 
-## 十、灰度与回滚
+## 五、模块设计
 
-- **顺序**:Phase 0 → 1 → 2 → 3 → 4,每阶段独立灰度。Phase 2/3 依赖 Phase 1 已部署(ingest 预检保证 memtable bounded)。
-- **灰度**:按节点灰度;线格式不变,集群可同时存在新旧二进制。
-- **回滚**:任一阶段回滚至上一阶段二进制,**无需数据迁移**(线格式未变)。新二进制写出的文件仍为 uint32,旧二进制可读。
-- **监控**:ingest 预检触发次数、WAL 拆 batch 次数、Phase 0 corrupt 检测次数、Phase 4 修复丢弃行数,均接入告警。
+### 1. 写入、WAL、memtable
+
+#### 风险点
+
+- memtable 中同一 series 的 String field `ColVal` 会跨多次写入持续增长。
+- append 过程中不能出现部分列已 mutation、后续列因超限失败的半写状态。
+- WAL physical record 使用 uint32 长度字段，长度失败必须在 memtable mutation 前暴露。
+
+#### 设计动作
+
+1. 在 `appendFields` / `AppendFieldsToRecord` 前做 String field bytes 预算。
+2. 预算覆盖整次 batch，确保不会发生部分字段 append 后失败。
+3. 单值超过产品上限返回 `ErrValueTooLarge`。
+4. 追加会使目标 `ColVal` 超过 `MaxVarColValBytes` 时返回 `ErrNeedFlush`，触发 snapshot/flush 后重试。
+5. WAL physical record 长度在 memtable mutation 前检查，超限时拆 batch 或拒写。
+6. `AddMemSize` / token 最好放在预算成功之后；若保持现有顺序，错误返回时必须回滚。
+
+#### 验收点
+
+- 低阈值下，同一 series String field 列接近阈值后继续写入，会在 mutation 前返回 `ErrNeedFlush`。
+- 单值超限不写 memtable、不写 WAL。
+- WAL 超限 batch 不会出现 memtable 成功但 WAL 失败。
+
+### 2. Snapshot / flush
+
+#### 风险点
+
+- 当前切分以 rows 为主，不能限制 String field `ColVal.Val` 字节增长。
+- `ChunkMeta.size` 输出可以将错就错，但 builder 内部不能使用回绕后的 `chunkMeta.size` 推进 `dataOffset`。
+
+#### 设计动作
+
+1. snapshot 写出前使用 `SplitByRowsAndVarBytes`:
+   - 按 rows 和 String field bytes 双条件切分。
+   - 不再把超阈值 record 交给 builder。
+2. `ChunkDataBuilder` 维持当前 `ChunkMeta.size uint32` 输出行为，不因为 chunk data 超 4GB 强制切 chunk。
+3. `MsBuilder` 推进 `dataOffset` 时使用实际编码/写入字节数，例如 `len(encodeChunk)` 或 writer 实际 `DataSize` 差值，而不是 `chunkBuilder.chunkMeta.size`。
+
+#### 验收点
+
+- 低 `MaxVarColValBytes` 下，snapshot 会切成多个 bounded record。
+- 构造 chunk data size 回绕场景时，后续 chunk offset 仍按真实写入位置推进。
+- 输出 `ChunkMeta.size` 可以保持 uint32 回绕，不作为本方案失败条件。
+
+### 3. 非流式 compact / merge fastmode
+
+#### 风险点
+
+- 非流式路径会整 chunk 读取，再按 segment entry 切列数据。
+- 如果源 `ChunkMeta.size` 已回绕，整 chunk 读取会拿到截断数据。
+- `ChunkMeta.size` 只约束落盘 chunk data 的字节范围；整 chunk decode 后仍必须校验解压后的 String field `ColVal.Offset` 是否在 `ColVal.Val` 边界内。
+- 非流式 record merge 还会把多个 segment / record 继续追加到目标 `ColVal`。
+
+#### 设计动作
+
+1. 进入非流式 compact / merge 前，对源 chunk 执行 `ValidateChunkMetaDataRange`。
+2. 如果 `expectedChunkDataSize > int64(cm.size)`，不继续非流式整 chunk 读取，降级到 streamMode。
+3. 如果整 chunk 读取成功，但 `decodeRecord` 后 `ValidateCol` / `ValidateRecord` 发现 String field offset 越界，同样不继续非流式 fast path，降级到 streamMode。
+4. streamMode 逐 segment 读取，依赖 segment entry 的 `offset/size`，不依赖源 `ChunkMeta.size` 定位数据。
+5. `decodeRecord` / `Record.Merge` 使用 bounded append，避免目标 String field `ColVal` 超阈值。
+6. 对大 String field 场景，优先绕开整 record fast path，使用 byte-bounded 流式路径。
+
+#### 验收点
+
+- 源 `ChunkMeta.size` 小于 expected size（由 next chunk offset 或 segment entry 计算）时，非流式 compact / merge 降级 streamMode。
+- 整 chunk 读取后 decode 出的 String field `ColVal.Offset` 越界时，非流式 compact / merge 降级 streamMode。
+- 降级后不发生 `columnData` slice panic。
+- 多 segment 合并超过低阈值时，输出多个 bounded record。
+
+### 4. Stream compact
+
+#### 风险点
+
+- 源读取按 segment offset/size 进行，不依赖源 `ChunkMeta.size` 定位数据。
+- `compactColumn` / `continueMerge` 如果只按 rows 判断，仍可能让当前 `c.col` 的 String field bytes 持续增长。
+- 输出 `ChunkMeta.size` 当前在 `writeMetaToDisk` 中用 `uint32(writer.DataSize() - cm.offset)` 写入，本方案不强制改为防回绕。
+
+#### 设计动作
+
+1. `continueMerge` 从 row-only 改成 rows + bytes 双条件。
+2. 从 `lastSeg`、`tmpCol` append 到 `c.col` 前做 String field bytes 预算。
+3. 达到阈值时先 `writeSegment`，再追加新 segment。
+4. `writeMetaToDisk` 的输出 `ChunkMeta.size` 维持现状；后续读取方不得依赖它作为真实 chunk data 长度。
+
+#### 验收点
+
+- 低 `MaxVarColValBytes` 下，stream compact 会提前 `writeSegment`。
+- 即使输出 `ChunkMeta.size` 回绕，后续 stream 读取仍可按 segment entry 读取。
+
+### 5. Stream merge / out-of-order merge
+
+#### 风险点
+
+- 逐列 merge 的 `columnWriter.remain` 是累积对象，不能只按 rows 或时间窗口 split。
+- `WriteOriginal` 当前使用 `for readSize < meta.size` 复制原 chunk；源 `meta.size` 已回绕时会复制截断数据并生成坏新文件。
+- `StreamWriteFile.WriteMeta` 输出 `ChunkMeta.size` 当前会 uint32 窄化，本方案不强制保护该输出。
+
+#### 设计动作
+
+1. `columnWriter.write` / `splitRemain` 改成 rows + bytes 双条件。
+2. unordered merge 时间窗口不能只依赖 `maxTime`，还要受 `MaxVarColValBytes` 限制。
+3. `WriteOriginal` 不再依赖源 `meta.size`:
+   - 按场景使用 `nextChunkMeta.offset - meta.offset` 或 segment entry 覆盖范围计算 `expectedChunkDataSize`。
+   - fast-copy 复制范围使用 `[meta.offset, meta.offset + expectedChunkDataSize)`。
+   - 分块读取时每次仍可用较小 uint32 buffer size，但循环总长度用 int64。
+   - 平移 segment offset 后写新 meta；新 `ChunkMeta.size` 仍维持当前 uint32 输出行为。
+4. 如果 segment entry range 本身不可信，禁用 `WriteOriginal`，改走逐 segment rewrite；无法安全重写时返回 corrupt error。
+
+#### 验收点
+
+- 源 `meta.size` 回绕时，`WriteOriginal` 不再只复制前 `meta.size` 字节。
+- 源 segment entry range 不可信时，不走 fast-copy。
+- 逐列 merge 超低阈值时提前 flush/split。
+
+### 6. 查询路径
+
+#### 风险点
+
+- `tsspFileReader.ReadData` 中 `cm.size < defaultIoSize` 时会整 chunk 预读。
+- 如果 `cm.size` 已回绕成小值，整 chunk 预读可能拿到截断 chunkData。
+- 截断 chunkData 后续 `columnData` / decode 会失败或 panic。
+
+#### 设计动作
+
+1. 查询路径默认仍保留 `defaultIoSize` 整 chunk 预读优化。
+2. 当源 chunk range 校验发现 `expectedChunkDataSize > int64(cm.size)`，或整 chunk 预读后的 decode/range check 失败时，降级为按 segment 依次读取。
+3. 按 segment 读取使用 `Segment.offset/size`，不依赖源 `ChunkMeta.size`。
+4. `columnData` 前增加边界判断，避免截断 chunkData 触发 slice panic；失败后走 per-segment fallback 或返回明确 corrupt error。
+
+#### 验收点
+
+- 构造回绕 `ChunkMeta.size` 且 segment entry 正确的文件，查询会降级到 per-segment read 并尽量完成读取。
+- segment entry 也不可信时，查询返回 corrupt error，不 panic。
+
+### 7. 诊断与 repair
+
+#### 设计动作
+
+1. 诊断工具扫描:
+   - String field offset 非单调或越界。
+   - `ChunkMeta.size` 小于 expected size（由 next chunk offset 或 segment entry 计算）。
+   - next chunk offset 或 segment entry offset/size 越过文件 data 区。
+2. repair 通过低优先级 recompact/rewrite 实现。
+3. repair 必须限速、可中断、可回滚。
+4. 不默认静默丢行；若必须丢弃，记录审计信息。
+
+### 8. 其他依赖点核查
+
+| 位置 / 流程 | 是否依赖 `ChunkMeta.size` | 处理 |
+|-------------|---------------------------|------|
+| `tsspFileReader.ReadData` 的 `validate(cm.offset, cm.size)` | 是，但只做文件范围粗校验 | 不能作为 size 正确性的证明；后续仍需整 chunk 预读 fallback 或 segment range 校验 |
+| `tsspFileReader.ReadData` 的 `cm.size < defaultIoSize` | 是，决定是否整 chunk 预读 | 预读失败、range check 失败或 decode 失败时，降级 per-segment read |
+| `ChunkIterator.readRecord` | 是，非流式 compact 读整 chunk | 入口 size 校验失败，或整 chunk decode 后 `ColVal.Offset` 越界时降级 streamMode |
+| `mergePerformer.WriteOriginal` | 当前依赖，风险最高 | 改为按 next chunk offset 或 segment entry 覆盖范围复制，不使用源 `meta.size` |
+| stream compact 读取源数据 | 否，按 segment offset/size 读取 | 不需要因源 `ChunkMeta.size` 回绕改读取逻辑 |
+| unordered reader / SegmentReader | 否，按 segment offset/size 读取 | 不需要因源 `ChunkMeta.size` 回绕改读取逻辑 |
+| first/last/min/max 等预聚合读取 | 基本不依赖，按目标 segment 读取 | 保持按 segment 读取；遇到 decode 错误 fail-closed |
+| `ChunkMeta` marshal/unmarshal / self codec | 只是读写 uint32 字段 | 线格式不变，不新增输出保护；读侧把该字段视为不可信 |
+| `MetaIndex.size` | 不是 `ChunkMeta.size`，用于 meta block 读取 | 不纳入本问题，保持现状 |
+| snapshot / flush `dataOffset` 推进 | 当前可能间接依赖 `chunkMeta.size` | 改为使用真实编码/写入大小，避免 size 回绕污染后续 offset |
 
 ---
 
-## 十一、改动清单(按文件)
+## 六、同版本交付内容
 
-### Phase 0
-- `lib/encoding/encoding.go`(`unpackStringV2` 边界校验)
-- `lib/record/column.go`(`PadColVal`/`sliceValAndOffset` 补 Tag;`BytesUnsafe` 边界;新增 `isStringLike`)
-- `lib/record/column_string.go`(`StringValue*` 边界校验)
-- `lib/record/record_check.go`(新增 `Validate*() error`,String/Tag 完整校验)
+这些修复在一个版本中交付，不再按发布批次拆分。代码一次合入，运行时通过能力开关、路径开关和后台任务类型逐步放量。
 
-### Phase 1
-- `engine/mutable/ts_table.go`(`appendFields` 前预检)
-- `lib/record/record_group.go`(`AppendFieldsToRecord` 调用方处理预检结果)
-- `engine/wal.go` / `lib/record/record_codec.go` / `lib/record/column_codec.go` / `lib/codec/binary_encoder.go`(WAL 拆 batch + uint32 长度断言)
+### 必须随版本交付
 
-### Phase 2
-- `lib/record/column.go` / `column_string.go`(新增 `TryAppendString/Tag/Null`、`TryAppendColVal`、`SplitByRowsAndVarBytes`)
-- 迁移 TSStore 写路径:`engine/mutable/*`、`engine/immutable/stream_compact.go`、`merge_performer.go`、`record_sort.go`、`meger.go`
-- CI analyzer(新建,`tools/` 或 `.ci/`)
+- 新增 `ValidateChunkMetaDataRange`，支持用 next chunk offset 或 segment entry 覆盖范围判断源 `ChunkMeta.size` 是否可信。
+- 查询整 chunk 预读失败或校验不通过时，降级到 per-segment read。
+- 非流式 compact / merge fastmode 发现源 `ChunkMeta.size` 不可信，或整 chunk decode 后 `ColVal.Offset` 越界时，降级 streamMode。
+- `WriteOriginal` 复制长度改为依赖 next chunk offset 或 segment entry 覆盖范围，而不是源 `meta.size`。
+- `appendFields` 前做 String field bytes 预算。
+- 单值超限拒写。
+- 追加会使 memtable `ColVal` 超阈值时返回 `ErrNeedFlush`，触发 snapshot/flush 后重试。
+- WAL physical record 长度在 memtable mutation 前检查，超限拆 batch 或拒写。
+- 引入 String field 判断、bounded append API 和 rows + var-bytes splitter。
+- 高风险 `AppendColVal`、`AppendString`、直接 `uint32(len(cv.Val))` 统一收敛到 bounded API。
+- snapshot/flush 按 rows + var-bytes 切分。
+- snapshot/flush 内部 offset 推进改为真实写入大小，不依赖回绕 `chunkMeta.size`。
+- stream compact 按 bytes 提前 `writeSegment`。
+- stream merge 的 `columnWriter` byte-bounded。
+- 非流式 compact / merge 大 String field 场景降级到 byte-bounded streamMode。
+- compact / merge 输出 `ChunkMeta.size` 维持现状，不作为本方案保护目标。
+- 扫描历史 TSSP，识别坏 `ColVal.Offset`、坏 `ChunkMeta.size`、chunk data range 不一致。
 
-### Phase 3
-- `engine/immutable/msbuilder.go`(`WriteRecord` 双阈值切分)
-- `engine/immutable/column_builder.go`(`EncodeColumn` 字节阈值)
-- `engine/immutable/stream_compact.go`(追加点估字节、`splitColumn` 改前置判断)
-- `engine/immutable/merge_performer.go`(`cw.remain` 字节 flush)
-- `engine/immutable/unordered_reader.go`(byte-bounded 时间窗口)
-- `engine/immutable/merge_tool.go` / `merge_self.go`(禁用/改造 `mergeSelfFastMode`)
-- `engine/immutable/chunk_iterators.go` / `compact.go`(非流式 compact 大列路径处置)
-- 编码断言:`lib/encoding/encoding.go`(`packStringV1/V2`)、`tssp_file_meta.go`(`Segment.size`)、WAL 各 uint32 长度字段
+### 默认不自动执行
 
-### Phase 4
-- 诊断/修复工具(新建,复用 Phase 0 校验)
+- 历史文件 repair/recompact 不随版本自动运行。
+- repair 通过运维开关手动启用，必须限速、可中断、记录审计。
 
 ---
 
-## 十二、决策摘要
+## 七、测试策略
 
-- **主线 = 路线 B**:保持 `uint32` 全域,用 bounded append 闸口 + 字节阈值切分 + 流式 merge/compact + ingest 预检,建立「单内存 `ColVal.Val ≤ 256MiB`」不变量。
-- **A(uint64 类型变更)= future non-goal**:B 落地后不再必做;`uint64` 仅用于内部长度计算与边界判断,不改 `ColVal.Offset` 类型。
-- **兼容性**:TSSP/WAL 线格式全不变 → 历史数据可读、可灰度、可回滚。
-- **完整性保证**:不靠编译器(A 的弱点),靠「bounded API + CI analyzer + 编码断言 + fuzz」四层闭环。
-- **阈值 256MiB**(可配 512MiB):远小于 4GB,给所有 uint32 边界留余量,同时避免 4GB+ 连续内存的 OOM/双缓冲风险。
-- **先读侧加固 + ingest 止血**:立即降低线上 crash 与数据腐败风险,再从容做 bounded API 与切分改造。
-- **高危路径(`mergeSelfFastMode`、非流式 compact)先禁用/绕开**,统一走流式,避免构造 4GB+ 单 ColVal。
-- **单值超限直接拒写**,不截断/不拆分/不落 WAL。
+### 写入 / WAL / snapshot
+
+- 低 `MaxVarColValBytes` 下，同一 series String field 列接近阈值后继续写入，验证 mutation 前返回 `ErrNeedFlush`。
+- 单值超过产品上限，验证不写 memtable、不写 WAL。
+- WAL physical record 超安全阈值，验证写 memtable 前拆批或拒写。
+- snapshot 只按行数不足以切开的场景，验证 rows + bytes splitter 生效。
+- 构造 `ChunkMeta.size` 回绕场景，验证 snapshot writer 内部后续 chunk offset 仍按真实写入大小推进。
+
+### `ChunkMeta.size` 读取降级
+
+- 构造 `ChunkMeta.size` 小于 expected size 的源 meta，分别覆盖 next chunk offset 和 segment entry 两种算法，验证非流式 compact / merge 降级 streamMode。
+- 构造 `ChunkMeta.size` 可信但 decode 后 String field `ColVal.Offset` 越界的整 chunk 数据，验证非流式 compact / merge fastmode 降级 streamMode。
+- 查询路径触发 `defaultIoSize` 整 chunk 预读但 decode/range check 失败时，验证降级 per-segment read。
+- segment entry 本身不可信时，验证查询/compact 返回 corrupt error，不 panic。
+- stream compact / stream merge 输出回绕 `ChunkMeta.size` 后，后续 streamMode 仍可按 segment entry 读取。
+
+### Compact / merge
+
+- 多个合法小 segment compact 后总 bytes 超低阈值，验证不会构造超阈值目标 `ColVal`。
+- stream compact 的 `continueMerge` 在 bytes 达阈值时提前 `writeSegment`。
+- stream merge 的 `columnWriter.remain` 在 bytes 达阈值时提前 flush/split。
+- 源 `meta.size` 回绕时，`WriteOriginal` 仍按 next chunk offset 或 segment entry 覆盖范围复制，不生成截断新文件。
+
+### 兼容性
+
+- 旧 TSSP/WAL 新二进制可读。
+- 新二进制写出的 TSSP/WAL 仍保持旧格式，旧二进制可读。
+- 含坏 offset / 坏 chunk meta 的旧文件，新二进制读不 panic。
+
+---
+
+## 八、改动清单
+
+### 共享 record 能力
+
+- `lib/record/column.go`:String field 判断、checked accessor、bounded append 入口。
+- `lib/record/record_check.go`:新增 `ValidateCol` / `ValidateRecord`。
+- `lib/record/*`:新增 rows + var-bytes splitter。
+
+### 写入 / WAL
+
+- `engine/mutable/ts_table.go`:memtable append 前预算。
+- `engine/shard.go`:处理 `ErrNeedFlush` / `ErrValueTooLarge`，修正 mem size/token 顺序或回滚。
+- `engine/wal.go`:WAL physical record 长度预检查，拆 batch / 拒写发生在 memtable mutation 前。
+
+### Snapshot / flush
+
+- `engine/immutable/msbuilder.go`:写 record 前按 rows + var-bytes 切分；`dataOffset` 用真实写入大小推进。
+- `engine/immutable/chunkdata_builder_ts.go`:保留 `ChunkMeta.size uint32` 输出现状，不新增 chunk byte cap。
+- `engine/immutable/column_builder.go`:保留 segment 写前断言。
+
+### Compact
+
+- `engine/immutable/chunk_iterators.go`:整 chunk 读取前校验源 chunk data range；整 chunk decode 后校验 `ColVal.Offset`；不可信或 offset 越界时触发 streamMode 降级。
+- `engine/immutable/stream_compact.go`:`compactColumn` / `continueMerge` 增加 byte 条件；`writeMetaToDisk` 的 `ChunkMeta.size` 输出维持现状。
+- `engine/immutable/merge_tool.go` / `merge_self.go`:大 String field、源 `ChunkMeta.size` 不可信，或整 chunk decode 后 `ColVal.Offset` 越界时绕开整 record fast path。
+
+### Merge
+
+- `engine/immutable/merge_performer.go`:`columnWriter` 按 rows + bytes flush/split；`WriteOriginal` 复制长度改用 next chunk offset 或 segment entry 覆盖范围，不依赖源 `meta.size`。
+- `engine/immutable/stream_downsample.go`:`StreamWriteFile.WriteMeta` 的 `ChunkMeta.size` 输出维持现状。
+- `engine/immutable/unordered_reader.go`:乱序窗口 byte-bounded。
+
+### 查询 / 诊断
+
+- `engine/immutable/tssp_file_meta.go` / `chunk_meta_codec.go`:chunk data range 校验辅助。
+- `engine/immutable/tssp_file.go`:整 chunk 预读失败或 size 不可信时降级 per-segment read；`columnData` 前增加边界判断。
+- 新增诊断/repair 工具，复用 `Validate*` 和 chunk data range 校验。
+
+---
+
+## 九、灰度与回滚
+
+本版本线格式不变，所有修复随同一版本发布。灰度对象不是代码批次，而是节点/租户/shard、运行时开关、读写路径和后台任务类型。除 repair 外，保护性开关默认打开；如需更保守放量，可在灰度节点上按下列路径启用和观察。
+
+### 灰度开关
+
+| 开关 | 默认值 | 作用 | 回滚方式 |
+|------|--------|------|----------|
+| `enable_chunkmeta_size_fallback` | 开 | 查询整 chunk 预读失败、size 不可信或 decode 后 offset 越界时，降级 per-segment read | 关闭后回到旧读取路径，但旧路径可能继续受坏 `ChunkMeta.size` 影响 |
+| `enable_nonstream_degrade_stream` | 开 | 非流式 compact / merge fastmode 遇到不可信 `ChunkMeta.size` 或解压后 `ColVal.Offset` 越界时，降级 streamMode | 关闭后回到旧 fastmode 行为 |
+| `enable_writeoriginal_range_copy` | 开 | `WriteOriginal` 使用 next chunk offset 或 segment entry 覆盖范围复制，不依赖源 `meta.size` | 关闭后回到旧复制长度逻辑 |
+| `enable_var_col_budget` | 开 | 写入、snapshot、compact、merge 使用 String field bytes 预算，避免构造超阈值 `ColVal` | 紧急时可关闭，但需要保留告警，避免继续制造坏数据 |
+| `enable_wal_precheck` | 开 | WAL physical record 在 memtable mutation 前做长度检查，拆 batch 或拒写 | 关闭后回到旧 WAL 写入逻辑 |
+| `enable_background_byte_bound` | 开 | snapshot/flush、stream compact、stream merge 按 rows + bytes 切分或提前 flush | 关闭后后台流程回到旧切分逻辑 |
+| `enable_repair_job` | 关 | 允许低优先级 repair/recompact 历史坏文件 | 停止任务即可；已重写文件仍是旧 TSSP 线格式 |
+
+### 放量节奏
+
+- 先打开读侧 fallback 与非流式降级开关，观察查询 per-segment fallback、source chunk meta range 校验失败和 compact/merge streamMode 降级次数。
+- 写流量按 shard 或租户逐步放量 `enable_var_col_budget` 与 `enable_wal_precheck`，重点观察 `ErrNeedFlush`、`ErrValueTooLarge`、WAL 拆批/拒写、写入延迟和写失败率。
+- 后台任务按类型放量 `enable_background_byte_bound`，先 snapshot/flush，再 stream compact/merge，最后覆盖非流式 compact/merge fastmode 降级路径。
+- `enable_writeoriginal_range_copy` 随后台任务一起放量，重点观察 next chunk offset / segment entry range 复制次数、fast-copy 禁用次数和新文件校验结果。
+- 诊断工具可默认运行只读扫描；repair/recompact 必须手动开启、限速运行，并支持按文件或目录停止。
+
+### 回滚策略
+
+- 优先回滚具体开关，不做数据格式迁移。
+- 如果读侧 fallback 带来不可接受的查询延迟，可关闭 `enable_chunkmeta_size_fallback`，但需要明确旧路径遇到坏 `ChunkMeta.size` 仍可能 decode 失败或读到截断数据。
+- 如果写入预算出现误判，可临时关闭 `enable_var_col_budget`，但应保留超限观测指标，并优先修正预算逻辑后重新开启。
+- 如果后台任务放量导致资源占用过高，可关闭 `enable_background_byte_bound` 或 `enable_nonstream_degrade_stream`，并限制 compact/merge 并发。
+- repair/recompact 可随时停止；已完成 rewrite 的文件不需要反向迁移。
+
+监控:
+
+- `ErrNeedFlush` 次数
+- `ErrValueTooLarge` 次数
+- WAL 拆批/拒写次数
+- source chunk meta range 校验失败次数
+- decode 后 `ColVal.Offset` 越界次数
+- 查询 per-segment fallback 次数
+- 非流式 compact/merge 降级 streamMode 次数
+- `WriteOriginal` 使用 next chunk offset / segment entry range 复制次数，及 fast-copy 禁用次数
+- compact/merge 提前 write segment 次数
+- repair 处理文件数与失败记录数
+
+---
+
+## 十、决策摘要
+
+- 主线保护 `ColVal.Offset`，通过 mutation 前预算、bounded append 和后台流程 byte-bounded，避免构造超阈值 String field `ColVal`。
+- `ChunkMeta.size` 不再作为输出侧保护目标。compact / merge 等流程输出维持现状，允许 uint32 回绕继续存在。
+- 后续流程必须把源 `ChunkMeta.size` 当作不可信元数据。整 chunk 读、非流式 compact/merge、查询预读、`WriteOriginal` 都需要校验或绕开对它的依赖。
+- 非流式 compact / merge 遇到不可信 `ChunkMeta.size`，或整 chunk decode 后 `ColVal.Offset` 越界时降级 streamMode。
+- `WriteOriginal` 不能再用 `meta.size` 作为复制长度，应使用 next chunk offset 或 segment entry 推导出的真实覆盖范围。
+- 查询路径中 `defaultIoSize` 整 chunk 预读失败时，降级为按 segment 依次读取。
+- 即使输出 `ChunkMeta.size` 将错就错，writer 内部 offset 推进仍必须使用真实写入大小，不能依赖已回绕的 `chunkMeta.size`。
