@@ -31,10 +31,10 @@ import (
 
 var tsmCursorPool = &sync.Pool{}
 
-// lazyUnorderedMergeEnabled gates the lazy out-of-order merge path (Phase 3 of
-// tsmMergeCursor_FirstTimeInit_unordered_analysis.md). Default off: the eager FirstTimeInit
-// full-read path is used. Enable to stream out-of-order data through a segment-at-a-time heap
-// merge, reducing first-packet latency and the chain-merge cost.
+// lazyUnorderedMergeEnabled gates the lazy out-of-order merge path. Default off: the eager
+// FirstTimeInit full-read path is used. Enable to stream out-of-order data through a
+// segment-at-a-time heap K-way merge in maxRowCnt-sized batches, reducing the O(N^2*R) chain-merge
+// cost and the allocation/GC pressure of building a full out-of-order outRec up front.
 //
 // It is an atomic because the setter may be called from a config/admin goroutine while query
 // goroutines read it in lazyUnorderedEnabled; prefer setting it once at startup.
@@ -104,8 +104,8 @@ func SetLazyUnorderedMergeMinLocations(n int32) {
 }
 
 // lazyUnorderedEnabled reports whether the lazy out-of-order merge path should be used for the
-// current cursor. It is restricted to ascending non-aggregate reads without limit-cut or Prom
-// semantics; every other shape falls back to the eager path.
+// current cursor. It is restricted to non-aggregate reads (ascending and descending) without
+// limit-cut or Prom semantics; every other shape falls back to the eager path.
 func (c *tsmMergeCursor) lazyUnorderedEnabled() bool {
 	if !lazyUnorderedMergeEnabled.Load() {
 		return false
@@ -505,9 +505,10 @@ func (c *tsmMergeCursor) Next() (*record.Record, error) {
 // locations, streamed in maxRowCnt-sized batches.
 //
 // openGemini's out-of-order data is older than the ordered data (SplitRecordByTime at flush).
-// The two are time-disjoint. For ascending, output = unordered(older) -> ordered(newer), so
-// Phase 1 streams unordered then Phase 2 reads ordered. For descending the order is reversed:
-// Phase 1 reads ordered (newer, output first), Phase 2 streams unordered (older).
+// The two are time-disjoint. For ascending, output = unordered(older) -> ordered(newer), so the
+// unordered heap batches are streamed first and the ordered data is read after. For descending the
+// order is reversed: ordered (newer, output first) is read first, then the unordered heap batches
+// are streamed.
 //
 // The underlying data scanning (segment reads, filtering) is direction-agnostic — Location's
 // internal !Ascending branches handle segment iteration direction and FilterByTime(Descend).

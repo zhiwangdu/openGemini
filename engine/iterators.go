@@ -57,7 +57,7 @@ const (
 	// unorderedLocationCount records how many out-of-order locations were matched for a
 	// series (the K amplification factor in the analysis). unorderedMergeCount records how
 	// many chain-merge iterations the non-aggregate FirstTimeInit performed. Both surface the
-	// unordered-read cost that dominates first-packet latency.
+	// unordered-read/merge cost that dominates total query time and allocation under eager.
 	unorderedLocationCount = "unordered_location_count"
 	unorderedMergeCount    = "unordered_merge_count"
 
