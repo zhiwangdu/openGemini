@@ -170,7 +170,7 @@ ordered 侧不需要参与 K 路堆合并；堆只负责把 unordered 文件集�
 | **核心优化** | 堆式 K 路合并 + `maxRowCnt` 流式分批 | 替换链式 `O(N²R)` 为 `O(M·logK)`；乱序流式归并输出 |
 | **辅助优化** | dst 内存复用 + 观测指标 + ReInit 修复 | 降低分配/GC 压力；增加可观测性；修复 cursor 复用 bug |
 
-核心优化通过 feature flag 控制（默认关），仅对升序非聚合非 limit-cut 非 Prom 查询生效。
+核心优化通过 feature flag 控制（默认关），对升序/降序非聚合、非 limit-cut、非 Prom 查询生效。
 
 ---
 
@@ -179,13 +179,16 @@ ordered 侧不需要参与 K 路堆合并；堆只负责把 unordered 文件集�
 ### 5.1 核心思路
 
 在 §3 的同一 series 文件前提下，ordered 侧已经是按 seq 排好的全局有序流，且与 unordered
-不重叠。当前 TSStore flush 语义下 unordered 比 ordered **更旧**，所以升序查询输出 =
-**归并去重后的 unordered(旧) → ordered(新)**，无需 ordered/unordered 交错合并或 watermark 延迟。
+不重叠。当前 TSStore flush 语义下 unordered 比 ordered **更旧**，所以两侧不需要交错合并或
+watermark/deferral：
+
+- 升序输出 = **归并去重后的 unordered(旧) → ordered(新)**。
+- 降序输出 = **ordered(新) → 归并去重后的 unordered(旧)**。
 
 基于此，优化方案为：**只对 unordered 文件集合做堆式 K 路归并，按 `maxRowCnt` 流式分批输出，
-全部 unordered 输出完再读 ordered**。合并复杂度 `O(M·logK)`（M = unordered 总行数，K = 命中的
-unordered location 数），替换链式 `O(N²·R)`；输出按 `maxRowCnt` 分批，每批只合并最多
-`maxRowCnt` 个输出行（而非构造完整 unordered `outRec`），降低累计拷贝和分配峰值。
+再按查询方向拼接 ordered/unordered 两个 disjoint phase**。合并复杂度 `O(M·logK)`（M = unordered
+总行数，K = 命中的 unordered location 数），替换链式 `O(N²·R)`；输出按 `maxRowCnt` 分批，每批只
+合并最多 `maxRowCnt` 个输出行（而非构造完整 unordered `outRec`），降低累计拷贝和分配峰值。
 
 ### 5.2 组件设计
 
@@ -195,7 +198,8 @@ unordered location 数），替换链式 `O(N²·R)`；输出按 `maxRowCnt` 分
   的 record）、`pos`、`done`、`inHeap`。
 - `nextBatch(watermark, maxRows)`：watermark 为 nil（乱序-only，准入全部），按 `maxRows` cap 输出。
   每源只持当前 1 个 segment，耗尽才读下一个 → 堆 live = K × segmentSize。
-- 堆序：当前行时间升序，同时间 `seq` 降序（最新者先 pop）。
+- 堆序：随查询方向切换；升序按当前行时间最小优先，降序按当前行时间最大优先；同时间 `seq` 降序
+  （最新者先 pop）。
 - `appendMergedSameTimeRow`：同时间组按 newest→oldest 折叠，每列取最新非 nil 值，等价于 `mergeRecRow`
   折叠。所有输入 record 共享 `ctx.schema` 时可按列下标对齐；否则必须按字段名对齐。
 - `isAborted` 回调：合并循环顶检查，abort 时 `return nil, nil`（丢弃半成品）。
@@ -206,19 +210,19 @@ unordered location 数），替换链式 `O(N²·R)`；输出按 `maxRowCnt` 分
 - 另暴露 `Location.HasNext()`、`Location.Sequence()`、`LocationCursor.LocationAt(i)`。
 
 **`nextLazy`**（`engine/tsm_merge_cursor.go`）两阶段：
-- **Phase 1**（乱序流式）：`lazyMerger.nextBatch(nil, maxRowCnt)` 每次产 `maxRowCnt` 行 →
-  `outOrderRecIter` → `mergeData` 输出。重复直到 `allDone()`。
-- **Phase 2**（有序）：乱序耗尽后读有序 batch，`mergeData` 输出。有序与乱序 disjoint，
-  `mergeData` 走 NonOverlap 批量分支（廉价）。
+- 升序：先 `lazyMerger.nextBatch(nil, maxRowCnt)` 流式输出 unordered，再读 ordered。
+- 降序：先读 ordered，ordered 耗尽后再 `lazyMerger.nextBatch(nil, maxRowCnt)` 流式输出 unordered。
+- ordered 与 unordered disjoint，不需要用 ordered.min/ordered.max 做 watermark 延迟；`nextBatch(nil, ...)`
+  表示 unordered-only 归并，准入当前可读 segment。
 
 ### 5.3 正确性不变式
 
 1. **ordered 全局有序**：同一 series 的 ordered 文件按 seq 顺序全局有序，文件间无重叠、无重复。
-   ordered 侧可作为单调流在 Phase 2 直接输出。
+   ordered 侧可作为单调流在对应 phase 直接输出。
 2. **unordered/ordered disjoint**：同一 series 的 unordered 与 ordered 不重叠。当前 TSStore 语义下
-   unordered 旧、ordered 新，升序输出 = Phase 1 全部 unordered → Phase 2 ordered，顺序正确。
-   若未来存在 unordered 更新于 ordered 的布局，需要按两侧时间范围选择 phase 顺序，不能固定
-   unordered-first。
+   unordered 旧、ordered 新，升序输出 = unordered → ordered，降序输出 = ordered → unordered。
+   两种方向都只需要切换 phase 顺序，不需要 deferral。若未来存在 unordered/ordered 时间范围交错，
+   则需要重新引入跨两侧的时间归并，不能固定两段式输出。
 3. **unordered 文件间 K 路归并**：unordered 文件之间可能乱序、重叠、重复。heap key 必须是当前行
    时间；文件 seq 只用于同 timestamp 覆盖优先级，不能作为归并顺序。
 4. **同 timestamp 完整合并**：输出 timestamp `t` 前，必须收齐所有可能产生 `t` 的 unordered row，
@@ -227,11 +231,11 @@ unordered location 数），替换链式 `O(N²·R)`；输出按 `maxRowCnt` 分
    timestamp 跨 segment”作为明确文件前提。
 5. **字段对齐**：同 timestamp 合并若按列下标读取，必须证明所有输入 record 都按 `ctx.schema` 构建且
    字段顺序一致；否则必须像 `mergeRecRow(newRec, oldRec, ...)` 一样按字段名归并。
-6. **终止**：堆空且所有源 `done` 时 `nextBatch` 返回 nil；`allDone()` 判定 Phase 1 完成，转 Phase 2；
+6. **终止**：堆空且所有源 `done` 时 `nextBatch` 返回 nil；`allDone()` 判定 unordered phase 完成；
    ordered 也读完返回 nil。无死循环。
 7. **abort**：`nextBatch` 循环顶检查 `isAborted`，abort 时丢弃半成品返回 nil。
 
-> **保护范围**：`lazyUnorderedEnabled()` 限制仅升序非聚合非 limit-cut 非 Prom。其余查询形状保留 eager，
+> **保护范围**：`lazyUnorderedEnabled()` 限制非聚合、非 limit-cut、非 Prom。其余查询形状保留 eager，
 > 避免把上述前提之外的路径纳入灰度。
 
 ### 5.4 小 N 阈值（防退化）
@@ -243,8 +247,8 @@ unordered location 数），替换链式 `O(N²·R)`；输出按 `maxRowCnt` 分
 ### 5.5 Feature flag 与适用范围
 
 `lazyUnorderedMergeEnabled`（`atomic.Bool`，默认关）：`SetLazyUnorderedMergeEnabled` 运行时切换。
-`lazyUnorderedEnabled()` 限制：**仅升序**、非聚合（`len(ops)==0`）、非 limit-cut、非 Prom。其余形状
-回退 eager。
+`lazyUnorderedEnabled()` 限制：非聚合（`len(ops)==0`）、非 limit-cut、非 Prom；升序和降序都走同一
+lazy unordered merger，只是 `nextLazy` 的 phase 顺序相反。其余形状回退 eager。
 
 ---
 
@@ -291,31 +295,27 @@ flowchart TD
     R --> T
 
     T --> N["Next → nextLazy"]
-    N --> P1{"Phase 1: unordered allDone?"}
-    P1 -- "no" --> P1a{"outOrderRecIter has remain?"}
-    P1a -- "yes" --> P1b["mergeData → emit unordered batch"]
-    P1a -- "no" --> P1c["lazyMerger.nextBatch(nil, maxRowCnt)"]
-    P1c --> P1d["heap K-way merge maxRowCnt rows"]
-    P1d --> P1b
-    P1b --> OUT["record to seriesCursor"]
-    P1 -- "yes" --> P2{"Phase 2: orderRecIter has remain?"}
-    P2 -- "no" --> P2a["read next ordered batch"]
-    P2a --> P2b{"ordered nil?"}
-    P2b -- "yes" --> P2c["return nil (done)"]
-    P2b -- "no" --> P2d["mergeData → emit ordered"]
-    P2 -- "yes" --> P2d
-    P2d --> OUT
+    N --> D{"Ascending?"}
+    D -- "yes" --> AU["Phase 1: unordered heap batches"]
+    AU --> AO["Phase 2: ordered batches"]
+    D -- "no" --> DO["Phase 1: ordered batches"]
+    DO --> DU["Phase 2: unordered heap batches"]
+    AU --> OUT["record to seriesCursor"]
+    AO --> OUT
+    DO --> OUT
+    DU --> OUT
 
     S:::hot
     R:::amp
-    P1d:::hot
+    AU:::hot
+    DU:::hot
     classDef hot fill:#ffd6d6,stroke:#c62828,stroke-width:2px,color:#111;
     classDef amp fill:#fff0c2,stroke:#b26a00,stroke-width:2px,color:#111;
 ```
 
 - eager 分支（默认）保留原 `FirstTimeInit` 全量读 + 链式合并。
-- 核心优化分支：Phase 1 只对 unordered 文件集合做堆式归并并按 `maxRowCnt` 流式输出；Phase 2 在
-  unordered 耗尽后读 ordered（ordered 侧已全局有序且与 unordered disjoint）。
+- 核心优化分支：只对 unordered 文件集合做堆式归并并按 `maxRowCnt` 流式输出；ordered 侧已全局有序。
+  升序 phase 顺序是 unordered → ordered；降序 phase 顺序是 ordered → unordered。
 
 ### 7.2 堆式 K 路合并数据流
 
@@ -328,7 +328,7 @@ flowchart LR
     L1 --> W["ReadDataBeforeWatermark (逐 segment, 每文件持当前段)"]
     L2 --> W
     LN --> W
-    W --> H["heap K-way: pop min time, same-time group by seq desc"]
+    W --> H["heap K-way: pop min/max time by direction, same-time group by seq desc"]
     H --> SG["appendMergedSameTimeRow: newest non-nil wins"]
     SG --> RB["outOrderRecIter (ready batch, ≤ maxRowCnt)"]
 
@@ -364,12 +364,12 @@ flowchart TD
         OD --> OE["mergeData: 乱序 + 有序"]
     end
     subgraph NEW["优化方案"]
-        NB["Phase 1: nextBatch(nil, maxRowCnt)"] --> NC["heap K-way merge maxRowCnt 行"]
-        NC --> ND["emit 乱序 batch"]
+        NB["unordered phase: nextBatch(nil, maxRowCnt)"] --> NC["heap K-way merge maxRowCnt 行"]
+        NC --> ND["emit unordered batch"]
         ND --> NE{"allDone?"}
         NE -- "no" --> NB
-        NE -- "yes" --> NF["Phase 2: 读有序 batch"]
-        NF --> NG["mergeData: 有序 (NonOverlap)"]
+        NE -- "yes" --> NF["ordered phase: 读有序 batch"]
+        NF --> NG["mergeData: disjoint phase"]
     end
     OB:::hot
     OC:::hot
@@ -381,7 +381,7 @@ flowchart TD
 
 - eager 首批前读完全部乱序、链式合并构造完整 `outRec`（`O(N²R)` + 全量内存）。
 - 优化方案按 `maxRowCnt` 流式堆合并 unordered。首批需要准入各 active source 的当前 segment，但只
-  产出最多 `maxRowCnt` 个输出行；unordered 全部输出后再读 ordered（disjoint）。
+  产出最多 `maxRowCnt` 个输出行；升序先输出 unordered phase，降序先输出 ordered phase。
 
 ---
 
@@ -497,8 +497,8 @@ source 的当前 segment，因此“首包只合并 `maxRowCnt` 行”指最多�
 | 真实布局（ordered 新/unordered 旧） | 44.0 ms | 8.14 ms（5.4×） |
 | 旧布局（ordered 旧/unordered 新） | 42.4 ms | 8.30 ms（5.1×） |
 
-两种布局结果几乎一致 → **收益与布局无关**，来自堆合并算法 `O(M·logK)` vs 链式 `O(N²R)`，而非
-deferral（升序真实布局下 deferral 不生效——乱序更旧，先输出）。
+两种布局结果几乎一致 → **收益与布局无关**，来自堆合并算法 `O(M·logK)` vs 链式 `O(N²R)`。当前核心
+路径不依赖 deferral：ordered/unordered 已经 disjoint，按查询方向输出两个 phase 即可。
 
 ---
 
@@ -539,7 +539,7 @@ deferral（升序真实布局下 deferral 不生效——乱序更旧，先输�
 | 路径 | 触发条件 | 乱序读取方式 | 覆盖? | 严重性 |
 |---|---|---|---|---|
 | TS 非聚合升序 | 默认 | 堆合并 + 流式分批 | ✅ | — |
-| 降序非聚合 | `!Ascending` | eager 链式 | ❌（§12.1） | 中 |
+| 降序非聚合 | `!Ascending` | 堆合并 + 流式分批 | ✅（§12.1） | — |
 | limit-cut 非聚合 | `CanLimitCut` | eager 全量读 | ❌（§12.2） | 中 |
 | Prom 查询 | `IsPromQuery` | eager（经 tsmMergeCursor） | ❌（未分析） | 中 |
 | tsmMergeCursor 聚合 | `len(ops)>0` 且非 fileCursor | pre-agg meta | ❌ | 低 |
@@ -549,15 +549,29 @@ deferral（升序真实布局下 deferral 不生效——乱序更旧，先输�
 
 ---
 
-## 12. 未来演进
+## 12. 已覆盖路径与未来演进
 
-### 12.1 降序支持
+### 12.1 降序支持（已实现）
 
-降序输出 = 有序(新) → 乱序(旧)。有序先输出，可用 watermark=ordered.min 延迟更旧的乱序——deferral
-在此方向有效。主要工作：
-- `ReadDataBeforeWatermark` 降序分支（segPos 高→低，`if maxT < watermark { return nil }`）。
-- 堆按时间降序（`Less` 改 `ti > tj`）。
-- `nextLazy` 降序 watermark = `MinTime(false)`。
+降序输出 = ordered(新) → unordered(旧)。由于同一 series 的 ordered 与 unordered 无交集，ordered
+任一命中段的最小时间都在 unordered 最大时间之后，天然就是 unordered 侧的时间上界；因此
+ordered/unordered 之间不需要 deferral，也不需要用 `ordered.min` 做 watermark。
+
+当前代码已经按这个模型实现：
+
+- `tsmMergeCursor.nextLazy` 按方向切 phase：升序先 `nextLazyUnorderedBatch()` 再 `nextLazyOrdered()`；
+  降序先 `nextLazyOrdered()`，ordered 耗尽后再 `nextLazyUnorderedBatch()`。
+- ordered locations 在 `FirstTimeInit` 中 `sort.Sort(c.locations)` 后，降序通过 `c.locations.Reverse()`
+  重排；unordered locations 不依赖 location 顺序决定时间顺序，由 heap 按当前行时间归并。
+- `lazyMergerHeap.Less` 已按 `ascending` 切换：升序 `ti < tj`，降序 `ti > tj`；同 timestamp 仍按
+  `seq` 降序保证 newest wins。
+- `ReadDataBeforeWatermark` 在降序下直接 fallback 到 `ReadData`，由 `Location`/reader 的
+  `ctx.Ascending=false` 分支处理 segment 与 record 方向；lazy 路径传 `nextBatch(nil, ...)`，不做跨
+  ordered/unordered 的 watermark 延迟。
+- `TestLazyUnorderedMergeDifferential` 的固定用例和 3000 个随机 disjoint 用例同时覆盖 asc/desc，并以
+  eager 为 oracle。
+
+后续只需保持降序差分测试和真实多 segment 文件测试，不应再把降序列为未来工作。
 
 ### 12.2 limit-cut 支持
 
@@ -720,8 +734,8 @@ crossover 推后、内存收益消失 → 回退 eager。
 
 ### 13.3 查询负载
 
-- 主查询：非聚合升序全范围 `SELECT * ...`。
-- 回归：降序、聚合、limit-cut。
+- 主查询：非聚合升序/降序全范围 `SELECT * ...`。
+- 回归：聚合、limit-cut、Prom。
 
 ### 13.4 指标
 
@@ -732,12 +746,12 @@ crossover 推后、内存收益消失 → 回退 eager。
 
 | 场景 | 预期 |
 |---|---|
-| N=1000, no-overlap, 升序非聚合 | 总耗时 ↓ ~5×、峰值堆 ↓（多段显著） |
+| N=1000, no-overlap, 升序/降序非聚合 | 总耗时 ↓ ~5×、峰值堆 ↓（多段显著） |
 | 大 string + 多 unordered + 范围高重叠但数据不重复 + 单文件 1-2 segment | `unorder_duration` 明显下降；分配/GC 明显下降；峰值堆持平或下降 |
 | N=100 | 持平 |
 | N<64 | 走 eager 不退化 |
 | timestamp 大量重复的 full-overlap | 收益不确定，记录 same-time group 常数和 fallback 依据 |
-| 降序/聚合/limit-cut | flag on 与 off 一致 |
+| 聚合/limit-cut/Prom | flag on 与 off 一致，继续走 eager |
 
 ---
 
@@ -758,7 +772,8 @@ memtable 落盘前按时间排序，segment timeRange 应按 segPos 单调有序
 ### 14.2 disjoint 布局前提
 
 核心优化正确性依赖乱序旧、有序新、disjoint（`SplitRecordByTime` 保证）。若乱序与有序时间重叠
-（非正常场景），Phase 1/2 顺序会错。`lazyUnorderedEnabled()` 限制仅升序非聚合非 limit-cut 非 Prom。
+（非正常场景），固定两段式 phase 顺序会错；升序/降序都需要重新退化为跨两侧时间归并。
+`lazyUnorderedEnabled()` 限制非聚合、非 limit-cut、非 Prom。
 灰度期建议额外采样 ChunkMeta：若发现当前 series/query 范围内 unordered 与 ordered 重叠，则回退 eager
 并记录指标。
 
