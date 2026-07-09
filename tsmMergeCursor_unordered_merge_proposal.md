@@ -149,6 +149,24 @@ ordered 与 unordered 的文件级时间范围发生重叠。
 写入更晚，则当时高水位已 `≥ t`，`t` 不可能进 ordered，矛盾。因此**同 timestamp 跨侧时 unordered 副本
 胜出**（非 nil 列覆盖 ordered）。这与现状 `mergeData(newRec=unordered, oldRec=ordered)` 的语义一致。
 
+#### 2.4.1 compaction / seq 语义
+
+无序文件内部与跨侧的同 timestamp 覆盖都依赖“文件 seq 越大 = 写入越晚 = 越新”。后台乱序合并
+（mergeOutOfOrder）会重写文件、产生新 seq，需保证该语义不被破坏：
+
+- **乱序合并按相同覆盖语义折叠**：合并产出的文件在落盘前已对同 timestamp 行按 newest-wins 折叠去重，
+  故合并文件的行是其各源文件同 timestamp 行的最新值；合并文件 seq 高于被合并的源文件，正确代表“取代
+  之”。
+- **未参与本次合并的同 timestamp 行**只可能出现在 seq 更低的旧文件（已被折叠、应被取代）或 seq 更高
+  的更新文件（更晚写入、应胜出）中——两种情况下 seq 顺序都与 recency 一致。
+- **乱序→有序提升**（matchOrderFiles 将 unordered 并入 ordered）：提升后的有序文件在落盘前同样折叠，
+  其行已是当时最新；之后到达的同 timestamp 迟到点会进入新的 unordered 文件（seq 更高），跨侧时仍由
+  §2.4 判定 unordered 胜出。
+
+> 该语义需用**经过 compaction 的真实文件**做差分测试验证（§9）。若发现 compaction 后 seq 不再代表
+> 行的 recency（例如跨侧同 timestamp 出现 seq 倒挂），则同 timestamp 覆盖须改为按行级写入版本号而非
+> 文件 seq，或将该 cursor 回退现状。
+
 ---
 
 ## 3. 设计目标与适用范围
@@ -157,7 +175,9 @@ ordered 与 unordered 的文件级时间范围发生重叠。
 
 1. **总查询性能**：乱序文件数 N 较大时，总耗时显著低于现状；随 N 增长，现状 ~`N²`、优化 ~`N·logN`，
    复现理论发散趋势。
-2. **内存/GC 压力**：分配量显著降低（`O(M)` vs `O(N²R)`）；不预读全部 unordered，峰值 live 内存下降。
+2. **内存/GC 压力**：分配量显著降低（`O(M)` vs `O(N²R)`）；不预读全部 unordered。峰值 live 内存：多
+   segment / 大 string 场景下降；单段不相交、高重复 timestamp 场景可能持平甚至不占优（见 §8.3、§11.3），
+   以 guardrail 约束不显著上升为底线。
 3. **不退化**：小 N 不退化（阈值路由回现状）；不支持形状回退现状，结果与耗时无差异。
 
 ### 3.2 适用范围
@@ -168,7 +188,8 @@ disjoint——因为跨侧由通用时间归并处理，能正确应对交错、
 
 ### 3.3 成功指标
 
-乱序文件较多时：总耗时下降、分配/GC 下降、峰值内存持平或下降；小 N 不退化；结果与现状逐行一致。
+乱序文件较多时：总耗时下降、分配量稳定下降；峰值内存在多 segment / 大 string 场景下降，单段场景不
+高于 guardrail；小 N 不退化；结果与现状逐行一致。
 
 ---
 
@@ -214,11 +235,54 @@ disjoint——因为跨侧由通用时间归并处理，能正确应对交错、
 **跨侧流式二路归并（复用 `mergeData`）**：
 - 维护两个迭代器：`outOrderRecIter`（由 unordered 堆按 `maxRowCnt` 喂入）与 `orderRecIter`（由有序
   读取按 `maxRowCnt` 喂入）。
-- 每次 `Next`：若某侧迭代器空且未耗尽，则读一批补入；随后 `mergeData(outOrderRecIter, orderRecIter,
-  maxRowCnt, ascending)` 产出最多 `maxRowCnt` 行。
 - `mergeData` 在一侧时间整体早于另一侧时走批量分支（廉价），在重叠时走逐行双指针 + 列级 nil 合并，
   在同 timestamp 跨侧时按 §2.4 语义合并（unordered 胜出）。
 - 升序/降序由 `mergeData` 的 `ascending` 参数处理，编排逻辑无需按方向分支。
+
+#### 5.2.1 跨侧 driver 状态机（伪代码）
+
+driver 必须显式处理两侧 EOF、补读失败、过滤后空批、以及“`mergeData` 返回空但两侧未 EOF”的推进，避免
+死循环或提前单侧输出。`Next` 的形式化状态机：
+
+```
+状态：
+  uExh := unordered 堆已耗尽（无源可读）
+  oExh := ordered 已 EOF（readData 返回 nil）
+  outOrderRecIter / orderRecIter：各自可能 hasRemain / 空
+
+Next():
+  if 中断: return nil
+  loop:
+    # 1. 按需补入：仅当一侧“空且未 EOF”时补读一批
+    if !outOrderRecIter.hasRemain() and not uExh:
+        rec = 堆.nextBatch(maxRowCnt)        # 可能因过滤/全 nil 返回 nil
+        if rec != nil: outOrderRecIter.init(rec)
+        else: uExh = true                    # 堆彻底无数据
+    if !orderRecIter.hasRemain() and not oExh:
+        rec = readData(ordered)              # 可能因过滤/EOF 返回 nil
+        if rec != nil: orderRecIter.init(rec)
+        else: oExh = true
+    # 2. 两边都无 remain → 真正结束
+    if !outOrderRecIter.hasRemain() and !orderRecIter.hasRemain():
+        return nil
+    # 3. 归并产出（只要任一侧有 remain，mergeData 必产出非空记录）
+    out = mergeData(outOrderRecIter, orderRecIter, maxRowCnt, ascending)
+    if out != nil and out.RowNums() > 0: return out
+    # 4. 兜底：out 为空但某侧仍有 remain（仅 maxRowCnt<=0 退化情形）→ 回 loop 推进，
+    #    绝不在此直接单侧吐出
+```
+
+不变式与边界：
+
+- **mergeData 非空性**：只要任一侧 `hasRemain`，`mergeData` 必产出 `RowNums()>0` 的记录（`appendRecs` 每轮
+  至少 Append/merge 一行，除非 `maxRowCnt<=0`）。故正常配置下步骤 4 不触发，无死循环风险。
+- **无死循环**：每次回到 loop，必有一侧被补读或 `uExh/oExh` 置位（堆/ordered 是单调推进游标），状态严格
+  向 EOF 收敛；两侧均 EOF 即步骤 2 `return nil`。
+- **不提前单侧输出（硬约束）**：任何分支都**禁止**绕过 `mergeData` 直接吐出某一侧剩余——必须两侧在场经
+  `mergeData` 归并，否则跨侧同 timestamp 丢失合并（§5.3 不变式 4）。这是区别于已否决“两段式”的核心。
+- **过滤后空批**：堆 `nextBatch` 或 `readData` 因 `FilterByTime/FilterByField` 过滤为空返回 nil 时，按
+  “该侧这一段无有效行”处理（堆继续下一段、ordered 继续 EOF 判定），不当作整侧 EOF。
+- **补读失败**：`readData` 返回 error 时向上透传，driver 终止；已消费的输出不回滚（与现状一致）。
 
 ### 5.3 正确性不变式
 
@@ -229,19 +293,40 @@ disjoint——因为跨侧由通用时间归并处理，能正确应对交错、
 3. **跨侧流式归并正确**：`mergeData` 是正确的流式二路归并——它不会在一侧未追上时提前吐出另一侧行
    （`outOrder.min > order.max` 时只吐 ordered、hold 住 unordered），因此不产生跨侧错序或重复。同
    timestamp 跨侧由两侧都在场时按 §2.4 合并。
-4. **同 timestamp 完整合并**：输出 timestamp `t` 前，必须收齐所有产生 `t` 的行。unordered 内部的 `t`
-   由堆在同时间组内收齐（不被批次/段拆开）；跨侧的 `t` 由 `mergeData` 在两侧都在场时收齐。这要求
-   “同一 source 内同一 timestamp 不跨 segment 重复”作为文件前提，否则须继续推进该源后再输出。
-5. **字段对齐**：同 timestamp 合并若按列下标读取，必须证明所有输入记录都按同一 schema 构建且字段
-   顺序一致；否则必须按字段名归并。
-6. **终止**：堆空且所有源耗尽、有序也读完时，两侧迭代器均空，`mergeData` 返回空，游标结束。无死循环。
+4. **同 timestamp 完整合并（准入门，硬前提）**：输出 timestamp `t` 前，必须收齐所有产生 `t` 的行。
+   - **跨侧的 `t`**：由 `mergeData` 在两侧都在场时收齐（§5.2.1 状态机保证不提前单侧吐出）。
+   - **unordered 内部跨文件的 `t`**：由堆在同时间组内收齐——弹出所有当前行时间 == `t` 的源，折叠后只
+     输出一行；同时间组不被 `maxRowCnt` 批次边界拆开。
+   - **同一 source 跨 segment 的 `t`（关键风险）**：写路径 `AppendFieldsToRecord`/`cloneRowToDict` **不按
+     (series, timestamp) 去重**，故同一文件内可能出现重复 timestamp；经 Sort 后重复 timestamp 相邻，可能
+     被 segment 边界拆开。现状链式合并按“每个 ReadData 段 = 一条链记录”折叠**跨段**同 timestamp（不同段
+     的同 `t` 在两次 `MergeRecord` 间被 `mergeRecRow` 折叠为一行），但**保留段内**重复 timestamp（多行）。
+     堆必须精确匹配此粒度：
+     - 段内重复 `t`：各占一次堆迭代 → 多行（与现状一致）。
+     - 跨段重复 `t`：源在段尾输出 `t` 后耗尽该段、读入下一段，若下一段首行仍为 `t`，**必须把该源重新并入
+       当前同时间组继续折叠**（跨段追平），而非另起一组输出第二行。否则会产出重复 timestamp 行，与现状
+       不一致。
+   - **准入判定**：上线前必须用真实落盘文件验证“跨段追平”已实现且与现状逐行一致；若文件格式保证同一
+     source 内同 timestamp 不跨段（需写路径去重，当前**不保证**），可免除追平。差分测试必须覆盖段内重复、
+     跨段重复、跨段 + 跨文件同 timestamp（§9）。未通过则该路径回退现状。
+5. **字段对齐（按字段名归并）**：同 timestamp 折叠**按字段名**对齐，与现状 `mergeRecRow` 一致——对每个
+   输出字段，在各源记录中按字段名查找（schema 演进、字段过滤后子 schema、字段缺失时缺失列补 nil），取
+     newest 非 nil 值。这消除“所有输入必须同 schema 同序”的隐含前提，对 schema 变化鲁棒。实现上，由于读
+     路径按 `ctx.schema` 构建 dst 解码（reader 层 normalize，缺列补 nil），常见情况各源 schema 已对齐、按
+     名归并退化为按下标；但设计上以按字段名为准，并在差分测试中覆盖字段缺失/字段集合不同/过滤后子 schema
+     用例。运行时若检测到输入 schema 与 `ctx.schema` 不一致且无法按名归并，回退现状。
+6. **终止**：堆空且所有源耗尽、有序也读完时，两侧迭代器均空，`mergeData` 返回空，游标结束。无死循环
+   （§5.2.1 状态机收敛性证明）。
 7. **中断**：合并循环顶检查中断回调，中断时丢弃半成品。
 
-> **与现状的等价性**：现状 = `链式合并(unordered内部) + mergeData(跨侧)`；本方案 =
-> `堆归并(unordered内部) + mergeData(跨侧)`。两者唯一差异是无序内部合并算法，而堆的同 timestamp
-> 去重语义（seq 降序 newest 胜出）与链式 `MergeRecord(newRec=高seq, oldRec=累计)` 等价，跨侧同
-> timestamp 覆盖语义（unordered 胜过 ordered）两者一致（§2.4）。故喂入 `mergeData` 的 unordered 流
-> 逐行相同，**本方案输出与现状在所有布局下逐行一致**。
+> **与现状的等价性（条件性）**：现状 = `链式合并(unordered内部) + mergeData(跨侧)`；本方案 =
+> `堆归并(unordered内部) + mergeData(跨侧)`。两者唯一差异是无序内部合并算法。在以下条件全部满足时，
+> 喂入 `mergeData` 的 unordered 流逐行相同、**输出与现状逐行一致**：
+> (a) 堆同时间组覆盖语义（seq 降序 newest 胜出）与链式 `MergeRecord` 等价；
+> (b) 跨侧同 timestamp 覆盖按 §2.4（unordered 胜出），含 compaction 后 seq 语义（§2.4.1）；
+> (c) 同一 source 跨段同 timestamp 已实现跨段追平（不变式 4）；
+> (d) 字段按名归并（不变式 5）。
+> 任一条件未满足/未通过差分测试时，该路径回退现状。等价性由 §9 差分测试门禁守卫。
 
 ### 5.4 小 N 阈值（防退化）
 
@@ -249,10 +334,21 @@ disjoint——因为跨侧由通用时间归并处理，能正确应对交错、
 N=100：N=10 优化更慢、N=100 持平、N=1000 快约 5×）。0 表示禁用阈值（测试用）。默认值需通过 §13.6
 的对照压测按生产 workload 校准。
 
-### 5.5 Feature flag 与查询形状适用范围
+### 5.5 Feature flag、查询形状适用范围与灰度 guardrail
 
-核心优化默认关，运行时可切换。适用形状：非聚合、非 limit-cut、非 Prom；升序与降序走同一编排，
-仅 `mergeData` 的方向参数不同。其余形状回退现状。
+核心优化默认关，运行时可切换（flag + 小 N 阈值均可热更，经 sysctrl 下发）。适用形状：非聚合、非
+limit-cut、非 Prom；升序与降序走同一编排，仅 `mergeData` 的方向参数不同。其余形状回退现状。
+
+**灰度 guardrail（核心，非未来演进）**：已知退化场景（unordered 文件间全重叠/大同时间组、单段高 K、
+高重复 timestamp）下堆常数升高、crossover 推后、内存收益消失。核心方案上线即须内置以下保护，不能延后：
+
+- **kill switch**：flag 一键关闭，全局回退现状（已具备）。
+- **小 N 阈值**：K < 阈值回退现状（§5.4，已具备）。
+- **观测型 guardrail**：每个走优化路径的 cursor 记录 K、unordered 内部同时间组平均规模 g、堆归并行数、
+  与现状等价的差分采样失败次数；当 g/K 比值超过阈值（同时间组过大、堆常数劣化）或差分采样不一致时，
+  该 cursor 回退现状并计数。guardrail 阈值与全重叠 fallback 的具体触发条件见 §11.3、§12.5。
+- **回退计数（分项）**：小 N 阈值、查询形状、guardrail（g/K 超阈值）、差分采样失败等各类回退分别计数，
+  量化优化路径生产命中率与回退成因。
 
 ### 5.6 备选方案与取舍
 
@@ -290,7 +386,9 @@ N=100：N=10 优化更慢、N=100 持平、N=1000 快约 5×）。0 表示禁用
 
 - **乱序 location 数**：命中的乱序 location 数（放大因子 K）。
 - **链式合并次数**：现状路径的链式合并迭代次数。
-- **优化路径命中次数 / 现状回退次数**：按小 N 阈值与查询形状统计优化路径实际生效比例。
+- **同时间组平均规模 g**：用于 §5.5 guardrail 判定（g/K 比值超阈值回退）。
+- **优化路径命中 / 回退计数（分项）**：按小 N 阈值、查询形状、guardrail、差分采样失败分别计数，量化
+  优化路径生产命中率与回退成因。
 
 ### 6.3 游标复用生命周期
 
@@ -468,17 +566,23 @@ N=1000 约 5×），但发散趋势一致。
   unordered 时间交错（如 ordered=[130,150]、unordered=[140]）、同 timestamp 跨侧——验证 `mergeData`
   跨侧归并正确、无错序无重复。
 - **多段用例**：多 segment 文件，覆盖逐段读取。
-- **同 timestamp 完整性用例**：同 timestamp 横跨多个 unordered 文件、横跨 `maxRowCnt` 批次边界、同
-  timestamp 跨侧；若文件格式允许同一源内重复 timestamp，还需覆盖同 timestamp 横跨同一源的 segment
-  边界。
-- **schema 对齐用例**：查询字段缺失、不同字段集合、字段过滤后 schema 变化时，验证优化输出与现状按
-  字段名合并结果一致，或证明该路径所有输入记录均严格按同一 schema 构建。
+- **同 timestamp 完整性用例（准入门禁）**：
+  - 同 timestamp 横跨多个 unordered 文件、横跨 `maxRowCnt` 批次边界、同 timestamp 跨侧；
+  - **段内重复 timestamp**（同一源同一 segment 内多行同 `t`）→ 应多行输出，与现状一致；
+  - **跨段重复 timestamp**（同一源相邻 segment 边界两侧同 `t`）→ 应跨段追平折叠为一行，与现状一致
+    （§5.3 不变式 4，最关键门禁，不通过则回退现状）；
+  - 跨段 + 跨文件同 timestamp 组合。
+- **compaction 后用例**：经过后台乱序合并 / 乱序→有序提升后的真实文件，验证 seq 仍代表 recency、
+  同 timestamp 覆盖与现状一致（§2.4.1）。不通过则该路径回退现状。
+- **schema 对齐用例**：查询字段缺失、不同字段集合、字段过滤后 schema 变化、schema 演进（旧文件缺新
+  字段）时，验证优化输出与现状按字段名合并结果一致。
 
 ### 9.2 覆盖场景清单
 
-仅有序、仅乱序、乱序间同时间高 seq 覆盖、nil 列由旧源填补、同 timestamp 组不被批次/段拆散、跨侧
-同 timestamp 由 `mergeData` 收齐、字段顺序与字段集合对齐、跨侧时间交错/重叠、迟到点落在已写窗口内、
-小批流式、乱序跨多个有序文件、多段逐段读取、升序与降序。
+仅有序、仅乱序、乱序间同时间高 seq 覆盖、nil 列由旧源填补、同 timestamp 组不被批次/段拆散、**段内
+重复 timestamp 多行 / 跨段重复 timestamp 跨段追平**、跨侧同 timestamp 由 `mergeData` 收齐、字段按名
+归齐、跨侧时间交错/重叠、迟到点落在已写窗口内、compaction 后 seq 语义、小批流式、乱序跨多个有序文件、
+多段逐段读取、升序与降序。
 
 ---
 
@@ -500,25 +604,28 @@ N=1000 约 5×），但发散趋势一致。
 
 ## 11. 风险与缓解
 
-### 11.1 同 timestamp 完整性
+### 11.1 同 timestamp 完整性（准入门，硬前提）
 
-现状由逐行合并自然保证同 timestamp 去重与列级 nil 覆盖；本方案需**显式**保证：unordered 内部由堆在
-同时间组收齐，跨侧由 `mergeData` 在两侧都在场时收齐。需确认同 timestamp 不会被批次边界、segment
-边界或同一源后续读取拆成多行。上线前必须有差分测试覆盖（§9）。
+详见 §5.3 不变式 4。核心风险是**同一 source 跨 segment 的重复 timestamp**：写路径不按 (series,
+timestamp) 去重，重复 timestamp 可能被 segment 边界拆开；现状链式合并跨段折叠、段内保留，堆必须精确
+匹配（跨段追平）。未实现跨段追平或未通过差分测试 → 该路径回退现状。上线前必须有段内重复、跨段重复、
+跨段+跨文件同 timestamp 的差分测试门禁（§9）。
 
 ### 11.2 schema 对齐
 
-按列下标合并必须证明所有输入记录按同一 schema 构建且字段顺序一致。若查询字段过滤、schema 演进或
-reader 返回子 schema 可能改变字段集合，必须改为按字段名归并。
+按字段名归并（§5.3 不变式 5），对 schema 演进、字段过滤后子 schema、字段缺失鲁棒。差分测试覆盖字段
+缺失/字段集合不同/过滤后 schema 变化；运行时检测到无法按名归并则回退现状。
 
-### 11.3 全重叠退化
+### 11.3 全重叠退化与 guardrail
 
-unordered 文件间全重叠（同时间组 = K）时堆常数升高、crossover 推后、内存收益消失。需 fallback 机制
-（§12.5）。
+unordered 文件间全重叠（同时间组 = K）或大同时间组时，堆常数升高、crossover 推后、内存收益消失。由
+§5.5 的观测型 guardrail 守卫：同时间组平均规模 g 与 K 的比值超阈值时该 cursor 回退现状并计数。具体
+fallback 触发条件与阈值校准见 §12.5。
 
 ### 11.4 单段不相交盲区
 
-单段不相交 unordered 文件下堆持 K 段 = M（全部数据），峰值无收益。需时间簇增量准入（§12.6）。
+单段不相交 unordered 文件下堆持 K 段 = M（全部数据），峰值无收益（§8.3）。由 §5.5 guardrail 的峰值
+比值约束不显著上升；根本解决需时间簇增量准入（§12.6）。
 
 ### 11.5 游标复用
 
@@ -560,10 +667,12 @@ location 命中后，若 ChunkMeta 的列与查询 schema 无交集、或时间�
 
 乱序文件过多的 shard/measurement 触发后台预合并/分层 compact，从源头降低 N。长期 compaction 侧工作。
 
-### 12.5 全重叠 fallback
+### 12.5 全重叠 fallback（guardrail 阈值校准）
 
-unordered 文件间全重叠时，优化无延迟收益且逐行列合并慢于现状向量化合并。fallback 触发条件应同时
-考虑 N 与相交度（同时间组规模 g）：g 大时常数升高、crossover 推后、内存收益消失 → 回退现状。
+unordered 文件间全重叠时，优化无延迟收益且逐行列合并慢于现状向量化合并。§5.5 的观测型 guardrail 已
+提供回退机制；本节给出阈值校准方法：fallback 触发条件同时考虑 N 与相交度（同时间组规模 g）——g 大时
+常数升高、crossover 推后、内存收益消失 → 该 cursor 回退现状。具体阈值（g/K 比值、峰值比值）通过 §13.6
+对照压测按生产 workload 校准；校准前可先用保守阈值（如 g/K > 0.5 即回退）灰度。
 
 ### 12.6 时间簇增量准入
 
@@ -628,14 +737,15 @@ flowchart TD
 
 ### 13.1 环境
 
-单机 standalone，固定硬件。关键配置控制 N（乱序文件数）并冻结 compaction：
+单机 standalone，固定硬件。关键配置控制 N（乱序文件数）并冻结 compaction（性能矩阵用）；compaction
+后正确性用例（§13.5）另起一套，放开乱序合并/compaction 跑出合并/提升后的文件再测：
 
 | 配置 | 取值 | 作用 |
 |---|---|---|
 | memtable 大小上限 | 小（1MB） | 每批次写入即 flush |
 | write-cold-duration | 短（1s） | 加速 flush |
-| max-unordered-file-number | 大（2000） | 抑制合并 |
-| max-concurrent-compactions | 0 | 关闭 compaction |
+| max-unordered-file-number | 大（2000） | 抑制合并（性能矩阵） |
+| max-concurrent-compactions | 0 | 关闭 compaction（性能矩阵） |
 | max-rows-per-segment | 可调 | 控制 R |
 
 ### 13.2 数据模型与写入
@@ -647,6 +757,10 @@ flowchart TD
     unordered=[140]）——核心正确性场景，验证 `mergeData` 跨侧归并无错序无重复。
   - **回填式（disjoint）**：乱序时间早于所有 ordered——验证 disjoint 下批量分支性能。
   - **同 timestamp 跨侧**：同一 timestamp 同时存在于 ordered 与 unordered——验证跨侧覆盖语义。
+- **重复 timestamp 布局（准入门禁）**：构造同一 series 同 timestamp 多行（写路径不去重，可直接产生）：
+  - **段内重复**：同 timestamp 多行落入同一 segment → 应多行输出；
+  - **跨段重复**：调整 `max-rows-per-segment` 使同 timestamp 多行被 segment 边界拆开 → 应跨段追平折叠
+    为一行。两者均与 flag off 逐行对照。
 - **乱序文件间重叠度**：no-overlap / partial / full。full-overlap 拆两类：
   - **范围重叠但 timestamp 不重复**：segment timeRange 高重叠，但写不同时间点——大 string 核心收益场景。
   - **timestamp 大量重复**：验证同时间组常数与 fallback 条件。
@@ -661,7 +775,8 @@ flowchart TD
 ### 13.4 指标
 
 总耗时 p50/p95/p99、峰值堆（pprof + RSS）、GC、CPU profile、磁盘 I/O、span 计数。重点观察乱序处理
-耗时、乱序 location 数、链式合并次数、优化路径命中/回退比例。flag on/off 对照。
+耗时、乱序 location 数、链式合并次数、同时间组平均规模 g、优化路径命中/回退比例（按小 N、形状、
+guardrail、差分失败分别计数）。flag on/off 对照。
 
 ### 13.5 预期
 
@@ -671,9 +786,11 @@ flowchart TD
 | N=1000, 回填式 disjoint | 同上（`mergeData` 走批量分支） |
 | 大 string + 多 unordered + 范围高重叠但数据不重复 + 单文件 1–2 segment | 乱序耗时明显下降；分配/GC 明显下降；峰值堆持平或下降 |
 | 同 timestamp 跨侧 | 结果与 flag off 完全一致（unordered 胜出） |
+| 段内重复 timestamp / 跨段重复 timestamp | 结果与 flag off 逐行一致（跨段追平折叠） |
+| compaction 后文件（乱序合并 / 乱序→有序提升） | 结果与 flag off 逐行一致；seq 语义保持 |
 | N=100 | 持平 |
 | N<阈值 | 走现状不退化 |
-| timestamp 大量重复的 full-overlap | 收益不确定，记录同时间组常数与 fallback 依据 |
+| timestamp 大量重复的 full-overlap | guardrail 触发回退现状；记录同时间组常数与 fallback 依据 |
 | 聚合/limit-cut/Prom | flag on 与 off 一致，继续走现状 |
 
 ### 13.6 小 N 阈值校准
