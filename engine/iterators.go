@@ -53,7 +53,12 @@ const (
 	memTableRowCount = "memtable_row_count"
 	unorderRowCount  = "unorder_row_count"
 	unorderDuration  = "unorder_duration"
-	aggIterCount     = "agg_iter"
+	// unorderedLocationCount records how many out-of-order locations were matched for a series
+	// (the K amplification factor). unorderedChainFallback records how many cursors fell back from
+	// the heap merge to the chain merge because an intra-segment duplicate timestamp was detected.
+	unorderedLocationCount = "unordered_location_count"
+	unorderedChainFallback = "unordered_chain_fallback"
+	aggIterCount           = "agg_iter"
 
 	createTagSetCursorDuration = "create_lazy_tagset_cursor"
 )

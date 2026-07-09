@@ -57,6 +57,7 @@ const (
 	verifyNode            = "verifynode"
 	memUsageLimit         = "memusagelimit"
 	BackgroundReadLimiter = "backgroundReadLimiter"
+	unorderedHeapMerge    = "unordered_heap_merge"
 )
 
 var (
@@ -167,6 +168,14 @@ func (e *EngineImpl) processReq(req *msgservice.SysCtrlRequest) (map[string]stri
 			return nil, err
 		}
 		setMemUsageLimit(int32(limit))
+		return nil, nil
+	case unorderedHeapMerge:
+		switchOn, err := syscontrol.GetBoolValue(req.Param(), "switchon")
+		if err != nil {
+			return nil, err
+		}
+		SetUnorderedHeapMergeEnabled(switchOn)
+		log.Info("set unordered heap merge switch", zap.Bool("switchon", switchOn))
 		return nil, nil
 	case BackgroundReadLimiter:
 		limit, err := syscontrol.GetBytesValue(req.Param(), "limit")

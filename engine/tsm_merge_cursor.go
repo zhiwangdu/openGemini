@@ -17,6 +17,7 @@ package engine
 import (
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/openGemini/openGemini/engine/comm"
@@ -29,6 +30,22 @@ import (
 )
 
 var tsmCursorPool = &sync.Pool{}
+
+// unorderedHeapMergeEnabled controls whether the heap K-way merge is used for out-of-order data in
+// FirstTimeInit (1 = on, the default; 0 = off, fall back to the chain MergeRecord). It is an atomic
+// because the setter may be called from a config/admin goroutine while query goroutines read it.
+var unorderedHeapMergeEnabled int32 = 1
+
+// SetUnorderedHeapMergeEnabled toggles the heap K-way merge at runtime.
+func SetUnorderedHeapMergeEnabled(en bool) {
+	if en {
+		atomic.StoreInt32(&unorderedHeapMergeEnabled, 1)
+	} else {
+		atomic.StoreInt32(&unorderedHeapMergeEnabled, 0)
+	}
+}
+
+func unorderedHeapMergeOn() bool { return atomic.LoadInt32(&unorderedHeapMergeEnabled) == 1 }
 
 func getTsmCursor() *tsmMergeCursor {
 	v := tsmCursorPool.Get()
@@ -522,10 +539,17 @@ func (c *tsmMergeCursor) FirstTimeInit() error {
 
 	if c.span != nil {
 		c.span.Count(tsmIterCount, 1)
+		c.span.CreateCounter(unorderedLocationCount, "")
+		c.span.Count(unorderedLocationCount, int64(c.outOfOrderLocations.Len()))
+		c.span.CreateCounter(unorderedChainFallback, "")
 		tm = time.Now()
 	}
-	isFirst := true
-	var outRec *record.Record
+	// Read all out-of-order segments, then K-way heap-merge them into outRec. The read order is
+	// the segment priority: the cursor yields segments depth-first per location in seq-ascending
+	// order, so a later-read segment is newer and wins at a duplicate timestamp — matching the
+	// chain MergeRecord's "last-processed = newRec = wins" semantics, but in O(M*logK) with a
+	// single outRec allocation instead of O(N^2*R) growing intermediate records.
+	var recs []*record.Record
 	for {
 		dst := record.NewRecordBuilder(c.ctx.schema)
 		rec, err := c.readData(false, dst)
@@ -536,19 +560,23 @@ func (c *tsmMergeCursor) FirstTimeInit() error {
 		if rec == nil {
 			break
 		}
-		if isFirst {
-			outRec = rec
-		} else {
-			var mergeRecord record.Record
-			if c.ctx.decs.Ascending {
-				mergeRecord.MergeRecord(rec, outRec)
-			} else {
-				mergeRecord.MergeRecordDescend(rec, outRec)
-			}
-
-			outRec = &mergeRecord
+		recs = append(recs, rec)
+	}
+	var outRec *record.Record
+	if !unorderedHeapMergeOn() || hasIntraSegmentDupTimes(recs) {
+		// Heap disabled, or intra-segment duplicate timestamps (which interact with MergeRecord's
+		// binary-search overlap region in a way the heap cannot replicate byte-for-byte): fall back
+		// to the chain merge for identical results.
+		if c.span != nil && unorderedHeapMergeOn() {
+			c.span.Count(unorderedChainFallback, 1)
 		}
-		isFirst = false
+		outRec = chainMergeUnorderedRecords(recs, c.ctx.decs.Ascending)
+	} else {
+		sources := make([]*unorderedHeapSource, len(recs))
+		for i, r := range recs {
+			sources[i] = &unorderedHeapSource{rec: r, priority: i}
+		}
+		outRec = heapMergeUnordered(sources, c.ctx.schema, c.ctx.decs.Ascending, c.ctx.IsAborted)
 	}
 
 	if c.span != nil {

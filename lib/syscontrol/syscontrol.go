@@ -145,6 +145,7 @@ const (
 	disableWrite          = "disablewrite"
 	disableRead           = "disableread"
 	BackgroundReadLimiter = "backgroundReadLimiter"
+	UnorderedHeapMerge    = "unordered_heap_merge"
 
 	NodeInterruptQuery = "interruptquery"
 	UpperMemUsePct     = "uppermemusepct"
@@ -411,7 +412,7 @@ func ProcessRequest(req msgservice.SysCtrlRequest, resp *bufio.Writer) (err erro
 		for n, s := range metaRes {
 			WriteString(resp, fmt.Sprintf("\n\t%v: %s,", n, s))
 		}
-	case DataFlush, compactionEn, compmerge, snapshot, DownSampleInOrder, verifyNode, memUsageLimit, BackgroundReadLimiter:
+	case DataFlush, compactionEn, compmerge, snapshot, DownSampleInOrder, verifyNode, memUsageLimit, BackgroundReadLimiter, UnorderedHeapMerge:
 		// store SysCtrl cmd
 		dataNodes, err := SysCtrl.MetaClient.DataNodes()
 		if err != nil {
