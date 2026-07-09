@@ -1,4 +1,4 @@
-# `ColVal.Offset` uint32 溢出修复方案设计（TSStore）
+# TSStore uint32 溢出修复方案设计
 
 > 关联文档:
 > - `uint32-offset-overflow-panic-analysis-tsstore.md`
