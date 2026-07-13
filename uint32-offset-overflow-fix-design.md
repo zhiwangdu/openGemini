@@ -19,7 +19,7 @@
 3. TSStore 时序写入路径中，tag 不作为数据列 append 到持久化 `Record.ColVals`。`tsMemTableImpl.WriteRows` 只把 `row.Fields` 传给 `appendFields` / `AppendFieldsToRecord`；tag 通过 series key / `tagSets` 参与 series 定位、过滤和结果附加信息。
 4. 查询侧按 series 迭代数据。`shard.createGroupCursors` 接收 `tagSets` 创建 group / series cursor，`seriesCursor.ReInit` 将 `TagSetItem.TagsVec` 放入 `seriesInfo`，tag filter 从 `PointTags` 取值，不依赖 TSSP 数据列。
 5. 查询结果中的 aux tag 可在 `tagSetCursor.TagAuxHandler` 中 append 到结果 `Record`，但它不是 TSStore 落盘、snapshot、compact、merge 的数据路径，不作为本方案主保护对象。
-6. 不支持单个 String field 值超过产品写入上限。超限单值应在进入 memtable / WAL 前拒写。
+6. 不支持单个 String field 值超过产品写入上限。超限单值应在 memtable mutation 前拒写。
 7. 线格式保持不变。`ColVal.Offset`、TSSP string block offset/length、`Segment.size`、`ChunkMeta.size`、WAL physical header 仍保持现有 uint32 表达。
 8. 不把 `ColVal.Offset` 改成 uint64。`ColVal` 是共享核心结构，改类型会扩大到大量读写边界；本方案采用 bounded append 和流程降级控制风险。
 
@@ -53,7 +53,42 @@
 - `MaxVarColValBytes`:默认 256MiB，可配置到 512MiB。
 - 测试阈值:支持 1KiB / 64KiB 等小阈值，用于验证 flush、split、降级和 fail-closed 行为。
 
-### 2. `ChunkMeta.size` 策略:输出将错就错，读侧不可信
+### 2. HTTP batch 与 WAL record 边界
+
+普通行协议写入并不是“一个 HTTP request 对应一个 WAL record”。实际链路是:
+
+```text
+HTTP request
+  -> N 个 ReadBlockSize parser batch
+  -> 每个 parser batch 按 shard 拆分
+  -> 每个目标 shard 生成最终 binaryRows
+  -> 每个目标 owner / retry attempt 调用 shard.WriteRows
+  -> 正常 TSStore、WAL enabled、非 Shelf 路径的一次成功 attempt
+  -> 一个 WAL physical record
+```
+
+默认配置下，`ReadBlockSize` 为 64KiB、`MaxLineSize` 为 1MiB；非 gzip、正常受 `max-body-size` 限制的 HTTP wire body 默认上限为 25MB。决定普通 `/write` 单个 parser batch 大小的主要是前两个分块参数，因此正常路径形成的单个 shard batch 与 WAL record 远小于 uint32 上限，WAL record 长度不是本问题的主 P0。
+
+但 `ReadBlockSize` 不是覆盖所有路径的全局不变量:
+
+- `ReadBlockSize` / `MaxLineSize` 可配置。
+- stream 写入可能追加派生行并重新 marshal，最终 `binaryRows` 不等于入口 parser block。
+- 内部 stream task、RPC、replication、Arrow Flight 等路径可能绕过 `serveWrite`。
+- gzip 路径当前从原始 `r.Body` 构造解压 reader，解压后 body 未受同一个 `truncateReader` 约束；chunked 请求也只能在流式读取过程中发现总量超限。若需要绝对 HTTP request 上限，应作为独立资源防护修复，不能据此证明 WAL payload 有界。
+- HTTP `max-body-size` 是请求资源保护，不是最终 shard `binaryRows` 大小的形式化证明。一个 HTTP request 不具备整体写入原子性；单个 parser block 按 shard / owner 并发写入，同一 block 内也可能部分目标成功、部分目标失败。
+
+WAL physical header 保存的是 Snappy 压缩后 payload 长度。若最终 `binaryRows` 恰为 2GiB，当前 Snappy `MaxEncodedLen` 最坏值为 2,505,397,621 bytes，仍小于 `math.MaxUint32`。本方案因此明确选择 `MaxOnlineWriteBatchBytesHard = 2GiB` 作为最终在线 shard payload 的不可配置硬上限；它不是 WAL header 的理论最大 raw payload。2GiB 也不能作为日常运行阈值:编码时原始数据与最坏压缩缓冲同时存活，仅两者就约 4.33GiB，不含 rows、索引和 GC 开销。可配置业务阈值必须不大于该硬上限，现有 HTTP 25MB 配置默认值和小 block 行为不应放大到 2GiB。
+
+本方案不为 WAL 长度设计 mutation 回滚或运行时动态拆 batch。只保留两层低成本防御:
+
+1. 最终 `binaryRows` 形成后、memtable mutation 前，先校验 `len(binaryRows) <= MaxOnlineWriteBatchBytesHard`，再使用 `snappy.MaxEncodedLen(len(binaryRows))` 做不分配内存的可表示性校验；超出硬上限、可配置业务阈值或 WAL uint32 可表示范围时，在线写入返回 `ErrWriteBatchTooLarge`。
+2. `WAL.writeBinary` 内部重复校验 `MaxEncodedLen`，用于检测“所有在线 mutation 路径都已前置校验”这一内部不变量是否失守，并避免直接进入非法 Resize / slice。它不是 mutation 后的一致性兜底；命中时返回内部 invariant error，由 WAL 现有致命错误策略 fail-fast，不能作为普通客户端 413 继续运行。
+
+上述调整只把可预判的 payload 长度错误前置，不试图在本方案中重构现有 memtable mutation 与 WAL 磁盘 I/O 的通用原子性；磁盘写失败等既有错误语义不属于本次 uint32 溢出修复范围。
+
+历史 WAL replay 已经受现有 uint32 physical header 约束，不应用新版本的日常业务 batch 上限阻断 shard open。Raft 模式应在在线 proposal 提交前校验业务 batch 上限；record 一旦 committed，apply 路径不能再因节点配置阈值不同而拒绝。在线入口与 WAL replay / committed raft apply 必须区分来源。
+
+### 3. `ChunkMeta.size` 策略:输出将错就错，读侧不可信
 
 `ChunkMeta.size` 是 uint32，表示一个 series chunk 的 data 区总长度。当前依赖点不多，本方案不把它作为输出侧强保护目标:
 
@@ -76,7 +111,7 @@
 - 查询路径不能继续依赖 `cm.size` 做整 chunk 预读。
 - `WriteOriginal` 不能用 `meta.size` 作为 fast-copy 的复制长度。
 
-### 3. 重要约束:writer 内部 offset 不能依赖回绕 size
+### 4. 重要约束:writer 内部 offset 不能依赖回绕 size
 
 虽然输出的 `ChunkMeta.size` 可以将错就错，但 writer 内部推进 offset 不能依赖已回绕的 `chunkMeta.size`。否则会把后续 chunk 的 `offset` 写错，问题就不再只是 size metadata 不准，而是文件布局损坏。
 
@@ -92,12 +127,12 @@
 | 模块 | 主要流程 | 风险点 | 处理原则 |
 |------|----------|--------|----------|
 | 写入 / memtable | 行协议解析 -> record append -> memtable mutation | String field `ColVal` 持续累积，append 前无 bytes 预算会形成回绕 offset | mutation 前预算，超限 flush/retry 或拒写 |
-| WAL | batch -> snappy physical record -> WAL header | WAL 长度失败不能晚于 memtable mutation 暴露 | WAL 长度前置检查，拆 batch 或拒写 |
+| WAL | shard `binaryRows` -> snappy physical record -> WAL header | 默认 HTTP block 路径风险很低；可配置入口、stream 放大和非 HTTP 路径不能只依赖 `ReadBlockSize`；`MaxEncodedLen` 负值可导致 panic | 最终 payload 在 mutation 前做 2GiB hard ceiling 与 O(1) 可表示性校验；WAL 层只检测内部不变量失守并 fail-fast，不拆 batch、不做 mutation 回滚 |
 | snapshot / flush | memtable record -> `MsBuilder` -> TSSP chunk | 只按 rows 切分不足以约束 String field bytes；内部 `dataOffset` 不能依赖回绕的 `chunkMeta.size` | rows + var-bytes 切分；offset 用真实写入大小推进 |
 | 非流式 compact / merge fastmode | chunk 整块读取 -> decodeRecord -> record merge -> 写新文件 | 整 chunk 读取依赖源 `ChunkMeta.size`；decode 后 `ColVal.Offset` 仍可能越界；record merge 会继续累积 `ColVal` | 源 size 不可信或 decode 后 offset 越界时降级 streamMode；merge 使用 bounded append |
 | stream compact | segment 读取 -> compactColumn -> writeSegment -> writeMeta | 源读按 segment 安全；合并条件仍需 bytes 边界 | rows + bytes merge 条件；输出 `ChunkMeta.size` 维持现状 |
 | stream merge | ordered/unordered segment merge 或 `WriteOriginal` fast-copy | `columnWriter` 可能累积过大；`WriteOriginal` 当前信任源 `meta.size` | remain byte-bounded；fast-copy 长度改用 next chunk offset 或 segment entry 覆盖范围 |
-| 查询 / 诊断 | chunk meta -> segment data -> decode | `defaultIoSize` 整 chunk 预读依赖 `cm.size`；历史坏 offset 不能 panic | 预读失败/校验不通过时降级按 segment 读；fail-closed |
+| 查询 | chunk meta -> segment data -> decode | `defaultIoSize` 整 chunk 预读依赖 `cm.size`；历史坏 offset 不能 panic | 预读失败/校验不通过时降级按 segment 读；fail-closed |
 
 ---
 
@@ -122,9 +157,21 @@
 
 - `ErrNeedFlush`:追加本身合法，但目标对象接近阈值，需要调用方先 flush/split/writeSegment 后重试。
 - `ErrValueTooLarge`:单值或不可拆单次追加超过产品上限，拒写。
+- `ErrWriteBatchTooLarge`:在线写入最终 shard `binaryRows` 超过 2GiB hard ceiling、可配置业务上限或 WAL physical header 可表示范围；在 mutation 前拒写，不做动态拆批。
+- `ErrWALRecordSizeInvariant`:WAL 内部发现调用方绕过 mutation 前长度校验；这是内部不变量违规，不映射为客户端 413，按 WAL 致命错误策略 fail-fast。
 - `ErrCorruptColumn`:源 offset 或源 meta 不可信，不能继续 append 或 fast-copy。
 
-### 2. 源 chunk size 校验
+### 2. WAL payload 长度校验
+
+新增 `MaxOnlineWriteBatchBytesHard = 2GiB` 和共享的纯长度校验，例如 `ValidateWALRecordPayloadSize(rawLen int, businessLimit int64, online bool) error`:
+
+- 不读取或复制 payload，不执行 Snappy 编码，只调用 `snappy.MaxEncodedLen(rawLen)`。
+- 在线写入先校验不可配置的 2GiB hard ceiling，再校验不大于该值的可配置业务 batch 上限和 WAL uint32 可表示范围，超限返回 `ErrWriteBatchTooLarge`。
+- WAL 内部调用时至少校验 `MaxEncodedLen` 非负且可由 uint32 表示。命中返回 `ErrWALRecordSizeInvariant` 并交由致命错误策略处理，不把 mutation 后的失败伪装成普通客户端拒写。
+- 在线 raft proposal 在提交前应用业务 batch 上限；WAL replay / committed raft apply 不再套用新版本的业务阈值，只做线格式和数据完整性校验。
+- 长度常量和中间计算使用 int64 / uint64 表达，测试不通过真实 GiB 级内存分配构造边界。
+
+### 3. 源 chunk size 校验
 
 新增 `ValidateChunkMetaDataRange(cm *ChunkMeta, next *ChunkMeta, fileDataSize int64) (expectedSize int64, err error)`:
 
@@ -141,28 +188,49 @@
 
 ## 五、模块设计
 
-### 1. 写入、WAL、memtable
+### 1. 写入、memtable 与 WAL 防御
 
 #### 风险点
 
 - memtable 中同一 series 的 String field `ColVal` 会跨多次写入持续增长。
 - append 过程中不能出现部分列已 mutation、后续列因超限失败的半写状态。
-- WAL physical record 使用 uint32 长度字段，长度失败必须在 memtable mutation 前暴露。
+- 普通 HTTP `/write` 已按 `ReadBlockSize` 拆分，WAL uint32 长度不是主风险；仍需防御 stream 放大、非 HTTP 入口和异常配置形成的超大最终 `binaryRows`。
+- 当前 WAL 未处理 `snappy.MaxEncodedLen` 返回负值的情况，极端输入可能触发 Resize / slice panic。
 
 #### 设计动作
 
-1. 在 `appendFields` / `AppendFieldsToRecord` 前做 String field bytes 预算。
-2. 预算覆盖整次 batch，确保不会发生部分字段 append 后失败。
-3. 单值超过产品上限返回 `ErrValueTooLarge`。
-4. 追加会使目标 `ColVal` 超过 `MaxVarColValBytes` 时返回 `ErrNeedFlush`，触发 snapshot/flush 后重试。
-5. WAL physical record 长度在 memtable mutation 前检查，超限时拆 batch 或拒写。
-6. `AddMemSize` / token 最好放在预算成功之后；若保持现有顺序，错误返回时必须回滚。
+1. 在 `appendFields` / `AppendFieldsToRecord` 前，按目标 measurement / series / field 汇总整次 shard batch 对各 String field 的新增 bytes，并校验单值大小；预算阶段只计数，不复制或追加 field data。
+2. 使用 `current ColVal bytes + batch delta` 做整批预算；预算与后续 mutation 之间必须有同一锁、reservation 或等价同步，避免并发写入造成 TOCTOU。
+3. 预算失败时尚未发生 data mutation。单值超过产品上限返回 `ErrValueTooLarge`；目标 active memtable 放不下时返回 `ErrNeedFlush`，先 rotate/snapshot/flush，再在新 active memtable 上重试。空 memtable 仍放不下才拒写。
+4. 不为失败路径实现已追加字段的 mutation 回滚。`AddMemSize` / token 应在预算成功后申请或提交；如果现有时序必须提前申请，只释放资源 token，不回滚数据 mutation。
+5. 最终 `binaryRows` 形成后、memtable mutation 前执行不分配内存的长度校验:
+
+   ```go
+   const MaxOnlineWriteBatchBytesHard int64 = 2 << 30
+
+   rawLen := int64(len(binaryRows))
+   if rawLen > MaxOnlineWriteBatchBytesHard ||
+       (businessLimit > 0 && rawLen > businessLimit) {
+       return ErrWriteBatchTooLarge
+   }
+   maxEncoded := snappy.MaxEncodedLen(len(binaryRows))
+   if maxEncoded < 0 || uint64(maxEncoded) > math.MaxUint32 {
+       return ErrWriteBatchTooLarge
+   }
+   ```
+
+   可配置业务阈值必须小于或等于 2GiB hard ceiling，并建议根据单节点内存预算设置为显著更低的值；普通 HTTP 路径继续保留当前 25MB body 配置默认值与小 block 行为。
+6. 超限在线 batch 直接拒写，不在 shard / WAL 层动态拆批。HTTP 将 `ErrWriteBatchTooLarge` 映射为 413；该错误不可重试。流式 HTTP request 和单个 parser block 都不是跨 shard / owner 的原子单元，返回错误时可能已有其他 block、shard 或 owner 写入成功。
+7. `WAL.writeBinary` 重复检查 `MaxEncodedLen`。若命中，说明共同前置校验点被绕过，返回 `ErrWALRecordSizeInvariant` 并按 WAL 致命错误策略 fail-fast；该检查不提供 mutation 后的一致性兜底，也不新增运行时开关。
+8. 在线 raft proposal 在 commit 前执行同一业务 batch 校验；WAL replay / committed raft apply 不应用新版本的日常业务 batch 上限。格式校验失败仍应 fail-closed，但历史或已提交的合法 record 不能因节点阈值不同导致 shard 无法打开或副本分歧。
 
 #### 验收点
 
 - 低阈值下，同一 series String field 列接近阈值后继续写入，会在 mutation 前返回 `ErrNeedFlush`。
 - 单值超限不写 memtable、不写 WAL。
-- WAL 超限 batch 不会出现 memtable 成功但 WAL 失败。
+- 同一 batch 含多个 series / field 时，任一目标列预算失败都不会出现部分字段已经 append 的半写状态。
+- 使用可注入的小业务阈值验证最终 `binaryRows` 在 mutation 前返回 `ErrWriteBatchTooLarge`，不拆 batch、不回滚 mutation；纯长度测试覆盖 2GiB hard ceiling 的 `-1` / `=` / `+1` 边界。
+- 绕过前置校验直接向 WAL 传入不可表示长度时，在分配/切片前得到 `ErrWALRecordSizeInvariant` 并进入 fail-fast 策略；默认 `ReadBlockSize` / `MaxLineSize` 下的普通 HTTP batch 不触发该错误。
 
 ### 2. Snapshot / flush
 
@@ -275,19 +343,7 @@
 - 构造回绕 `ChunkMeta.size` 且 segment entry 正确的文件，查询会降级到 per-segment read 并尽量完成读取。
 - segment entry 也不可信时，查询返回 corrupt error，不 panic。
 
-### 7. 诊断与 repair
-
-#### 设计动作
-
-1. 诊断工具扫描:
-   - String field offset 非单调或越界。
-   - `ChunkMeta.size` 小于 expected size（由 next chunk offset 或 segment entry 计算）。
-   - next chunk offset 或 segment entry offset/size 越过文件 data 区。
-2. repair 通过低优先级 recompact/rewrite 实现。
-3. repair 必须限速、可中断、可回滚。
-4. 不默认静默丢行；若必须丢弃，记录审计信息。
-
-### 8. 其他依赖点核查
+### 7. 其他依赖点核查
 
 | 位置 / 流程 | 是否依赖 `ChunkMeta.size` | 处理 |
 |-------------|---------------------------|------|
@@ -314,10 +370,10 @@
 - 查询整 chunk 预读失败或校验不通过时，降级到 per-segment read。
 - 非流式 compact / merge fastmode 发现源 `ChunkMeta.size` 不可信，或整 chunk decode 后 `ColVal.Offset` 越界时，降级 streamMode。
 - `WriteOriginal` 复制长度改为依赖 next chunk offset 或 segment entry 覆盖范围，而不是源 `meta.size`。
-- `appendFields` 前做 String field bytes 预算。
-- 单值超限拒写。
-- 追加会使 memtable `ColVal` 超阈值时返回 `ErrNeedFlush`，触发 snapshot/flush 后重试。
-- WAL physical record 长度在 memtable mutation 前检查，超限拆 batch 或拒写。
+- `appendFields` 前按整次 shard batch 汇总 String field bytes 并校验单值；预算失败不产生部分 data mutation，也不做 mutation 回滚。
+- 单值超限拒写；追加会使 memtable `ColVal` 超阈值时返回 `ErrNeedFlush`，触发 snapshot/flush 后重试。
+- 最终 `binaryRows` 在 memtable mutation 前校验 2GiB hard ceiling、可配置业务阈值和 WAL 可表示性；超限在线写入直接拒绝，不动态拆 batch。
+- `WAL.writeBinary` 对 `snappy.MaxEncodedLen` 做不可关闭的内部 invariant 检查；命中时在非法分配/切片前 fail-fast，不作为 mutation 后的一致性兜底。
 - 引入 String field 判断、bounded append API 和 rows + var-bytes splitter。
 - 高风险 `AppendColVal`、`AppendString`、直接 `uint32(len(cv.Val))` 统一收敛到 bounded API。
 - snapshot/flush 按 rows + var-bytes 切分。
@@ -326,12 +382,6 @@
 - stream merge 的 `columnWriter` byte-bounded。
 - 非流式 compact / merge 大 String field 场景降级到 byte-bounded streamMode。
 - compact / merge 输出 `ChunkMeta.size` 维持现状，不作为本方案保护目标。
-- 扫描历史 TSSP，识别坏 `ColVal.Offset`、坏 `ChunkMeta.size`、chunk data range 不一致。
-
-### 默认不自动执行
-
-- 历史文件 repair/recompact 不随版本自动运行。
-- repair 通过运维开关手动启用，必须限速、可中断、记录审计。
 
 ---
 
@@ -341,7 +391,13 @@
 
 - 低 `MaxVarColValBytes` 下，同一 series String field 列接近阈值后继续写入，验证 mutation 前返回 `ErrNeedFlush`。
 - 单值超过产品上限，验证不写 memtable、不写 WAL。
-- WAL physical record 超安全阈值，验证写 memtable 前拆批或拒写。
+- 同一 batch 构造多个 series / String field，其中后处理字段预算失败，验证前面的字段也没有发生 mutation。
+- 抽取纯长度校验并使用可注入的小业务阈值，验证 `limit-1` / `limit` / `limit+1` 边界；超限时在 memtable mutation 前返回 `ErrWriteBatchTooLarge`，且不拆 batch。
+- 不实际分配 GiB 内存，使用纯长度输入验证 2GiB hard ceiling 的 `-1` / `=` / `+1` 边界，并验证 2GiB 的 Snappy 最坏编码长度仍可由 uint32 表示。
+- 绕过共同前置点直接构造 `snappy.MaxEncodedLen` 不可表示的 WAL 长度，验证在分配/切片前产生 `ErrWALRecordSizeInvariant` 并进入 fail-fast 策略，不返回普通客户端错误。
+- 覆盖普通 HTTP 多 block、多 shard、stream 追加派生行后的最终 `binaryRows`，以及绕过 `serveWrite` 的内部 stream task、RPC、replication、Arrow Flight 等在线写入路径。
+- 验证 HTTP 将 `ErrWriteBatchTooLarge` 映射为 413 且不重试；chunked / gzip 等流式请求以及单个 parser block 都允许跨 block、shard、owner 的部分成功，不误报为 request 或 block 原子拒绝。
+- 在线 raft proposal 超业务 batch 阈值时在 commit 前拒绝；历史 WAL replay / committed raft apply 不受新业务阈值影响，旧合法 record 仍可恢复且副本行为一致。
 - snapshot 只按行数不足以切开的场景，验证 rows + bytes splitter 生效。
 - 构造 `ChunkMeta.size` 回绕场景，验证 snapshot writer 内部后续 chunk offset 仍按真实写入大小推进。
 
@@ -378,9 +434,12 @@
 
 ### 写入 / WAL
 
-- `engine/mutable/ts_table.go`:memtable append 前预算。
-- `engine/shard.go`:处理 `ErrNeedFlush` / `ErrValueTooLarge`，修正 mem size/token 顺序或回滚。
-- `engine/wal.go`:WAL physical record 长度预检查，拆 batch / 拒写发生在 memtable mutation 前。
+- `engine/mutable/ts_table.go`:按整次 shard batch 汇总 String field bytes，在任何字段 append 前完成预算；预算与 mutation 使用同一同步域或 reservation。
+- `engine/shard.go`:处理 `ErrNeedFlush` / `ErrValueTooLarge` / `ErrWriteBatchTooLarge`；line protocol 与 Arrow Flight 等 WAL payload 都在 data mutation 前调用统一长度校验；调整 mem size/token 时序，失败只释放资源，不回滚 data mutation；若 WAL 返回 `ErrWALRecordSizeInvariant`，按致命不变量违规处理，不能继续正常写入。
+- `engine/engine.go` / replication proposal 路径:在线 raft proposal 在 commit 前校验业务 batch 上限；committed apply 不重复应用可配置业务阈值。
+- `engine/wal.go`:对 `snappy.MaxEncodedLen` 及 uint32 可表示范围做不可关闭的内部 invariant 检查；命中时 fail-fast，不承担动态拆 batch 或一致性兜底。
+- `lib/errno`:新增不可重试的客户端错误 `ErrWriteBatchTooLarge` 和内部错误 `ErrWALRecordSizeInvariant`；本地、RPC 与 replication 在线入口必须保留前者的错误类型，后者不得作为客户端错误传播后继续写入。
+- `lib/util/lifted/influx/httpd/handler.go`:将 `ErrWriteBatchTooLarge` 映射为 413，明确流式 `/write` 的 request 和 parser block 都不是跨 shard / owner 原子写入单元。
 
 ### Snapshot / flush
 
@@ -400,17 +459,16 @@
 - `engine/immutable/stream_downsample.go`:`StreamWriteFile.WriteMeta` 的 `ChunkMeta.size` 输出维持现状。
 - `engine/immutable/unordered_reader.go`:乱序窗口 byte-bounded。
 
-### 查询 / 诊断
+### 查询
 
 - `engine/immutable/tssp_file_meta.go` / `chunk_meta_codec.go`:chunk data range 校验辅助。
 - `engine/immutable/tssp_file.go`:整 chunk 预读失败或 size 不可信时降级 per-segment read；`columnData` 前增加边界判断。
-- 新增诊断/repair 工具，复用 `Validate*` 和 chunk data range 校验。
 
 ---
 
 ## 九、灰度与回滚
 
-本版本线格式不变，所有修复随同一版本发布。灰度对象不是代码批次，而是节点/租户/shard、运行时开关、读写路径和后台任务类型。除 repair 外，保护性开关默认打开；如需更保守放量，可在灰度节点上按下列路径启用和观察。
+本版本线格式不变，所有修复随同一版本发布。灰度对象不是代码批次，而是节点/租户/shard、运行时开关、读写路径和后台任务类型。保护性开关默认打开；如需更保守放量，可在灰度节点上按下列路径启用和观察。
 
 ### 灰度开关
 
@@ -420,17 +478,16 @@
 | `enable_nonstream_degrade_stream` | 开 | 非流式 compact / merge fastmode 遇到不可信 `ChunkMeta.size` 或解压后 `ColVal.Offset` 越界时，降级 streamMode | 关闭后回到旧 fastmode 行为 |
 | `enable_writeoriginal_range_copy` | 开 | `WriteOriginal` 使用 next chunk offset 或 segment entry 覆盖范围复制，不依赖源 `meta.size` | 关闭后回到旧复制长度逻辑 |
 | `enable_var_col_budget` | 开 | 写入、snapshot、compact、merge 使用 String field bytes 预算，避免构造超阈值 `ColVal` | 紧急时可关闭，但需要保留告警，避免继续制造坏数据 |
-| `enable_wal_precheck` | 开 | WAL physical record 在 memtable mutation 前做长度检查，拆 batch 或拒写 | 关闭后回到旧 WAL 写入逻辑 |
 | `enable_background_byte_bound` | 开 | snapshot/flush、stream compact、stream merge 按 rows + bytes 切分或提前 flush | 关闭后后台流程回到旧切分逻辑 |
-| `enable_repair_job` | 关 | 允许低优先级 repair/recompact 历史坏文件 | 停止任务即可；已重写文件仍是旧 TSSP 线格式 |
+
+最终 `binaryRows` 的 2GiB hard ceiling / WAL 可表示性预检查与 `WAL.writeBinary` 内部 invariant 检查始终开启，不设置灰度开关。它们不改变线格式，不做 batch 拆分，正常 HTTP 小 block 路径只增加 O(1) 长度计算；WAL 内部检查命中时必须 fail-fast，不能关闭后继续写入。
 
 ### 放量节奏
 
 - 先打开读侧 fallback 与非流式降级开关，观察查询 per-segment fallback、source chunk meta range 校验失败和 compact/merge streamMode 降级次数。
-- 写流量按 shard 或租户逐步放量 `enable_var_col_budget` 与 `enable_wal_precheck`，重点观察 `ErrNeedFlush`、`ErrValueTooLarge`、WAL 拆批/拒写、写入延迟和写失败率。
+- 写流量按 shard 或租户逐步放量 `enable_var_col_budget`，重点观察 `ErrNeedFlush`、`ErrValueTooLarge`、`ErrWriteBatchTooLarge`、写入延迟和写失败率。WAL 格式断言始终开启，正常流量下命中次数应为零。
 - 后台任务按类型放量 `enable_background_byte_bound`，先 snapshot/flush，再 stream compact/merge，最后覆盖非流式 compact/merge fastmode 降级路径。
 - `enable_writeoriginal_range_copy` 随后台任务一起放量，重点观察 next chunk offset / segment entry range 复制次数、fast-copy 禁用次数和新文件校验结果。
-- 诊断工具可默认运行只读扫描；repair/recompact 必须手动开启、限速运行，并支持按文件或目录停止。
 
 ### 回滚策略
 
@@ -438,26 +495,29 @@
 - 如果读侧 fallback 带来不可接受的查询延迟，可关闭 `enable_chunkmeta_size_fallback`，但需要明确旧路径遇到坏 `ChunkMeta.size` 仍可能 decode 失败或读到截断数据。
 - 如果写入预算出现误判，可临时关闭 `enable_var_col_budget`，但应保留超限观测指标，并优先修正预算逻辑后重新开启。
 - 如果后台任务放量导致资源占用过高，可关闭 `enable_background_byte_bound` 或 `enable_nonstream_degrade_stream`，并限制 compact/merge 并发。
-- repair/recompact 可随时停止；已完成 rewrite 的文件不需要反向迁移。
 
 监控:
 
 - `ErrNeedFlush` 次数
 - `ErrValueTooLarge` 次数
-- WAL 拆批/拒写次数
+- `ErrWriteBatchTooLarge` 次数，按 HTTP、stream、内部 task、RPC 等来源区分
+- WAL `MaxEncodedLen` / uint32 可表示性内部 invariant 失败次数；正常运行应为零，命中即触发致命告警
 - source chunk meta range 校验失败次数
 - decode 后 `ColVal.Offset` 越界次数
 - 查询 per-segment fallback 次数
 - 非流式 compact/merge 降级 streamMode 次数
 - `WriteOriginal` 使用 next chunk offset / segment entry range 复制次数，及 fast-copy 禁用次数
 - compact/merge 提前 write segment 次数
-- repair 处理文件数与失败记录数
 
 ---
 
 ## 十、决策摘要
 
 - 主线保护 `ColVal.Offset`，通过 mutation 前预算、bounded append 和后台流程 byte-bounded，避免构造超阈值 String field `ColVal`。
+- 写入路径的 P0 聚焦 memtable `ColVal` 整批预算。预算失败发生在任何字段 append 前，通过 rotate/flush/retry 或拒写处理，不实现 mutation 回滚。
+- 普通 HTTP `/write` 已按 `ReadBlockSize` 拆成多个 parser batch，每个 batch 再按 shard / owner 形成写入 attempt；正常 WAL-enabled、非 Shelf 路径中，每个成功 `shard.WriteRows` attempt 对应一个 WAL record。HTTP request 和 parser block 都不是跨目标原子写入单元。
+- WAL 长度不作为主 P0，不做运行时拆 batch。最终 `binaryRows` 在 mutation 前校验 2GiB hard ceiling、可配置业务阈值和 WAL 可表示范围；WAL 层只检测前置校验不变量失守，命中时 fail-fast，不提供 mutation 后的一致性兜底。
+- 2GiB 是本方案选择且可由当前 WAL uint32 header 安全表示的不可配置 hard ceiling，不是 header 的理论极限，也不是建议运行阈值；可配置业务阈值不得超过它，现有非 gzip HTTP 25MB body 默认值和小 block 行为保持不变。
 - `ChunkMeta.size` 不再作为输出侧保护目标。compact / merge 等流程输出维持现状，允许 uint32 回绕继续存在。
 - 后续流程必须把源 `ChunkMeta.size` 当作不可信元数据。整 chunk 读、非流式 compact/merge、查询预读、`WriteOriginal` 都需要校验或绕开对它的依赖。
 - 非流式 compact / merge 遇到不可信 `ChunkMeta.size`，或整 chunk decode 后 `ColVal.Offset` 越界时降级 streamMode。
