@@ -130,7 +130,7 @@
 |------|----------|--------|----------|
 | 写入 / memtable | 行协议解析 -> record append -> memtable mutation | String field `ColVal` 持续累积，append 前无 bytes 预算会形成回绕 offset | mutation 前预算，超限 flush/retry 或拒写 |
 | WAL | shard `binaryRows` -> snappy physical record -> WAL header | 在现有行协议单行限制和写入批量约束下，单个 payload 不可能达到 uint32 表示边界 | 本次不修改 WAL，也不增加 payload 长度比较 |
-| snapshot / flush | memtable record -> `MsBuilder` -> TSSP chunk | 只按 rows 切分不足以约束 String field bytes；内部 `dataOffset` 不能依赖回绕的 `chunkMeta.size` | rows + var-bytes 切分；offset 用真实写入大小推进 |
+| snapshot / flush | memtable record -> `MsBuilder` -> TSSP chunk | 写入侧预算必须保证输入 `Record` 的 String offset 有效；内部 `dataOffset` 不能依赖回绕的 `chunkMeta.size` | 写出前校验 `Record`，保留现有 rowsLimit / segment 行数切分；offset 用真实写入大小推进 |
 | 非流式 compact / merge fastmode | chunk 整块读取 -> decodeRecord -> record merge -> 写新文件 | 整 chunk 读取依赖源 `ChunkMeta.size`；decode 后 `ColVal.Offset` 仍可能越界；record merge 会继续累积 `ColVal` | 源 size 不可信或 decode 后 offset 越界时降级 streamMode；merge 使用 bounded append |
 | stream compact | segment 读取 -> compactColumn -> writeSegment -> writeMeta | 源读按 segment 安全；当前 rows 上限与 `max-line-size` 组合已保证输出 segment 和临时合并对象低于 uint32 边界 | 保持 row-only 合并与现有 `writeSegment` 时机；输出 `ChunkMeta.size` 维持现状 |
 | stream merge | ordered/unordered segment merge 或 `WriteOriginal` fast-copy | ordered 输入按 segment 有界，但按当前 segment 时间范围或 `math.MaxInt64` 读取 unordered 时可一次聚合多个 segment；`WriteOriginal` 当前信任源 `meta.size` | 保留现有 merge / `columnWriter` 流程；unordered time range 读取增加最多 1000 行的 `rowsLimit` 并循环消费；fast-copy 长度改用后继 `ChunkMeta` offset（对应下一 series）或 segment entry 覆盖范围 |
@@ -151,7 +151,6 @@
 - `TryAppendColVal`
 - `TryAppendString`
 - `TryAppendStringNull`
-- `SplitByRowsAndVarBytes`
 - `ValidateCol`
 - `ValidateRecord`
 
@@ -202,20 +201,20 @@
 
 #### 风险点
 
-- 当前切分以 rows 为主，不能限制 String field `ColVal.Val` 字节增长。
+- snapshot 输入来自已完成 mutation 前预算的 memtable，正常情况下各 String field `ColVal` 已满足 bytes 边界；写出入口仍需拒绝 offset/length 不可信的异常 `Record`。
 - `ChunkMeta.size` 输出可以将错就错，但 builder 内部不能使用回绕后的 `chunkMeta.size` 推进 `dataOffset`。
 
 #### 设计动作
 
-1. snapshot 写出前使用 `SplitByRowsAndVarBytes`:
-   - 按 rows 和 String field bytes 双条件切分。
-   - 不再把超阈值 record 交给 builder。
-2. `ChunkDataBuilder` 保持“一个 series 在一个 TSSP 文件内只有一个 `ChunkMeta`”的现有组织方式和 `ChunkMeta.size uint32` 输出行为，不引入将同一 series 拆成多个 `ChunkMeta` 的新表示。
-3. `MsBuilder` 推进 `dataOffset` 时使用实际编码/写入字节数，例如 `len(encodeChunk)` 或 writer 实际 `DataSize` 差值，而不是 `chunkBuilder.chunkMeta.size`。
+1. snapshot 写出前执行 `ValidateRecord`；发现 String field offset/length 不可信时返回 `ErrCorruptColumn`，不得尝试通过切分修复已经损坏的 offset。
+2. 保留 `MsBuilder.WriteRecord` 现有的 rowsLimit `Record.Split`，以及 `EncodeChunk` 按 `maxRowsPerSegment` 生成 segment 的流程；不增加 `MaxVarColValBytes` 驱动的 record 切分。
+3. `ChunkDataBuilder` 保持“一个 series 在一个 TSSP 文件内只有一个 `ChunkMeta`”的现有组织方式和 `ChunkMeta.size uint32` 输出行为，不引入将同一 series 拆成多个 `ChunkMeta` 的新表示。
+4. `MsBuilder` 推进 `dataOffset` 时使用实际编码/写入字节数，例如 `len(encodeChunk)` 或 writer 实际 `DataSize` 差值，而不是 `chunkBuilder.chunkMeta.size`。
 
 #### 验收点
 
-- 低 `MaxVarColValBytes` 下，snapshot 会切成多个 bounded record。
+- 低 `MaxVarColValBytes` 下，由 memtable mutation 前预算触发 rotate/flush；snapshot 不因 bytes 阈值改变现有 record 或 segment 切分边界。
+- 构造 offset/length 不可信的 snapshot 输入，验证在进入 builder 编码前 fail-closed。
 - 构造 chunk data size 回绕场景时，文件中后续 series 的 `ChunkMeta.offset` 仍按真实写入位置推进。
 - 输出 `ChunkMeta.size` 可以保持 uint32 回绕，不作为本方案失败条件。
 
@@ -412,9 +411,9 @@ Handle(ordered current segment)
 - `WriteOriginal` 复制长度改为依赖后继 `ChunkMeta` offset（对应下一 series）或 segment entry 覆盖范围，而不是源 `meta.size`。
 - `appendFields` 前按整次 shard batch 汇总 String field bytes 并校验单值；预算失败不产生部分 data mutation，也不做 mutation 回滚。
 - 单值超限拒写；追加会使 memtable `ColVal` 超阈值时返回 `ErrNeedFlush`，触发 snapshot/flush 后重试。
-- 引入 String field 判断、bounded append API 和 rows + var-bytes splitter。
+- 引入 String field 判断、bounded append API 和 `ValidateCol` / `ValidateRecord`。
 - 除已有 row-only 边界的 stream compact，以及按 `maxTime + rowsLimit` 分批读取的 stream merge 外，高风险 `AppendColVal`、`AppendString`、直接 `uint32(len(cv.Val))` 统一收敛到 bounded API。
-- snapshot/flush 按 rows + var-bytes 切分。
+- snapshot/flush 写出前校验 `Record`，保留现有 rowsLimit / segment 行数切分，不增加 bytes 驱动的切分。
 - snapshot/flush 内部 offset 推进改为真实写入大小，不依赖回绕 `chunkMeta.size`。
 - stream merge 保留现有 `Handle -> readUnordered -> merge -> columnWriter` 主流程；按 ordered 当前 segment 的 `maxOrderTime` 读取、以及用 `math.MaxInt64` 排空剩余 unordered 时，均增加 `rowsLimit=1000` 并循环消费。
 - 非流式 compact / merge 大 String field 场景降级到按 segment 或 `maxTime + rowsLimit` 分批读取的 streamMode；stream compact 保持现有 row-only 切分，stream merge 保持现有 merge / `columnWriter` 流程。
@@ -429,7 +428,8 @@ Handle(ordered current segment)
 - 低 `MaxVarColValBytes` 下，同一 series String field 列接近阈值后继续写入，验证 mutation 前返回 `ErrNeedFlush`。
 - 单值超过产品上限，验证不产生 memtable mutation。
 - 同一 batch 构造多个 series / String field，其中后处理字段预算失败，验证前面的字段也没有发生 mutation。
-- snapshot 只按行数不足以切开的场景，验证 rows + bytes splitter 生效。
+- snapshot 写出前验证 `Record`；offset/length 不可信时在进入 builder 编码前 fail-closed。
+- 低 bytes 阈值不改变 snapshot 现有 rowsLimit / segment 行数切分边界。
 - 构造 `ChunkMeta.size` 回绕场景，验证 snapshot writer 内部后续 series 的 `ChunkMeta.offset` 仍按真实写入大小推进。
 
 ### `ChunkMeta.size` 读取降级
@@ -464,7 +464,6 @@ Handle(ordered current segment)
 
 - `lib/record/column.go`:String field 判断、checked accessor、bounded append 入口。
 - `lib/record/record_check.go`:新增 `ValidateCol` / `ValidateRecord`。
-- `lib/record/*`:新增 rows + var-bytes splitter。
 
 ### 写入 / memtable
 
@@ -474,7 +473,7 @@ Handle(ordered current segment)
 
 ### Snapshot / flush
 
-- `engine/immutable/msbuilder.go`:写 record 前按 rows + var-bytes 切分；`dataOffset` 用真实写入大小推进。
+- `engine/immutable/msbuilder.go`:写 record 前执行 `ValidateRecord`，保留现有 rowsLimit 切分；`dataOffset` 用真实写入大小推进。
 - `engine/immutable/chunkdata_builder_ts.go`:保留“一个 series、一个文件、一个 `ChunkMeta`”及 `ChunkMeta.size uint32` 的输出现状，不新增多 `ChunkMeta` 表示或 chunk byte cap。
 - `engine/immutable/column_builder.go`:保留 segment 写前断言。
 
