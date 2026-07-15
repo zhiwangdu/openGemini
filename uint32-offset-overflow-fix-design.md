@@ -46,11 +46,12 @@
 
 ### 4. Stream 路径处理原则
 
-**stream compact 保持现状；stream merge 只限制单次 unordered 读取行数，不改写现有 merge 和写出流程。**
+**stream compact 保持现状；stream merge 本次只修复 `WriteOriginal` 截断复制，unordered 时间范围读取风险留给单独的乱序合并优化。**
 
 - stream compact 不增加 rows + bytes 条件，也不在 bytes 达阈值时提前 `writeSegment`。
-- stream merge 的 ordered 输入按 segment 有界，但 `Read(maxTime)` 可能在当前 ordered segment 时间范围内命中多个 unordered segment；`lastSeries && lastSeg` 时还可能通过 `math.MaxInt64` 一次读取剩余全部 unordered。
-- stream merge 保留 `Handle -> readUnordered -> merge -> columnWriter`，只给 time range 读取增加 `rowsLimit`。默认取 `maxRowsPerSegment=1000`，按批循环消费；不改 `columnWriter`，也不增加 `MaxVarColValBytes` 驱动的输出切分。
+- stream merge 读取 unordered 时只有 `maxTime` 时间边界，可能一次聚合多个 segment，极端情况下形成超过 4GiB 的 String `ColVal`；这是已知风险。
+- 本次不修改 `ReadTimes` / `Read`、`readUnordered`、`MergeHelper` 或 `columnWriter`，也不增加 `rowsLimit`；该问题在单独的乱序合并优化中处理。
+- 本次 stream merge 的核心修复是 `WriteOriginal` 不再按可能回绕的 `meta.size` 复制，避免只复制 chunk 前缀而丢失数据。
 
 ### 5. 格式与类型选择
 
@@ -58,7 +59,7 @@
 
 - `ColVal.Offset`、TSSP string block offset/length、`Segment.size` 和 `ChunkMeta.size` 继续使用现有 uint32 表达。
 - `ColVal` 是共享核心结构，改为 uint64 会扩大到大量内存结构、编解码和读写边界，超出本次修复范围。
-- 本方案通过 mutation 前预算、bounded append、segment/rowsLimit 有界处理和流程降级控制风险；源 `ChunkMeta.size` 在读、compact、merge 侧按不可信元数据处理。
+- 本方案通过 mutation 前预算、bounded append、现有 segment 边界和流程降级控制本次范围内的风险；源 `ChunkMeta.size` 在读、compact、merge 侧按不可信元数据处理。stream merge 的 unordered 时间范围读取风险作为明确例外，留给单独优化。
 
 ---
 
@@ -70,7 +71,7 @@
 
 | 维度 | 对应字段 | 含义 | 本方案定位 |
 |------|----------|------|------------|
-| 单列变长数据大小 | `ColVal.Offset` | String field 单列的 `ColVal.Val` 字节大小；`Offset` 记录每个值在该列 `Val` 中的位置 | 主保护对象，通过 append 前预算或 segment/time+rowsLimit 有界处理避免回绕 |
+| 单列变长数据大小 | `ColVal.Offset` | String field 单列的 `ColVal.Val` 字节大小；`Offset` 记录每个值在该列 `Val` 中的位置 | 主保护对象，通过 append 前预算、bounded append 或既有 segment 边界避免回绕；stream merge unordered 读取风险单独处理 |
 | 单 series、单文件 chunk 数据大小 | `ChunkMeta.size` | 一个 `ChunkMeta` 描述的 chunk data 区大小，包含该 series 在当前 TSSP 文件内的 time 列和各 field 列 segment 数据 | 输出侧维持现状；读、compact、merge 侧把它视为不可信元数据 |
 
 在当前 TSStore TSSP 组织下，同一 series 在一个 TSSP 文件内只对应一个 `ChunkMeta`，不会拆分成多个 `ChunkMeta`。该 `ChunkMeta` 描述该 series 在当前文件内的完整 chunk data 区；因此这里的大小维度是“单 series、单文件”，不是全文件或全 measurement。
@@ -79,11 +80,11 @@
 
 ### 1. 主保护对象:`ColVal.Offset`
 
-真正必须阻止的是 String field `ColVal.Val` 在内存中跨 record / segment 无界累积到 uint32 上限以上。此类路径必须在 mutation 前做 bytes 预算，或把单次处理行数严格限制住。stream compact 由 segment 行数约束，stream merge 由 time range + `rowsLimit` 分批读取约束；两者在当前“每批最多 1000 行 + 每行最多 1MiB”的配置前提下形成低于 uint32 上限的独立边界，不纳入 `MaxVarColValBytes` 切分。
+真正必须阻止的是 String field `ColVal.Val` 在内存中跨 record / segment 无界累积到 uint32 上限以上。本次覆盖的路径必须在 mutation 前做 bytes 预算、使用 bounded append，或已有可靠的 segment 行数边界。stream compact 由现有 segment 行数约束；stream merge 的 unordered 读取目前只有时间边界，尚不满足这一要求，本次只登记风险，不修改其读取流程。
 
 核心不变量:
 
-> 除上述按 rows + `max-line-size` 已有界的 stream compact 和 stream merge rowsLimit batch 外，任意会跨 record / segment 累积的 TSStore String field 列追加到目标 `ColVal` 前，必须保证追加后 `len(dst.Val) <= MaxVarColValBytes`。
+> 除按 rows + `max-line-size` 已有界的 stream compact 外，本次改造覆盖的跨 record / segment 累积路径在追加 TSStore String field 到目标 `ColVal` 前，必须保证追加后 `len(dst.Val) <= MaxVarColValBytes`。stream merge unordered 时间范围读取是已知未覆盖项，由单独的乱序合并优化补齐。
 
 建议阈值:
 
@@ -133,7 +134,7 @@
 | snapshot / flush | memtable record -> `MsBuilder` -> TSSP chunk | 写入侧预算必须保证输入 `Record` 的 String offset 有效；内部 `dataOffset` 不能依赖回绕的 `chunkMeta.size` | 写出前校验 `Record`，保留现有 rowsLimit / segment 行数切分；offset 用真实写入大小推进 |
 | 非流式 compact / merge fastmode | chunk 整块读取 -> decodeRecord -> record merge -> 写新文件 | 整 chunk 读取依赖源 `ChunkMeta.size`；decode 后 `ColVal.Offset` 仍可能越界；record merge 会继续累积 `ColVal` | 源 size 不可信或 decode 后 offset 越界时降级 streamMode；merge 使用 bounded append |
 | stream compact | segment 读取 -> compactColumn -> writeSegment -> writeMeta | 源读按 segment 安全；当前 rows 上限与 `max-line-size` 组合已保证输出 segment 和临时合并对象低于 uint32 边界 | 保持 row-only 合并与现有 `writeSegment` 时机；输出 `ChunkMeta.size` 维持现状 |
-| stream merge | ordered/unordered segment merge 或 `WriteOriginal` fast-copy | ordered 输入按 segment 有界，但按当前 segment 时间范围或 `math.MaxInt64` 读取 unordered 时可一次聚合多个 segment；`WriteOriginal` 当前信任源 `meta.size` | 保留现有 merge / `columnWriter` 流程；unordered time range 读取增加最多 1000 行的 `rowsLimit` 并循环消费；fast-copy 长度改用后继 `ChunkMeta` offset（对应下一 series）或 segment entry 覆盖范围 |
+| stream merge | ordered/unordered segment merge 或 `WriteOriginal` fast-copy | unordered 读取只有时间边界，可能聚合超过 4GiB；`WriteOriginal` 信任回绕的 `meta.size` 会截断复制并丢数据 | unordered 读取风险转入单独优化，本次不改流程；核心修复 `WriteOriginal` 的真实复制范围 |
 | 查询 | chunk meta -> segment data -> decode | `defaultIoSize` 整 chunk 预读依赖 `cm.size`；历史坏 offset 不能 panic | 预读失败/校验不通过时降级按 segment 读；fail-closed |
 
 ---
@@ -234,7 +235,7 @@
 3. 如果整 chunk 读取成功，但 `decodeRecord` 后 `ValidateCol` / `ValidateRecord` 发现 String field offset 越界，同样不继续非流式 fast path，降级到 streamMode。
 4. streamMode 逐 segment 读取，依赖 segment entry 的 `offset/size`，不依赖源 `ChunkMeta.size` 定位数据。
 5. `decodeRecord` / `Record.Merge` 使用 bounded append，避免目标 String field `ColVal` 超阈值。
-6. 对大 String field 场景，优先绕开整 record fast path，使用按 segment 或 time + `rowsLimit` 分批读取的流式路径；stream compact 保持现有 row-only 边界，stream merge 保持现有 merge / `columnWriter` 流程并限制单次 unordered 读取行数。
+6. 对大 String field 场景，优先绕开整 record fast path 并使用现有 streamMode；stream compact 保持 row-only 边界。stream merge 的 unordered 时间范围读取不在本次增加行数限制，由单独的乱序合并优化处理。
 
 #### 验收点
 
@@ -267,100 +268,34 @@
 
 ### 5. Stream merge / out-of-order merge
 
-#### 调研结论与风险点
+本节只区分两类问题：unordered 读取的内存越界风险，以及 `WriteOriginal` 的截断复制风险。前者本次不改，后者是本节的核心修复点。
 
-- `ColumnIterator.walkSegment` 传给 `mergePerformer.Handle` 的 ordered 列是单 segment，最多 `maxRowsPerSegment` 行；`StreamWriteFile.WriteData` 也断言最终输出列不超过该行数。
-- 风险集中在两种 unordered time range 读取:
-  - 普通 `Handle` 使用 ordered 当前 segment 的 `maxOrderTime` 调用 `readUnordered(maxOrderTime)`。若该时间范围内 unordered 点密度远高于 ordered，一个 segment 的时间范围仍可能命中多个 unordered segment。
-  - `lastSeries && lastSeg` 会把 `maxOrderTime` 提升到 `math.MaxInt64`，当前实现可能一次读取该 series 剩余的全部 unordered 数据。
-- `UnorderedColumnReader.read` 会循环读取 source segment 直到满足 `need`；如果 `need` 来自不受行数限制的 `ReadTimes(maxTime)`，会在进入 `MergeHelper` 和 `columnWriter` 前形成大 `ColVal`。
-- `columnWriter` 的最终 row-only split 本身没有问题，也不是本次改造点。只要传给它的每个 merged batch 有明确行数上限，现有 `remain -> splitRemain -> WriteData` 流程可以继续使用。
-- `WriteOriginal` 当前使用 `for readSize < meta.size` 复制原 chunk；源 `meta.size` 已回绕时会复制截断数据并生成坏新文件。
-- `StreamWriteFile.WriteMeta` 输出 `ChunkMeta.size` 当前会 uint32 窄化，本方案不强制保护该输出。
+#### 问题一：unordered 读取只有时间边界，本次不修改
 
-#### 核心不变量
+- ordered 输入虽然按 segment 处理，但 `ReadTimes(maxTime)` / `Read(maxTime)` 只限制时间范围，不限制行数或 String bytes。
+- 普通流程可能在一个 ordered segment 的时间范围内命中多个 unordered segment；`lastSeries && lastSeg` 使用 `math.MaxInt64` 时还可能读取该 series 剩余的全部 unordered 数据。
+- 极端密度下，单次构造的 unordered `ColVal` 可能超过 4GiB 并导致 uint32 offset 回绕。
+- 本次仅记录该风险，不修改 `ReadTimes` / `Read`、`readUnordered`、`MergeHelper`、`columnWriter` 或现有时序语义；该问题在单独的乱序合并优化中统一处理。
 
-设 `R = maxRowsPerSegment`，当前为 1000；`unorderedReadRowsLimit` 默认直接取 `R`，不新增独立可调参数。
+#### 问题二：`WriteOriginal` 截断复制并丢数据，核心修复
 
-> `ReadTimes(maxTime, rowsLimit)` 每次最多推进 `rowsLimit` 个全局去重后的 unordered timestamp；所有 reader 只读取到本批最后一个 timestamp，并在返回 `hasMoreWithinRange=true` 时由调用方继续循环。不得用原始 `maxTime` 让单个 reader 越过本批边界。
+`WriteOriginal` 当前以 uint32 `meta.size` 作为复制总长度，并使用 `for readSize < meta.size` 循环读取。真实 chunk data 超过 4GiB 时，`meta.size` 回绕为较小值，fast-copy 只复制 chunk 前缀；随后写出的新文件缺少尾部数据，属于确定的数据丢失。
 
-按 `rowsLimit = R` 计算:
+修复动作:
 
-- `UnorderedColumnReader` 的旧 tail 小于一个 source segment，本批最多再读取到满足 `R` 行，因此单个 reader 的临时列严格小于 `2R` 行。
-- 当前 ordered segment 最多 `R` 行；按批次时间边界切出的 ordered range 与 unordered batch 合并后最多 `2R` 行。
-- `columnWriter.remain` 在调用前小于 `R` 行，append 本批 merged col 后临时对象严格小于 `3R` 行，随后沿用现有 `splitRemain` 按 `R` 行写出。
-- 在 `R=1000`、`max-line-size<=1MiB` 的前提下，最坏临时 String field `ColVal.Val` 低于约 3000MiB，仍小于 uint32 的 4GiB 边界；因此不需要 rows + bytes 条件。
+1. 在改写 `meta.offset` 和 segment entry 前，不再使用源 `meta.size` 作为复制长度，先计算 `expectedChunkDataSize`:
+   - 当前 `ChunkMeta` 后面存在另一个 series 的 `nextChunkMeta` 时，使用 `nextChunkMeta.offset - meta.offset`。
+   - 当前 `ChunkMeta` 位于文件物理顺序末尾时，使用 segment entry 覆盖范围。
+2. fast-copy 范围固定为 `[meta.offset, meta.offset + expectedChunkDataSize)`；总长度、`readSize` 和 offset 运算使用 int64，单次读取 buffer 仍保持小块。
+3. 复制完成后按目标文件的新起点平移 segment offset，再写入 meta；输出 `ChunkMeta.size` 继续维持现有 uint32 行为。
+4. segment entry 覆盖范围不可信时禁用 `WriteOriginal`，改走逐 segment rewrite；无法安全重写时返回 corrupt error，不能继续截断复制。
 
-#### 设计动作
+验收点:
 
-1. 为现有 time range API 增加行数上限和续读状态，建议签名:
-
-   ```go
-   ReadTimes(maxTime int64, rowsLimit int) (times []int64, hasMoreWithinRange bool, err error)
-   Read(sid uint64, maxTime int64, rowsLimit int) (col *record.ColVal, times []int64, hasMoreWithinRange bool, err error)
-   ```
-
-   - 先按 `maxTime` 查找本次允许读取的 `logicalEnd`，再令 `batchEnd = min(currentOffset + rowsLimit, logicalEnd)`，只推进并返回 `[currentOffset, batchEnd)`；`hasMoreWithinRange = batchEnd < logicalEnd`。
-   - 实际传给各 `UnorderedColumnReader.Read` 的上界必须是本批 `times[len(times)-1]`，不能继续使用调用方传入的原始 `maxTime`。
-   - `hasMoreWithinRange` 只表示当前 `maxTime` 范围内仍有未消费 timestamp；调用方据此继续循环。
-   - `rowsLimit <= 0` 视为内部参数错误；正常路径统一传 `GetMaxRowsPerSegment4TsStore()`。
-   - source segment decode 后执行 `ValidateCol`；offset/length 不可信时返回 corrupt error。
-2. ordered 当前 segment 范围内读取 unordered 时，保留 `Handle -> readUnordered -> merge -> write` 结构，只在 `Handle` 内增加批次循环:
-   - `readUnordered(maxOrderTime, R)` 返回最多 `R` 行 unordered 及 `hasMoreWithinRange`。
-   - 以本批最后一个 unordered timestamp 为边界，在当前 ordered segment 中用 `sort.Search` 找到 `<= batchMaxTime` 的连续 range；只把该 ordered range 与本批 unordered 交给现有 `MergeHelper.Merge`。
-   - 非最终 batch 调用现有 `p.write(..., lastSeg=false)`，推进 ordered range 起点后继续读取下一批；当前 `maxOrderTime` 范围内 unordered 耗尽后，再写剩余 ordered range。
-   - timestamp 等于批次边界的 ordered/unordered 点必须在同一批处理，继续保持 unordered 覆盖 ordered，不能把同 timestamp 拆到下一批。
-   - 原始 `lastSeg=true` 只传递一次：如果最后一个 unordered batch 已同时消费完 ordered range，就传给该 batch；否则传给最后的 ordered suffix。若范围内没有 unordered，则直接沿用现有 ordered-only 写法。这样不需要构造空 batch，且 `columnWriter.flush` 时机不变。
-3. 读取剩余全部 unordered 时继续使用现有分支语义，但把“全部”改为循环批次:
-   - `lastSeries && lastSeg` 仍可把逻辑上界设为 `math.MaxInt64`，但每次 `Read` 最多返回 `R` 行；当 ordered range 已消费完，后续批次以空 ordered col 与 unordered batch 继续走现有 merge/write 流程。
-   - `writeUnorderedCol` 不再为整个 `p.mergedTimes` 一次构造 nil col；将 `p.mergedTimes` 按最多 `R` 行切成连续 range，为每个 range 构造 nil col，并以该 range 的最后时间调用带 `rowsLimit` 的 `Read`。由于 range 本身最多 `R` 个全局 timestamp，本次读取必须返回 `hasMoreWithinRange=false`，随后沿用现有 merge/write，最后一个 range 才传 `lastSeg=true`。
-   - `UnorderedReader.readRemain` 已按 `maxRowsPerSegment` 推进 `wn`，保留该流程，只改为显式传入 `rowsLimit` 并断言单批返回不超过 `R` 行。
-4. `columnWriter.write`、`splitRemain`、`flush` 和 `writeMergedTime` 保持现状:
-   - 不新增 rows + bytes 条件或新的写出抽象，不改变现有 segment packing、pre-aggregation 和 time 列写出流程。
-   - 在 `columnWriter.write` 入口增加 debug/invariant 统计即可，验证输入 merged batch 不超过 `2R`、append 后 `remain` 不超过安全推导边界；违反时 fail-closed，不回退到全量读取。
-5. 分批前后必须保持现有语义:
-   - 输出 timestamp 全局有序，批次之间无遗漏、重复或逆序。
-   - ordered/unordered timestamp 相同时仍由 unordered 值覆盖；多个 unordered file 同 timestamp 的优先级保持当前 reader 顺序。
-   - 各 field 在 `ColumnChanged` 后从相同 unordered time offset 开始，基于相同 `maxTime + rowsLimit` 规则得到相同批次边界；nil bitmap、行数和 time 列继续对齐。
-   - rowsLimit 只限制内存中的单次读取/归并，不改变 TSSP 线格式，也不成为用户可配置的 segment 规则。
-6. `WriteOriginal` 不再依赖源 `meta.size`:
-   - 当前 `ChunkMeta` 后面存在另一个 series 的 `nextChunkMeta` 时，使用 `nextChunkMeta.offset - meta.offset`；当前 `ChunkMeta` 位于文件物理顺序末尾时，使用 segment entry 覆盖范围计算 `expectedChunkDataSize`。
-   - fast-copy 复制范围使用 `[meta.offset, meta.offset + expectedChunkDataSize)`。
-   - 分块读取时每次仍可用较小 uint32 buffer size，但循环总长度用 int64。
-   - 平移 segment offset 后写新 meta；新 `ChunkMeta.size` 仍维持当前 uint32 输出行为。
-7. 如果 segment entry range 本身不可信，禁用 `WriteOriginal`，改走逐 segment rewrite；无法安全重写时返回 corrupt error。
-
-#### 复杂度与性能边界
-
-- 不预生成新的全列分批计划，不改 `ColumnIterator`、`columnWriter` 和 time 列主流程；新增工作只是在单次 time range 命中超过 `R` 行时多次调用现有 read/merge/write。
-- 每个 unordered timestamp 仍只被当前 field 的 offset 单调消费一次，整体时间复杂度保持线性；批次数约为 `ceil(matchedUnorderedRows / R)`。
-- `columnWriter` 继续按 `R` 行打包最终 segment，因此最终 TSSP segment 数由合并后总行数决定，不因 unordered 读取分批而额外增加。
-- `mergedTimes` 及现有 schema/reader 生命周期保持不变；本方案只限制 String 列单次 materialize 的行数。
-
-伪流程:
-
-```text
-Handle(ordered current segment)
-  -> maxTime = ordered segment maxTime 或 math.MaxInt64
-  -> 循环 Read(maxTime, rowsLimit=1000)
-       -> 得到本批 unordered 和 batchMaxTime
-       -> 切出 ordered 中 <= batchMaxTime 的 range
-       -> 走现有 MergeHelper.Merge
-       -> 非最终批走现有 columnWriter.write(lastSeg=false)
-       -> 若本批已耗尽 unordered 和 ordered，则沿用原 lastSeg
-  -> 若仍有 ordered suffix，最后写 suffix 并沿用原 lastSeg/flush
-```
-
-#### 验收点
-
-- ordered 当前 segment 时间范围内包含超过 `R` 行 unordered 时，触发多批 `Read(maxOrderTime, R)`；输出与改造前全量 merge 结果逐行一致。
-- `lastSeries && lastSeg` 后仍有多个 unordered segment 时，以 `math.MaxInt64 + rowsLimit` 多批排空，不产生一次性全量 String `ColVal`。
-- ordered batch 边界与 unordered timestamp 相等时，两侧在同一批合并且 unordered 仍覆盖 ordered；多个 unordered file 的覆盖优先级不变。
-- ordered-only、unordered-only、字段仅存在于一侧、nil bitmap、pre-aggregation 和 time/field 总行数均保持现有语义。
-- 使用小 `R` 构造 source segment tail + 多批读取，验证单 reader 临时列 `<2R`、merged batch `<=2R`、`columnWriter` append 后临时对象 `<3R`。
-- `columnWriter.write` / `splitRemain` / `flush` 的既有测试结果不变；低 `MaxVarColValBytes` 不改变 stream merge 的 rowsLimit 或 segment 边界。
-- 源 `meta.size` 回绕时，`WriteOriginal` 不再只复制前 `meta.size` 字节。
-- 源 segment entry range 不可信时，不走 fast-copy。
+- 源 `meta.size` 回绕时，`WriteOriginal` 仍复制完整 `expectedChunkDataSize`，新文件不丢失 chunk 尾部。
+- 分别覆盖“下一 series 的 `ChunkMeta.offset`”和“文件末尾 segment entry 覆盖范围”两种长度计算方式。
+- segment entry range 不可信时不走 fast-copy。
+- unordered 读取和 merge / `columnWriter` 流程保持现状；本次不引入 rowsLimit 或新的分批语义。
 
 ### 6. 查询路径
 
@@ -412,11 +347,11 @@ Handle(ordered current segment)
 - `appendFields` 前按整次 shard batch 汇总 String field bytes 并校验单值；预算失败不产生部分 data mutation，也不做 mutation 回滚。
 - 单值超限拒写；追加会使 memtable `ColVal` 超阈值时返回 `ErrNeedFlush`，触发 snapshot/flush 后重试。
 - 引入 String field 判断、bounded append API 和 `ValidateCol` / `ValidateRecord`。
-- 除已有 row-only 边界的 stream compact，以及按 `maxTime + rowsLimit` 分批读取的 stream merge 外，高风险 `AppendColVal`、`AppendString`、直接 `uint32(len(cv.Val))` 统一收敛到 bounded API。
+- 除已有 row-only 边界的 stream compact 外，本次覆盖的高风险 `AppendColVal`、`AppendString`、直接 `uint32(len(cv.Val))` 统一收敛到 bounded API；stream merge unordered 时间范围读取作为已知未覆盖项转入单独优化。
 - snapshot/flush 写出前校验 `Record`，保留现有 rowsLimit / segment 行数切分，不增加 bytes 驱动的切分。
 - snapshot/flush 内部 offset 推进改为真实写入大小，不依赖回绕 `chunkMeta.size`。
-- stream merge 保留现有 `Handle -> readUnordered -> merge -> columnWriter` 主流程；按 ordered 当前 segment 的 `maxOrderTime` 读取、以及用 `math.MaxInt64` 排空剩余 unordered 时，均增加 `rowsLimit=1000` 并循环消费。
-- 非流式 compact / merge 大 String field 场景降级到按 segment 或 `maxTime + rowsLimit` 分批读取的 streamMode；stream compact 保持现有 row-only 切分，stream merge 保持现有 merge / `columnWriter` 流程。
+- stream merge 本次只修复 `WriteOriginal` 的真实复制范围；unordered 读取、merge 和 `columnWriter` 流程保持现状，不增加 rowsLimit。
+- 非流式 compact / merge 大 String field 场景绕开整 record fast path 并使用现有 streamMode；stream compact 保持现有 row-only 切分，stream merge unordered 读取风险转入单独优化。
 - compact / merge 输出 `ChunkMeta.size` 维持现状，不作为本方案保护目标。
 
 ---
@@ -444,11 +379,10 @@ Handle(ordered current segment)
 
 - 非流式 compact / merge 的 record 合并总 bytes 超低阈值时，验证不会构造超阈值目标 `ColVal`。
 - stream compact 复用现有 rows 边界测试，不新增低 `MaxVarColValBytes` 下提前 `writeSegment` 的测试预期。
-- stream merge 在单个 ordered segment 时间范围命中超过 1000 行 unordered 时，多次调用 `Read(maxOrderTime, rowsLimit=1000)`；每批 unordered 不超过 1000 行，最终输出与改造前逐行一致。
-- 最后一个 ordered segment 使用 `math.MaxInt64` 排空剩余 unordered 时同样按 1000 行循环读取，不一次构造剩余全部 String `ColVal`；unordered-only 字段按 `mergedTimes` 的连续 1000 行 range 处理。
-- 多个 unordered file 在批次边界存在相同 timestamp 时，验证同 timestamp 不跨批、覆盖优先级、nil bitmap、time/field segment 边界与改造前一致。
-- 低 `MaxVarColValBytes` 不改变 stream merge 的 `rowsLimit` 或最终 segment 边界，也不触发 bytes 阈值提前 flush/split。
-- 源 `meta.size` 回绕时，`WriteOriginal` 仍按下一 series 的 `ChunkMeta.offset` 或 segment entry 覆盖范围复制，不生成截断新文件。
+- 源 `meta.size` 回绕且当前 chunk 后面存在另一 series 时，`WriteOriginal` 按下一 `ChunkMeta.offset` 推导的 int64 长度完整复制，不生成截断新文件。
+- 当前 chunk 位于文件末尾时，`WriteOriginal` 按 segment entry 覆盖范围完整复制。
+- segment entry range 不可信时禁用 fast-copy，并验证逐 segment rewrite 或 corrupt error 行为。
+- 现有 unordered 读取、merge 和 `columnWriter` 回归测试结果保持不变；本次不新增 rowsLimit 相关测试预期。
 
 ### 兼容性
 
@@ -485,10 +419,8 @@ Handle(ordered current segment)
 
 ### Merge
 
-- `engine/immutable/merge_performer.go`:保留现有按 ordered segment 回调及 `merge -> columnWriter` 写出流程；在当前 segment 的 `maxOrderTime` 和最后排空用的 `math.MaxInt64` 范围内，循环读取最多 `maxRowsPerSegment` 行 unordered，并按本批最后时间点切分 ordered range；`WriteOriginal` 复制长度改用下一 series 的 `ChunkMeta.offset` 或 segment entry 覆盖范围，不依赖源 `meta.size`。
+- `engine/immutable/merge_performer.go`:`WriteOriginal` 复制总长度改为下一 series 的 `ChunkMeta.offset` 或 segment entry 覆盖范围，并使用 int64 推进；`Handle -> readUnordered -> merge -> columnWriter` 保持现状。
 - `engine/immutable/stream_downsample.go`:`StreamWriteFile.WriteMeta` 的 `ChunkMeta.size` 输出维持现状。
-- `engine/immutable/unordered_reader.go`:为 `ReadTimes` / `Read` 增加 `rowsLimit` 和 `hasMoreWithinRange`；先从全局 unordered times 截取最多 `rowsLimit` 行，再以本批最后时间点限制每个 source reader，避免按任意大的原始 `maxTime` 聚合完整 String 列。
-- `engine/immutable/column_iterator.go`:保持 ordered 数据按 segment 回调，不修改读取与回调流程。
 
 ### 查询
 

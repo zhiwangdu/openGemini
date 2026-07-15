@@ -12,13 +12,14 @@
 
 第二步只增加运行治理，不重写第一步的数据正确性方案。以下能力必须继续遵守:
 
-- `ColVal.Offset` 仍由 mutation 前预算、bounded append，以及 segment 或 `maxTime + rowsLimit` 有界读取保护；snapshot 写出前校验 `Record` 并保留现有 rowsLimit / segment 行数切分，不增加 bytes 驱动的切分；stream compact 保持既有 rows 边界，stream merge 保留既有 merge / `columnWriter` 流程，并限制每批 unordered 最多 1000 行。
+- `ColVal.Offset` 在本方案覆盖范围内由 mutation 前预算、bounded append 或既有 segment 边界保护；snapshot 写出前校验 `Record` 并保留现有 rowsLimit / segment 行数切分，stream compact 保持既有 rows 边界。
+- stream merge 的 unordered 时间范围读取可能构造超过 4GiB 的 `ColVal`，但不属于本方案第一步或第二步的改造范围，由单独的乱序合并优化处理；本方案只修复 `WriteOriginal` 的截断复制。
 - `ChunkMeta.size` 线格式保持 uint32；读、compact、merge 继续把源值视为不可信元数据。
 
 进入第二步开发前，第一步至少满足以下条件:
 
 1. 第一步文档“必须随版本交付”的代码与正确性测试全部完成。
-2. 低阈值下的 String field 预算、snapshot 写出前校验、非流式 compact/merge 降级和读侧 fallback 均已验证；低阈值不改变 snapshot、stream compact 或 stream merge 的既有输出切分边界，stream merge 只验证当前 ordered segment 范围和剩余 unordered 的 `rowsLimit` 批读边界。
+2. 低阈值下的 String field 预算、snapshot 写出前校验、非流式 compact/merge 降级、读侧 fallback 和 `WriteOriginal` 完整复制均已验证；低阈值不改变 snapshot 或 stream compact 的既有输出切分边界。
 3. 每个拟新增开关都有明确的作用域、默认值、观测指标、回滚风险和配置一致性要求。
 
 ---
@@ -36,7 +37,7 @@
 | `enable_writeoriginal_range_copy` | 开 | `WriteOriginal` 使用后继 `ChunkMeta` offset（对应下一 series）或 segment entry 覆盖范围复制，不依赖源 `meta.size` | 关闭后回到旧复制长度逻辑，可能复制截断数据 |
 | `enable_var_col_budget` | 开 | 写入与非流式 record merge 使用 String field bytes 预算，避免无界累积形成超阈值 `ColVal`；不作用于 snapshot、stream compact/merge 的输出切分 | 仅允许紧急、短时关闭；关闭会重新允许制造坏 offset，必须持续告警并限制流量 |
 
-snapshot 写出前的 `ValidateRecord`、stream compact 的 row-only segment 边界和 stream merge 的 unordered `rowsLimit` 都属于第一步正确性不变量，不设置运行时开关。第二步不能关闭这些校验或限制，也不能回滚到按当前 segment 时间范围或 `math.MaxInt64` 一次读取全部匹配 unordered 的旧行为。
+snapshot 写出前的 `ValidateRecord` 和 stream compact 的 row-only segment 边界属于第一步正确性不变量，不设置运行时开关。stream merge unordered 读取本次不增加 rowsLimit，也不纳入第二步灰度。
 
 开关实现还必须满足:
 
@@ -48,7 +49,7 @@ snapshot 写出前的 `ValidateRecord`、stream compact 的 row-only segment 边
 
 1. 先放量读侧 fallback，观察查询 per-segment fallback 和 source chunk meta range 校验失败次数。
 2. 再按 shard 或租户放量 `enable_var_col_budget`，重点观察 `ErrNeedFlush`、`ErrValueTooLarge`、写入延迟和写失败率。
-3. 后台任务按类型放量非流式 compact/merge fastmode 降级到按 segment 或 `maxTime + rowsLimit` 分批读取的 streamMode 路径；snapshot 不参与 bytes 切分灰度。
+3. 后台任务按类型放量非流式 compact/merge fastmode 降级到现有 streamMode 路径；snapshot 不参与 bytes 切分灰度，stream merge unordered 读取优化也不在本步骤放量。
 4. `enable_writeoriginal_range_copy` 随后台任务一起放量，重点观察下一 series 的 `ChunkMeta.offset` / segment entry range 复制次数、fast-copy 禁用次数和新文件校验结果。
 
 ### 回滚策略
@@ -56,7 +57,7 @@ snapshot 写出前的 `ValidateRecord`、stream compact 的 row-only segment 边
 - 优先回滚具体开关，不做数据格式迁移。
 - 读侧 fallback 带来不可接受的查询延迟时，可关闭 `enable_chunkmeta_size_fallback`，但必须接受旧路径仍可能 decode 失败或读到截断数据，并保留告警。
 - 写入预算出现误判时，可在限制写流量和持续告警的前提下短时关闭 `enable_var_col_budget`；优先修正预算逻辑后重新开启，不把关闭状态作为长期配置。
-- 非流式降级资源开销过高时可关闭 `enable_nonstream_degrade_stream` 并限制 compact/merge 并发。snapshot 的写出前校验和 stream merge 的 unordered `rowsLimit` 不可关闭；资源异常时只能限并发或暂停相关任务，不能绕过校验或回到单次全量 time-range 读取。
+- 非流式降级资源开销过高时可关闭 `enable_nonstream_degrade_stream` 并限制 compact/merge 并发。snapshot 的写出前校验不可关闭；资源异常时只能限并发或暂停相关任务，不能绕过校验。
 
 ### 监控
 
@@ -68,14 +69,13 @@ snapshot 写出前的 `ValidateRecord`、stream compact 的 row-only segment 边
 - 非流式 compact/merge 降级 streamMode 次数。
 - `WriteOriginal` 使用下一 series 的 `ChunkMeta.offset` / segment entry range 复制次数及 fast-copy 禁用次数。
 - snapshot 写出前 `ValidateRecord` 失败次数。
-- stream merge unordered 批次数、每批行数、`hasMoreWithinRange` 为 true 的次数、单批触达的 source segment/file 数，以及 rowsLimit invariant 失败次数；不监控 bytes 阈值提前 split/flush。
 
 ---
 
 ## 三、总体决策摘要
 
 - 开发分两步:第一步直接交付强制安全修复，不实现灰度能力；第二步才增加开关、分批放量、运行监控和开关式回滚。
-- 主线保护 `ColVal.Offset`，通过 mutation 前预算、bounded append，以及 stream segment 或 `maxTime + rowsLimit` 有界读取避免构造超阈值 String field `ColVal`；snapshot 只在写出前校验输入，不增加 bytes 驱动的切分。
+- 主线保护 `ColVal.Offset`，通过 mutation 前预算、bounded append 和既有 segment 边界避免在本方案覆盖路径中构造超阈值 String field `ColVal`；snapshot 只在写出前校验输入，不增加 bytes 驱动的切分。
 - 写入路径的 P0 聚焦 memtable `ColVal` 整批预算。预算失败发生在任何字段 append 前，通过 rotate/flush/retry 或拒写处理，不实现 mutation 回滚。
 - `ChunkMeta.size` 不作为输出侧保护目标。compact/merge 等流程输出维持现状，允许 uint32 回绕继续存在。
 - 后续流程必须把源 `ChunkMeta.size` 当作不可信元数据。整 chunk 读、非流式 compact/merge、查询预读、`WriteOriginal` 都需要校验或绕开对它的依赖。
@@ -83,5 +83,5 @@ snapshot 写出前的 `ValidateRecord`、stream compact 的 row-only segment 边
 - `WriteOriginal` 不能再用 `meta.size` 作为复制长度；当前 `ChunkMeta` 后面存在另一个 series 的 `ChunkMeta` 时使用二者 offset 差值，当前 `ChunkMeta` 位于文件物理顺序末尾时使用 segment entry 推导真实覆盖范围。
 - 查询路径中 `defaultIoSize` 整 chunk 预读失败时，降级为按 segment 依次读取。
 - stream compact 保持现有 row-only `continueMerge` 和按 1000 行 `writeSegment` 的行为；在 `max-line-size<=1MiB` 的配置前提下，输出 segment 和临时合并对象均低于 uint32 边界，本次及第二步均不为其增加 rows + bytes 条件或提前 `writeSegment` 开关。
-- stream merge 不在 `columnWriter` 增加 rows + bytes 条件，也不改变现有 `Handle -> readUnordered -> merge -> columnWriter` 流程。它只给 `ReadTimes` / `Read` 增加 `rowsLimit`：按 ordered 当前 segment 的 `maxOrderTime` 读取，以及最后用 `math.MaxInt64` 排空剩余 unordered 时，每批最多 1000 行并循环处理；该限制属于第一步正确性实现，不设置可关闭的灰度开关。
+- stream merge 的 unordered 读取只有时间边界，可能构造超过 4GiB 的 `ColVal`；本方案不修改 `ReadTimes` / `Read`、`readUnordered` 或 `columnWriter`，该风险转入单独的乱序合并优化。本方案在 stream merge 中只修复 `WriteOriginal` 的截断复制。
 - 即使输出 `ChunkMeta.size` 将错就错，writer 内部 offset 推进仍必须使用真实写入大小，不能依赖已回绕的 `chunkMeta.size`。
