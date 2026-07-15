@@ -13,23 +13,52 @@
 
 ## 一、范围与前提
 
-只考虑 TSStore（ts）路径。ColumnStore（cs）、colstore compact、detached primary key/data/index 等路径不在本方案范围内。
+**主线：防止 TSStore 持久化 String field 的 `ColVal.Offset` 在跨 record、segment 累积时溢出。**
 
-明确前提:
+**配套：把回绕的 `ChunkMeta.size` 视为不可信元数据；不修改其他存储引擎和线格式。**
 
-1. 本次不修改 stream compact 的 segment 合并/切分策略。调研确认当前边界足以排除单 segment 超过 4GiB:
-   - `util.DefaultMaxRowsPerSegment4TsStore` 为 1000，`max-rows-per-segment` 按当前运行配置保持 1000。`continueMerge` 只在当前 `c.col.Len < maxRowsPerSegment` 时跨输入继续合并；追加下一个最多 1000 行的源 segment 后，`splitColumn` 会立即按 1000 行切分，因此输出 segment 最多 1000 行，临时 `c.col` 严格少于 2000 行。
-   - HTTP 行协议由 `max-line-size` 限制完整单行长度。代码默认值为 1MiB，仓库示例配置为 64KiB；String field 解码只去除引号/转义，其单列值字节数不会大于所在行的输入字节数。
-   - 即使按 1MiB 上限估算，1000 行输出 segment 的单个 String field `ColVal.Val` 不超过约 1000MiB，临时合并对象低于约 2000MiB，均小于 uint32 的 4GiB 表示边界。因此本次不为 stream compact 增加 rows + bytes 条件，也不在 bytes 达阈值时提前 `writeSegment`。
-   - 该结论以 `max-rows-per-segment=1000`、`max-line-size<=1MiB` 且数据经过行协议限制为配置前提。未来若提高任一上限或引入绕过该限制的写入入口，应单独增加配置组合校验或重新评估 stream compact；不纳入本次修改。
-2. stream merge 的最终输出同样不需要 rows + bytes 切分，但按 ordered 当前 segment 时间范围读取 unordered、以及最后一次读取剩余全部 unordered 时，单次 `Read(maxTime)` 可能覆盖多个 segment。本方案不改变现有 `Handle -> readUnordered -> merge -> columnWriter` 主流程，只给 time range 读取增加 `rowsLimit`，默认每批最多 1000 行并循环处理；不改写 `columnWriter`，也不引入 `MaxVarColValBytes` 驱动的输出切分。
-3. `decodeColumnData` / `DecodeStringBlock` / `unpackStringV1/V2` 收到的是 segment 级编码块。在上述前提下，它不是本次跨 segment 累积溢出的主修点。
-4. TSStore 时序写入路径中，tag 不作为数据列 append 到持久化 `Record.ColVals`。`tsMemTableImpl.WriteRows` 只把 `row.Fields` 传给 `appendFields` / `AppendFieldsToRecord`；tag 通过 series key / `tagSets` 参与 series 定位、过滤和结果附加信息。
-5. 查询侧按 series 迭代数据。`shard.createGroupCursors` 接收 `tagSets` 创建 group / series cursor，`seriesCursor.ReInit` 将 `TagSetItem.TagsVec` 放入 `seriesInfo`，tag filter 从 `PointTags` 取值，不依赖 TSSP 数据列。
-6. 查询结果中的 aux tag 可在 `tagSetCursor.TagAuxHandler` 中 append 到结果 `Record`，但它不是 TSStore 落盘、snapshot、compact、merge 的数据路径，不作为本方案主保护对象。
-7. 不支持单个 String field 值超过产品写入上限。超限单值应在 memtable mutation 前拒写。
-8. 线格式保持不变。`ColVal.Offset`、TSSP string block offset/length、`Segment.size`、`ChunkMeta.size` 仍保持现有 uint32 表达。
-9. 不把 `ColVal.Offset` 改成 uint64。`ColVal` 是共享核心结构，改类型会扩大到大量读写边界；本方案采用 bounded append、segment/rowsLimit 有界处理和流程降级控制风险。
+### 1. 修复范围
+
+**仅覆盖 TSStore（ts）的写入、落盘、compact、merge 和读取链路。**
+
+- 包含 memtable append、snapshot/flush、非流式 compact/merge、stream compact、stream merge 和查询读取。
+- ColumnStore（cs）、colstore compact、detached primary key/data/index 等路径不在本方案范围内。
+
+### 2. 保护对象
+
+**主保护对象是持久化 String field 的 `ColVal.Offset`；tag 和查询结果中的 aux tag 不纳入主线。**
+
+- `tsMemTableImpl.WriteRows` 只把 `row.Fields` 传给 `appendFields` / `AppendFieldsToRecord`；tag 通过 series key / `tagSets` 参与 series 定位和过滤，不作为数据列 append 到持久化 `Record.ColVals`。
+- 查询侧按 series 迭代数据，tag filter 从 `PointTags` 取值，不依赖 TSSP 数据列。`TagAuxHandler` 虽可把 aux tag append 到查询结果 `Record`，但它不属于 TSStore 落盘、snapshot、compact 或 merge 路径。
+- 单个 String field 值仍受产品写入上限约束；单值超限时必须在 memtable mutation 前拒写。
+
+### 3. 单 segment 边界
+
+**当前配置已经保证单个合法 segment 及 stream compact 临时对象低于 uint32 边界，真正需要处理的是跨 record、segment 的无界累积。**
+
+- `util.DefaultMaxRowsPerSegment4TsStore` 为 1000，当前 `max-rows-per-segment` 保持 1000。
+- HTTP 行协议完整单行受 `max-line-size` 限制：代码默认值为 1MiB，仓库示例配置为 64KiB。String field 解码只去除引号和转义，单列值字节数不会大于所在输入行。
+- `continueMerge` 仅在当前 `c.col.Len < maxRowsPerSegment` 时跨输入合并；追加下一个最多 1000 行的源 segment 后，`splitColumn` 立即按 1000 行切分。因此输出 segment 最多 1000 行，临时 `c.col` 严格少于 2000 行。
+- 按 `max-line-size=1MiB` 保守估算，输出 segment 的单个 String field `ColVal.Val` 不超过约 1000MiB，stream compact 临时对象低于约 2000MiB，均小于 uint32 的 4GiB 表示边界。
+- `decodeColumnData` / `DecodeStringBlock` / `unpackStringV1/V2` 接收的是 segment 级编码块。在上述边界成立时，它们不是本次跨 segment 累积溢出的主修点。
+
+该结论以 `max-rows-per-segment=1000`、`max-line-size<=1MiB` 且数据经过行协议限制为前提。未来提高任一上限或引入绕过该限制的写入入口时，必须重新评估；本次不增加配置组合校验。
+
+### 4. Stream 路径处理原则
+
+**stream compact 保持现状；stream merge 只限制单次 unordered 读取行数，不改写现有 merge 和写出流程。**
+
+- stream compact 不增加 rows + bytes 条件，也不在 bytes 达阈值时提前 `writeSegment`。
+- stream merge 的 ordered 输入按 segment 有界，但 `Read(maxTime)` 可能在当前 ordered segment 时间范围内命中多个 unordered segment；`lastSeries && lastSeg` 时还可能通过 `math.MaxInt64` 一次读取剩余全部 unordered。
+- stream merge 保留 `Handle -> readUnordered -> merge -> columnWriter`，只给 time range 读取增加 `rowsLimit`。默认取 `maxRowsPerSegment=1000`，按批循环消费；不改 `columnWriter`，也不增加 `MaxVarColValBytes` 驱动的输出切分。
+
+### 5. 格式与类型选择
+
+**保持现有 uint32 线格式，不把 `ColVal.Offset` 改成 uint64。**
+
+- `ColVal.Offset`、TSSP string block offset/length、`Segment.size` 和 `ChunkMeta.size` 继续使用现有 uint32 表达。
+- `ColVal` 是共享核心结构，改为 uint64 会扩大到大量内存结构、编解码和读写边界，超出本次修复范围。
+- 本方案通过 mutation 前预算、bounded append、segment/rowsLimit 有界处理和流程降级控制风险；源 `ChunkMeta.size` 在读、compact、merge 侧按不可信元数据处理。
 
 ---
 
@@ -42,9 +71,9 @@
 | 维度 | 对应字段 | 含义 | 本方案定位 |
 |------|----------|------|------------|
 | 单列变长数据大小 | `ColVal.Offset` | String field 单列的 `ColVal.Val` 字节大小；`Offset` 记录每个值在该列 `Val` 中的位置 | 主保护对象，通过 append 前预算或 segment/time+rowsLimit 有界处理避免回绕 |
-| 单 chunk 数据大小 | `ChunkMeta.size` | 一个 `ChunkMeta` 描述的 chunk data 区大小，包含同一 series chunk 内 time 列和各 field 列的 segment 数据 | 输出侧维持现状；读、compact、merge 侧把它视为不可信元数据 |
+| 单 series、单文件 chunk 数据大小 | `ChunkMeta.size` | 一个 `ChunkMeta` 描述的 chunk data 区大小，包含该 series 在当前 TSSP 文件内的 time 列和各 field 列 segment 数据 | 输出侧维持现状；读、compact、merge 侧把它视为不可信元数据 |
 
-在当前 TSStore TSSP 组织下，一个 `ChunkMeta` 对应一个 series 在一个 TSSP 文件中的一个 chunk data 区，通常可理解为该 series 在该文件内的数据块。若未来同一 series 在同一文件内被拆成多个 chunk meta，本维度仍按“单 chunk”计算，而不是按全文件或全 measurement 计算。
+在当前 TSStore TSSP 组织下，同一 series 在一个 TSSP 文件内只对应一个 `ChunkMeta`，不会拆分成多个 `ChunkMeta`。该 `ChunkMeta` 描述该 series 在当前文件内的完整 chunk data 区；因此这里的大小维度是“单 series、单文件”，不是全文件或全 measurement。
 
 这两个维度不能相互替代:`ChunkMeta.size` 描述的是落盘后的 chunk data 字节范围，通常是压缩/编码后的数据；`ColVal.Offset` 描述的是 decode 后单列 `ColVal.Val` 内部的偏移。即使 `ChunkMeta.size` 看起来可信，decode 后的 String field `ColVal.Offset` 仍可能越界，必须单独校验。
 
@@ -63,20 +92,20 @@
 
 ### 2. `ChunkMeta.size` 策略:输出将错就错，读侧不可信
 
-`ChunkMeta.size` 是 uint32，表示一个 series chunk 的 data 区总长度。当前依赖点不多，本方案不把它作为输出侧强保护目标:
+`ChunkMeta.size` 是 uint32，表示一个 series 在当前 TSSP 文件内唯一 chunk 的 data 区总长度。当前依赖点不多，本方案不把它作为输出侧强保护目标:
 
 - compact / merge 等后台流程写新文件时，`ChunkMeta.size` 维持现状，仍可能按 uint32 回绕写入。
-- 不引入 `MaxChunkDataBytes` 作为必须切分新 chunk 的硬约束。
+- 不引入 `MaxChunkDataBytes`，也不按 bytes 将同一 series 在同一文件内拆成多个 `ChunkMeta`。
 - 但所有后续流程不得无条件相信源 `ChunkMeta.size` 是真实 chunk data 长度。
 
 判断源 `ChunkMeta.size` 是否可信时，先计算不依赖 `cm.size` 的 `expectedChunkDataSize`。实际落地可按场景选择算法:
 
-1. 相邻 chunk offset 差值:
-   - 若能拿到同一文件中下一个 chunk meta，使用 `nextChunkMeta.offset - currentChunkMeta.offset`。
-   - 该方式能直接得到当前 chunk data 到下一个 chunk data 起点之间的真实跨度，适合 chunk meta 顺序完整、相邻 chunk 可访问的场景。
+1. 后继 `ChunkMeta` offset 差值:
+   - 若当前 `ChunkMeta` 不是文件物理顺序中的最后一个 `ChunkMeta`，使用 `nextChunkMeta.offset - currentChunkMeta.offset`。
+   - `nextChunkMeta` 必然属于同一文件中的另一个 series，不是当前 series 的第二个 chunk。该差值表示当前 series 的 chunk data 起点到下一 series 的 chunk data 起点之间的真实跨度。
 2. segment entry 覆盖范围:
    - 使用 `max(entry.offset + entry.size) - cm.offset`。
-   - 该方式不依赖下一个 chunk meta，适合单 chunk 校验、最后一个 chunk、或只拿到当前 chunk meta 的场景。
+   - 该方式不依赖后继 `ChunkMeta`，适合当前 `ChunkMeta` 位于文件物理顺序末尾，或调用方只能取得当前 `ChunkMeta` 的场景。
 
 若 `expectedChunkDataSize > int64(cm.size)`，说明源 `ChunkMeta.size` 已截断、回绕或元数据损坏。此时:
 
@@ -86,7 +115,7 @@
 
 ### 3. 重要约束:writer 内部 offset 不能依赖回绕 size
 
-虽然输出的 `ChunkMeta.size` 可以将错就错，但 writer 内部推进 offset 不能依赖已回绕的 `chunkMeta.size`。否则会把后续 chunk 的 `offset` 写错，问题就不再只是 size metadata 不准，而是文件布局损坏。
+虽然输出的 `ChunkMeta.size` 可以将错就错，但 writer 内部推进 offset 不能依赖已回绕的 `chunkMeta.size`。否则会把文件中后续 series 的 `ChunkMeta.offset` 写错，问题就不再只是 size metadata 不准，而是文件布局损坏。
 
 因此:
 
@@ -104,7 +133,7 @@
 | snapshot / flush | memtable record -> `MsBuilder` -> TSSP chunk | 只按 rows 切分不足以约束 String field bytes；内部 `dataOffset` 不能依赖回绕的 `chunkMeta.size` | rows + var-bytes 切分；offset 用真实写入大小推进 |
 | 非流式 compact / merge fastmode | chunk 整块读取 -> decodeRecord -> record merge -> 写新文件 | 整 chunk 读取依赖源 `ChunkMeta.size`；decode 后 `ColVal.Offset` 仍可能越界；record merge 会继续累积 `ColVal` | 源 size 不可信或 decode 后 offset 越界时降级 streamMode；merge 使用 bounded append |
 | stream compact | segment 读取 -> compactColumn -> writeSegment -> writeMeta | 源读按 segment 安全；当前 rows 上限与 `max-line-size` 组合已保证输出 segment 和临时合并对象低于 uint32 边界 | 保持 row-only 合并与现有 `writeSegment` 时机；输出 `ChunkMeta.size` 维持现状 |
-| stream merge | ordered/unordered segment merge 或 `WriteOriginal` fast-copy | ordered 输入按 segment 有界，但按当前 segment 时间范围或 `math.MaxInt64` 读取 unordered 时可一次聚合多个 segment；`WriteOriginal` 当前信任源 `meta.size` | 保留现有 merge / `columnWriter` 流程；unordered time range 读取增加最多 1000 行的 `rowsLimit` 并循环消费；fast-copy 长度改用 next chunk offset 或 segment entry 覆盖范围 |
+| stream merge | ordered/unordered segment merge 或 `WriteOriginal` fast-copy | ordered 输入按 segment 有界，但按当前 segment 时间范围或 `math.MaxInt64` 读取 unordered 时可一次聚合多个 segment；`WriteOriginal` 当前信任源 `meta.size` | 保留现有 merge / `columnWriter` 流程；unordered time range 读取增加最多 1000 行的 `rowsLimit` 并循环消费；fast-copy 长度改用后继 `ChunkMeta` offset（对应下一 series）或 segment entry 覆盖范围 |
 | 查询 | chunk meta -> segment data -> decode | `defaultIoSize` 整 chunk 预读依赖 `cm.size`；历史坏 offset 不能 panic | 预读失败/校验不通过时降级按 segment 读；fail-closed |
 
 ---
@@ -134,9 +163,9 @@
 
 ### 2. 源 chunk size 校验
 
-新增 `ValidateChunkMetaDataRange(cm *ChunkMeta, next *ChunkMeta, fileDataSize int64) (expectedSize int64, err error)`:
+新增 `ValidateChunkMetaDataRange(cm *ChunkMeta, next *ChunkMeta, fileDataSize int64) (expectedSize int64, err error)`。`next` 表示同一 TSSP 文件物理顺序中的下一个 `ChunkMeta`，必然对应另一个 series；`cm` 是文件内最后一个 `ChunkMeta` 时传 `nil`:
 
-- 优先在可取得 `next` 时使用 `next.offset - cm.offset` 计算 expected size。
+- 存在 `next` 时，优先使用 `next.offset - cm.offset` 计算 expected size。
 - 没有 `next` 或需要校验 segment 覆盖范围时，遍历所有 column/time segment entry。
 - segment entry 算法需要校验 `entry.offset >= cm.offset`。
 - 校验 `entry.offset + int64(entry.size)` 不溢出且不超过文件 data 区。
@@ -181,13 +210,13 @@
 1. snapshot 写出前使用 `SplitByRowsAndVarBytes`:
    - 按 rows 和 String field bytes 双条件切分。
    - 不再把超阈值 record 交给 builder。
-2. `ChunkDataBuilder` 维持当前 `ChunkMeta.size uint32` 输出行为，不因为 chunk data 超 4GB 强制切 chunk。
+2. `ChunkDataBuilder` 保持“一个 series 在一个 TSSP 文件内只有一个 `ChunkMeta`”的现有组织方式和 `ChunkMeta.size uint32` 输出行为，不引入将同一 series 拆成多个 `ChunkMeta` 的新表示。
 3. `MsBuilder` 推进 `dataOffset` 时使用实际编码/写入字节数，例如 `len(encodeChunk)` 或 writer 实际 `DataSize` 差值，而不是 `chunkBuilder.chunkMeta.size`。
 
 #### 验收点
 
 - 低 `MaxVarColValBytes` 下，snapshot 会切成多个 bounded record。
-- 构造 chunk data size 回绕场景时，后续 chunk offset 仍按真实写入位置推进。
+- 构造 chunk data size 回绕场景时，文件中后续 series 的 `ChunkMeta.offset` 仍按真实写入位置推进。
 - 输出 `ChunkMeta.size` 可以保持 uint32 回绕，不作为本方案失败条件。
 
 ### 3. 非流式 compact / merge fastmode
@@ -210,7 +239,7 @@
 
 #### 验收点
 
-- 源 `ChunkMeta.size` 小于 expected size（由 next chunk offset 或 segment entry 计算）时，非流式 compact / merge 降级 streamMode。
+- 源 `ChunkMeta.size` 小于 expected size（由下一 series 的 `ChunkMeta.offset` 或 segment entry 计算）时，非流式 compact / merge 降级 streamMode。
 - 整 chunk 读取后 decode 出的 String field `ColVal.Offset` 越界时，非流式 compact / merge 降级 streamMode。
 - 降级后不发生 `columnData` slice panic。
 - 非流式 record merge 超过低阈值时，输出多个 bounded record。
@@ -296,7 +325,7 @@
    - 各 field 在 `ColumnChanged` 后从相同 unordered time offset 开始，基于相同 `maxTime + rowsLimit` 规则得到相同批次边界；nil bitmap、行数和 time 列继续对齐。
    - rowsLimit 只限制内存中的单次读取/归并，不改变 TSSP 线格式，也不成为用户可配置的 segment 规则。
 6. `WriteOriginal` 不再依赖源 `meta.size`:
-   - 按场景使用 `nextChunkMeta.offset - meta.offset` 或 segment entry 覆盖范围计算 `expectedChunkDataSize`。
+   - 当前 `ChunkMeta` 后面存在另一个 series 的 `nextChunkMeta` 时，使用 `nextChunkMeta.offset - meta.offset`；当前 `ChunkMeta` 位于文件物理顺序末尾时，使用 segment entry 覆盖范围计算 `expectedChunkDataSize`。
    - fast-copy 复制范围使用 `[meta.offset, meta.offset + expectedChunkDataSize)`。
    - 分块读取时每次仍可用较小 uint32 buffer size，但循环总长度用 int64。
    - 平移 segment offset 后写新 meta；新 `ChunkMeta.size` 仍维持当前 uint32 输出行为。
@@ -361,7 +390,7 @@ Handle(ordered current segment)
 | `tsspFileReader.ReadData` 的 `validate(cm.offset, cm.size)` | 是，但只做文件范围粗校验 | 不能作为 size 正确性的证明；后续仍需整 chunk 预读 fallback 或 segment range 校验 |
 | `tsspFileReader.ReadData` 的 `cm.size < defaultIoSize` | 是，决定是否整 chunk 预读 | 预读失败、range check 失败或 decode 失败时，降级 per-segment read |
 | `ChunkIterator.readRecord` | 是，非流式 compact 读整 chunk | 入口 size 校验失败，或整 chunk decode 后 `ColVal.Offset` 越界时降级 streamMode |
-| `mergePerformer.WriteOriginal` | 当前依赖，风险最高 | 改为按 next chunk offset 或 segment entry 覆盖范围复制，不使用源 `meta.size` |
+| `mergePerformer.WriteOriginal` | 当前依赖，风险最高 | 改为按下一 series 的 `ChunkMeta.offset` 或 segment entry 覆盖范围复制，不使用源 `meta.size` |
 | stream compact 读取源数据 | 否，按 segment offset/size 读取 | 不需要因源 `ChunkMeta.size` 回绕改读取逻辑 |
 | unordered reader / SegmentReader | 否，按 segment offset/size 读取 | 不需要因源 `ChunkMeta.size` 回绕改读取逻辑 |
 | first/last/min/max 等预聚合读取 | 基本不依赖，按目标 segment 读取 | 保持按 segment 读取；遇到 decode 错误 fail-closed |
@@ -377,10 +406,10 @@ Handle(ordered current segment)
 
 ### 必须随版本交付
 
-- 新增 `ValidateChunkMetaDataRange`，支持用 next chunk offset 或 segment entry 覆盖范围判断源 `ChunkMeta.size` 是否可信。
+- 新增 `ValidateChunkMetaDataRange`，支持用后继 `ChunkMeta` offset（对应下一 series）或 segment entry 覆盖范围判断源 `ChunkMeta.size` 是否可信。
 - 查询整 chunk 预读失败或校验不通过时，降级到 per-segment read。
 - 非流式 compact / merge fastmode 发现源 `ChunkMeta.size` 不可信，或整 chunk decode 后 `ColVal.Offset` 越界时，降级 streamMode。
-- `WriteOriginal` 复制长度改为依赖 next chunk offset 或 segment entry 覆盖范围，而不是源 `meta.size`。
+- `WriteOriginal` 复制长度改为依赖后继 `ChunkMeta` offset（对应下一 series）或 segment entry 覆盖范围，而不是源 `meta.size`。
 - `appendFields` 前按整次 shard batch 汇总 String field bytes 并校验单值；预算失败不产生部分 data mutation，也不做 mutation 回滚。
 - 单值超限拒写；追加会使 memtable `ColVal` 超阈值时返回 `ErrNeedFlush`，触发 snapshot/flush 后重试。
 - 引入 String field 判断、bounded append API 和 rows + var-bytes splitter。
@@ -401,11 +430,11 @@ Handle(ordered current segment)
 - 单值超过产品上限，验证不产生 memtable mutation。
 - 同一 batch 构造多个 series / String field，其中后处理字段预算失败，验证前面的字段也没有发生 mutation。
 - snapshot 只按行数不足以切开的场景，验证 rows + bytes splitter 生效。
-- 构造 `ChunkMeta.size` 回绕场景，验证 snapshot writer 内部后续 chunk offset 仍按真实写入大小推进。
+- 构造 `ChunkMeta.size` 回绕场景，验证 snapshot writer 内部后续 series 的 `ChunkMeta.offset` 仍按真实写入大小推进。
 
 ### `ChunkMeta.size` 读取降级
 
-- 构造 `ChunkMeta.size` 小于 expected size 的源 meta，分别覆盖 next chunk offset 和 segment entry 两种算法，验证非流式 compact / merge 降级 streamMode。
+- 构造 `ChunkMeta.size` 小于 expected size 的源 meta，分别覆盖后继 `ChunkMeta` offset 和 segment entry 两种算法；前者明确使用下一 series 的 `ChunkMeta`，验证非流式 compact / merge 降级 streamMode。
 - 构造 `ChunkMeta.size` 可信但 decode 后 String field `ColVal.Offset` 越界的整 chunk 数据，验证非流式 compact / merge fastmode 降级 streamMode。
 - 查询路径触发 `defaultIoSize` 整 chunk 预读但 decode/range check 失败时，验证降级 per-segment read。
 - segment entry 本身不可信时，验证查询/compact 返回 corrupt error，不 panic。
@@ -419,7 +448,7 @@ Handle(ordered current segment)
 - 最后一个 ordered segment 使用 `math.MaxInt64` 排空剩余 unordered 时同样按 1000 行循环读取，不一次构造剩余全部 String `ColVal`；unordered-only 字段按 `mergedTimes` 的连续 1000 行 range 处理。
 - 多个 unordered file 在批次边界存在相同 timestamp 时，验证同 timestamp 不跨批、覆盖优先级、nil bitmap、time/field segment 边界与改造前一致。
 - 低 `MaxVarColValBytes` 不改变 stream merge 的 `rowsLimit` 或最终 segment 边界，也不触发 bytes 阈值提前 flush/split。
-- 源 `meta.size` 回绕时，`WriteOriginal` 仍按 next chunk offset 或 segment entry 覆盖范围复制，不生成截断新文件。
+- 源 `meta.size` 回绕时，`WriteOriginal` 仍按下一 series 的 `ChunkMeta.offset` 或 segment entry 覆盖范围复制，不生成截断新文件。
 
 ### 兼容性
 
@@ -446,7 +475,7 @@ Handle(ordered current segment)
 ### Snapshot / flush
 
 - `engine/immutable/msbuilder.go`:写 record 前按 rows + var-bytes 切分；`dataOffset` 用真实写入大小推进。
-- `engine/immutable/chunkdata_builder_ts.go`:保留 `ChunkMeta.size uint32` 输出现状，不新增 chunk byte cap。
+- `engine/immutable/chunkdata_builder_ts.go`:保留“一个 series、一个文件、一个 `ChunkMeta`”及 `ChunkMeta.size uint32` 的输出现状，不新增多 `ChunkMeta` 表示或 chunk byte cap。
 - `engine/immutable/column_builder.go`:保留 segment 写前断言。
 
 ### Compact
@@ -457,7 +486,7 @@ Handle(ordered current segment)
 
 ### Merge
 
-- `engine/immutable/merge_performer.go`:保留现有按 ordered segment 回调及 `merge -> columnWriter` 写出流程；在当前 segment 的 `maxOrderTime` 和最后排空用的 `math.MaxInt64` 范围内，循环读取最多 `maxRowsPerSegment` 行 unordered，并按本批最后时间点切分 ordered range；`WriteOriginal` 复制长度改用 next chunk offset 或 segment entry 覆盖范围，不依赖源 `meta.size`。
+- `engine/immutable/merge_performer.go`:保留现有按 ordered segment 回调及 `merge -> columnWriter` 写出流程；在当前 segment 的 `maxOrderTime` 和最后排空用的 `math.MaxInt64` 范围内，循环读取最多 `maxRowsPerSegment` 行 unordered，并按本批最后时间点切分 ordered range；`WriteOriginal` 复制长度改用下一 series 的 `ChunkMeta.offset` 或 segment entry 覆盖范围，不依赖源 `meta.size`。
 - `engine/immutable/stream_downsample.go`:`StreamWriteFile.WriteMeta` 的 `ChunkMeta.size` 输出维持现状。
 - `engine/immutable/unordered_reader.go`:为 `ReadTimes` / `Read` 增加 `rowsLimit` 和 `hasMoreWithinRange`；先从全局 unordered times 截取最多 `rowsLimit` 行，再以本批最后时间点限制每个 source reader，避免按任意大的原始 `maxTime` 聚合完整 String 列。
 - `engine/immutable/column_iterator.go`:保持 ordered 数据按 segment 回调，不修改读取与回调流程。
