@@ -53,21 +53,68 @@
 - `MaxVarColValBytes`:默认 256MiB，可配置到 512MiB。
 - 测试阈值:支持 1KiB / 64KiB 等小阈值，用于验证 flush、split、降级和 fail-closed 行为。
 
-### 2. HTTP batch 与 WAL record 边界
+### 2. HTTP batch、WAL record 与大点性能边界
 
 普通行协议写入并不是“一个 HTTP request 对应一个 WAL record”。实际链路是:
 
 ```text
 HTTP request
-  -> N 个 ReadBlockSize parser batch
+  -> N 个按完整行对齐的 ReadBlockSize parser batch
+  -> 全局 worker 并发执行各 batch 的解析和完整写入，不跨 batch 合并
   -> 每个 parser batch 按 shard 拆分
-  -> 每个目标 shard 生成最终 binaryRows
-  -> 每个目标 owner / retry attempt 调用 shard.WriteRows
+  -> 每个 (parser batch, shard, owner / retry attempt) 生成 binaryRows 并调用 Store.WriteRows
   -> 正常 TSStore、WAL enabled、非 Shelf 路径的一次成功 attempt
   -> 一个 WAL physical record
 ```
 
-默认配置下，`ReadBlockSize` 为 64KiB、`MaxLineSize` 为 1MiB；非 gzip、正常受 `max-body-size` 限制的 HTTP wire body 默认上限为 25MB。决定普通 `/write` 单个 parser batch 大小的主要是前两个分块参数，因此正常路径形成的单个 shard batch 与 WAL record 远小于 uint32 上限，WAL record 长度不是本问题的主 P0。
+#### 分块与并发语义
+
+`ReadBlockSize` 是目标 buffer 大小，不是严格的 parser batch 字节上限，也不会把一个点从中间切开。`ReadLinesBlockExt` 会退到最后一个换行，把未完成行复制到 `tailBuf` 并带到下一批；当前 buffer 内没有换行时会倍增扩容，直到读到完整行或触发 `MaxLineSize`。复用 buffer 的 capacity 已经大于 `ReadBlockSize` 时也不会主动缩回，因此不能把 64KiB 当作 WAL payload 的形式化硬上限。
+
+`serveWrite` 每读出一个完整行块就创建独立 `UnmarshalWork`。全局 worker 数为 `P = cpu.GetCpuNum()`，队列容量为 `2P`；队列满后 `ScheduleUnmarshalWork` 阻塞并形成背压。worker 的 callback 同步执行完整 `RetryWritePointRows`，直到 shard / RPC / store / WAL 返回后才释放，因此这是端到端 parser batch 并发，不只是并行解析。不同 batch 之间没有 request 级或 shard 级 coalesce，完成顺序也不保证与 HTTP body 中的行顺序一致。
+
+每个 parser batch 内按 shard 聚合并并行写不同 shard；同一 shard 的 owners 顺序写入。严格的 store 写次数和 WAL record 数应按下式理解:
+
+```text
+parser batch 数 ~= ceil(pointCount / max(1, floor(effectiveBlockCapacity / averageLineBytes)))
+store write 数  = sum(distinctShards(each parser batch) * owners * attempts)
+WAL record 数   = 各 store 节点上成功执行到标准 TSStore s.wal.Write 的次数
+```
+
+其中 `effectiveBlockCapacity` 是本次读取实际复用或扩容后的 buffer capacity；在没有历史大 buffer 和超 `ReadBlockSize` 单行的常规场景中，可近似取配置的 `ReadBlockSize`。
+
+HTTP request 和 parser batch 都不是跨 shard / owner 的原子写入单元。不同 batch 并发还可能使同一 series 的时间戳按不同顺序进入 memtable；`WriteChunk.Mu` 会串行实际 append，但乱序到达可能把 `timeAsd` 置为 false，并在后续 flush 增加排序成本。
+
+#### 10KiB 大点量级
+
+默认配置下，`ReadBlockSize` 为 64KiB、`MaxLineSize` 为 1MiB；非 gzip、正常受 `max-body-size` 限制的 HTTP wire body 默认上限为 25MB。按平均每点 10KiB、每个 HTTP request 1000 点、普通复用 buffer capacity 等于配置值估算:
+
+| `ReadBlockSize` | 每个 parser batch 约含点数 | 单 shard / 单 owner 的 parser batch 与 WAL record 数 |
+|---|---:|---:|
+| 64KiB | 6 | 167 |
+| 512KiB | 51 | 20 |
+| 1MiB | 102 | 10 |
+
+64KiB 下若全部点落到同一 shard / owner，约产生 167 次路由、marshal、store write、Snappy encode、WAL header 和文件 `write`；若每个小 batch 命中多个 shard，次数按每批 distinct shard 数继续增加，理论上可接近每点一次 store write。该放大主要影响固定开销、锁竞争、RPC 和文件 syscall，不表示整体吞吐会随 batch 数等比例下降；解析、字符串复制、marshal、memtable append 和 Snappy 扫描等 O(总字节数) 工作仍然存在。
+
+不同部署还有额外差异:
+
+- 分离部署的 `ts-sql -> ts-store` 路径对每个 `(batch, shard, owner)` 执行一次 `FastMarshalMultiRows`、同步 RPC 和 store 端 `FastUnmarshalMultiRows`，小 batch 容易放大 RPC 固定成本。
+- 组合部署 `ts-server` 的非 stream `LocalStore` 路径当前先通过 `netstorage.MarshalRows` 调用一次 `FastMarshalMultiRows`，随后又覆盖同一 buffer 调用一次 `FastMarshalMultiRows`。它通常不是两份 binary buffer 同时常驻，但会对大 String field 做两次完整遍历和复制，是独立于拆批次数的 O(总字节数) 热点。
+- 同一 series 的 append 最终受 `WriteChunk.Mu` 串行，parser batch 并发不能消除这部分串行成本，反而可能引入竞争和乱序 flush 排序。
+
+一个 WAL physical record 不等于一次同步刷盘。每个 record 都会独立 Snappy 编码并调用一次底层文件 `Write`；默认 `wal-sync-interval = 100ms` 时，同一 WAL partition 在窗口内的多个 record 由后台 sync 合并，并非每 record 一次 `fsync`。只有 interval 配置为 `0` 时才逐 record 同步，此时 64KiB 小 batch 的性能放大会显著加重。
+
+因此，默认 HTTP 路径形成的单个 shard batch 与 WAL record 通常仍远小于 uint32 上限，WAL record 长度不是本问题的主 P0；但“64KiB 小 block”只能作为常见运行行为，不能作为安全证明，也不能忽略 10KiB 级大点下的小批写放大。
+
+#### 性能取舍与本方案边界
+
+本次 uint32 溢出修复不自动增大默认 `ReadBlockSize`，也不在 shard / WAL 层动态合并或拆分在线 batch，避免把安全修复扩大成写入调度与错误语义重构。性能侧采用以下约束:
+
+- 以 64KiB、256KiB、512KiB、1MiB 做真实大点 A/B 压测；512KiB 和 1MiB 作为优先候选，不在无数据支撑时直接修改默认值。
+- 调大 `ReadBlockSize` 会降低路由、RPC 和 WAL record 数，但并发内存近似按 `O(P * ReadBlockSize)` 增长。考虑运行中、队列内 raw block 以及 active binaryRows / Snappy buffer，活跃流水线可粗略按 `5P * ReadBlockSize` 评估，pool 高水位和阻塞 HTTP handler 还会额外保留 buffer。
+- 若大点会分散到多个 shard，仅增大 parser block 仍可能形成很小的 per-shard batch。长期优化应把 parser 读取块与 storage 写批次解耦，按 shard 和目标字节数聚合，并单独设计内存上限、等待时间、部分成功和重试语义。
+- 组合部署应单独评估并消除普通 `LocalStore` 路径的重复 marshal；该优化不改变 WAL 格式或本方案的长度校验边界。
 
 但 `ReadBlockSize` 不是覆盖所有路径的全局不变量:
 
@@ -126,8 +173,9 @@ WAL physical header 保存的是 Snappy 压缩后 payload 长度。若最终 `bi
 
 | 模块 | 主要流程 | 风险点 | 处理原则 |
 |------|----------|--------|----------|
+| HTTP 行协议拆批 | line-aligned block -> worker callback -> shard / owner fan-out | 10KiB 级大点在 64KiB block 中每批仅约 6 点；不同 block 不合并，放大路由、RPC、索引、Snappy、WAL `write` 和锁竞争；盲目调大 block 又会提高 `O(P * blockSize)` 并发内存 | 本次安全修复不自动改默认值；建立 64KiB~1MiB 大点压测基线，按吞吐、延迟和 heap 决定配置；跨 block 的 per-shard 聚合作为独立后续设计 |
 | 写入 / memtable | 行协议解析 -> record append -> memtable mutation | String field `ColVal` 持续累积，append 前无 bytes 预算会形成回绕 offset | mutation 前预算，超限 flush/retry 或拒写 |
-| WAL | shard `binaryRows` -> snappy physical record -> WAL header | 默认 HTTP block 路径风险很低；可配置入口、stream 放大和非 HTTP 路径不能只依赖 `ReadBlockSize`；`MaxEncodedLen` 负值可导致 panic | 最终 payload 在 mutation 前做 2GiB hard ceiling 与 O(1) 可表示性校验；WAL 层只检测内部不变量失守并 fail-fast，不拆 batch、不做 mutation 回滚 |
+| WAL | shard `binaryRows` -> snappy physical record -> WAL header | 默认 HTTP 单 record 的长度风险很低，但 record 数可能因大点 / 多 shard 被放大；默认 100ms sync 不等于逐 record `fsync`；可配置入口、stream 放大和非 HTTP 路径不能只依赖 `ReadBlockSize`；`MaxEncodedLen` 负值可导致 panic | 性能上区分 record、`write` 与 `fsync`；安全上对最终 payload 做 2GiB hard ceiling 与 O(1) 可表示性校验，WAL 层只检测内部不变量失守并 fail-fast，不拆 batch、不做 mutation 回滚 |
 | snapshot / flush | memtable record -> `MsBuilder` -> TSSP chunk | 只按 rows 切分不足以约束 String field bytes；内部 `dataOffset` 不能依赖回绕的 `chunkMeta.size` | rows + var-bytes 切分；offset 用真实写入大小推进 |
 | 非流式 compact / merge fastmode | chunk 整块读取 -> decodeRecord -> record merge -> 写新文件 | 整 chunk 读取依赖源 `ChunkMeta.size`；decode 后 `ColVal.Offset` 仍可能越界；record merge 会继续累积 `ColVal` | 源 size 不可信或 decode 后 offset 越界时降级 streamMode；merge 使用 bounded append |
 | stream compact | segment 读取 -> compactColumn -> writeSegment -> writeMeta | 源读按 segment 安全；合并条件仍需 bytes 边界 | rows + bytes merge 条件；输出 `ChunkMeta.size` 维持现状 |
@@ -194,7 +242,8 @@ WAL physical header 保存的是 Snappy 压缩后 payload 长度。若最终 `bi
 
 - memtable 中同一 series 的 String field `ColVal` 会跨多次写入持续增长。
 - append 过程中不能出现部分列已 mutation、后续列因超限失败的半写状态。
-- 普通 HTTP `/write` 已按 `ReadBlockSize` 拆分，WAL uint32 长度不是主风险；仍需防御 stream 放大、非 HTTP 入口和异常配置形成的超大最终 `binaryRows`。
+- 普通 HTTP `/write` 已按完整行拆成多个目标大小约为 `ReadBlockSize` 的 parser batch，WAL uint32 长度不是主风险；但该行为不是严格 payload 上限，10KiB 大点在默认 64KiB 下还会形成明显的小批写放大。安全校验不能依赖该分块，性能调优也不能只看单个 record 大小。
+- 组合部署 `LocalStore` 的普通非 stream 路径存在重复 `FastMarshalMultiRows`；分离部署则会按 `(parser batch, shard, owner)` 放大同步 RPC 和 store 端反序列化。二者属于需要单独压测和优化的写入热点，不改变 uint32 防御点的位置。
 - 当前 WAL 未处理 `snappy.MaxEncodedLen` 返回负值的情况，极端输入可能触发 Resize / slice panic。
 
 #### 设计动作
@@ -219,7 +268,7 @@ WAL physical header 保存的是 Snappy 压缩后 payload 长度。若最终 `bi
    }
    ```
 
-   可配置业务阈值必须小于或等于 2GiB hard ceiling，并建议根据单节点内存预算设置为显著更低的值；普通 HTTP 路径继续保留当前 25MB body 配置默认值与小 block 行为。
+   可配置业务阈值必须小于或等于 2GiB hard ceiling，并建议根据单节点内存预算设置为显著更低的值；普通 HTTP 路径继续保留当前 25MB body 与 64KiB `ReadBlockSize` 配置默认值。本次安全修复不把默认 block 放大到业务上限；是否调到 512KiB / 1MiB 由独立的大点性能压测决定。
 6. 超限在线 batch 直接拒写，不在 shard / WAL 层动态拆批。HTTP 将 `ErrWriteBatchTooLarge` 映射为 413；该错误不可重试。流式 HTTP request 和单个 parser block 都不是跨 shard / owner 的原子单元，返回错误时可能已有其他 block、shard 或 owner 写入成功。
 7. `WAL.writeBinary` 重复检查 `MaxEncodedLen`。若命中，说明共同前置校验点被绕过，返回 `ErrWALRecordSizeInvariant` 并按 WAL 致命错误策略 fail-fast；该检查不提供 mutation 后的一致性兜底，也不新增运行时开关。
 8. 在线 raft proposal 在 commit 前执行同一业务 batch 校验；WAL replay / committed raft apply 不应用新版本的日常业务 batch 上限。格式校验失败仍应 fail-closed，但历史或已提交的合法 record 不能因节点阈值不同导致 shard 无法打开或副本分歧。
@@ -383,6 +432,15 @@ WAL physical header 保存的是 Snappy 压缩后 payload 长度。若最终 `bi
 - 非流式 compact / merge 大 String field 场景降级到 byte-bounded streamMode。
 - compact / merge 输出 `ChunkMeta.size` 维持现状，不作为本方案保护目标。
 
+### 大点写入性能基线与后续项
+
+大点拆批性能不改变本方案的 P0 安全边界，但必须在同版本验证，避免以“默认 block 很小”作为安全结论时遗漏实际吞吐风险:
+
+- 交付 10KiB 级 String field、1000 点/request 的可重复压测结果，至少覆盖 64KiB、256KiB、512KiB、1MiB `ReadBlockSize`。
+- 默认配置是否调整，以单 shard / 多 shard、单 series / 多 series、组合部署 / 分离部署下的吞吐、p95/p99、CPU/GB、alloc bytes/GB 和 heap 高水位共同决定；没有完整数据时保持 64KiB 默认值。
+- 组合部署普通 `LocalStore` 的重复 marshal 作为独立、低语义风险的性能修复候选；修复后必须验证 stream 分支和 `IndexKey` buffer 生命周期不变。
+- parser block 与 per-shard storage batch 解耦不纳入本次 uint32 修复。若后续实施，必须先定义聚合字节上限、最大等待时间、worker 背压、同 series 顺序、跨 shard / owner 部分成功和 retry attempt 去重语义。
+
 ---
 
 ## 七、测试策略
@@ -400,6 +458,16 @@ WAL physical header 保存的是 Snappy 压缩后 payload 长度。若最终 `bi
 - 在线 raft proposal 超业务 batch 阈值时在 commit 前拒绝；历史 WAL replay / committed raft apply 不受新业务阈值影响，旧合法 record 仍可恢复且副本行为一致。
 - snapshot 只按行数不足以切开的场景，验证 rows + bytes splitter 生效。
 - 构造 `ChunkMeta.size` 回绕场景，验证 snapshot writer 内部后续 chunk offset 仍按真实写入大小推进。
+
+### 10KiB 大点拆批性能
+
+- 固定约 10KiB/点、1000 点/request、预创建 measurement / shard，分别压测 64KiB、256KiB、512KiB、1MiB `ReadBlockSize`；确认单 shard 下 `WriteRowsCount / WriteRowsBatch` 从约 6 提升到约 25 / 50 / 100，并核对实际 parser batch、store write 和 WAL record 数。
+- 分别覆盖单 shard / 单 series、单 shard / 多 series、均匀多 shard，避免只用单 shard 结果掩盖 `sum(distinctShards(each parser batch))` 放大。
+- 分别覆盖组合部署 `LocalStore` 与分离部署 RPC；前者用 CPU profile 确认重复 `FastMarshalMultiRows` 占比，后者统计每 request 的 RPC 数、store 端反序列化和 write concurrency limiter 等待。
+- WAL 至少覆盖 enabled + 默认 100ms sync、enabled + 0ms sync、disabled 三组，分别统计 WAL physical record、文件 `write` 和 `fsync`，不得把三者混为同一指标。
+- 并发至少覆盖 1、`P/2`、`P`、`2P`，采集 MB/s、points/s、p50/p95/p99、CPU/GB、alloc bytes/GB、GC pause、heap/RSS 高水位和 WAL bytes/input bytes。
+- 采集 `performance.WriteRowsCount`、`WriteRowsBatch`、`WriteWalDurationNs`、`WriteRowsDurationNs`、`WriteUnmarshalNs`、`WriteStorageDurationNs`、`WriteGetTokenDurationNs`，以及 `httpd.writeReqParseDurationNs`、`scheduleUnmarshalDns`、`writeStoresDurationNs`、`writeReqDurationNs`。duration 为并发累计值，需要按 bytes、points 或 batch 归一化，不能直接当墙钟时间比较。
+- 重点使用 `delta(WriteRowsCount) / delta(WriteRowsBatch)` 判断实际 per-shard batch 点数；`scheduleUnmarshalDns` 增长用于识别全局 worker queue 背压。比较各 block size 时同时检查 pool 高水位后的 buffer 保留，防止吞吐提升以不可接受的常驻内存为代价。
 
 ### `ChunkMeta.size` 读取降级
 
@@ -488,6 +556,7 @@ WAL physical header 保存的是 Snappy 压缩后 payload 长度。若最终 `bi
 - 写流量按 shard 或租户逐步放量 `enable_var_col_budget`，重点观察 `ErrNeedFlush`、`ErrValueTooLarge`、`ErrWriteBatchTooLarge`、写入延迟和写失败率。WAL 格式断言始终开启，正常流量下命中次数应为零。
 - 后台任务按类型放量 `enable_background_byte_bound`，先 snapshot/flush，再 stream compact/merge，最后覆盖非流式 compact/merge fastmode 降级路径。
 - `enable_writeoriginal_range_copy` 随后台任务一起放量，重点观察 next chunk offset / segment entry range 复制次数、fast-copy 禁用次数和新文件校验结果。
+- `ReadBlockSize` 调优与上述安全开关分开灰度。只有大点压测证明收益且 heap 预算允许时，才按租户 / 节点从 256KiB、512KiB 到 1MiB 逐级调整；每一级都比较实际 per-shard batch 点数、RPC / WAL record 数、p99 和 RSS 高水位。
 
 ### 回滚策略
 
@@ -495,6 +564,7 @@ WAL physical header 保存的是 Snappy 压缩后 payload 长度。若最终 `bi
 - 如果读侧 fallback 带来不可接受的查询延迟，可关闭 `enable_chunkmeta_size_fallback`，但需要明确旧路径遇到坏 `ChunkMeta.size` 仍可能 decode 失败或读到截断数据。
 - 如果写入预算出现误判，可临时关闭 `enable_var_col_budget`，但应保留超限观测指标，并优先修正预算逻辑后重新开启。
 - 如果后台任务放量导致资源占用过高，可关闭 `enable_background_byte_bound` 或 `enable_nonstream_degrade_stream`，并限制 compact/merge 并发。
+- 如果调大 `ReadBlockSize` 后 heap / RSS、GC 或尾延迟不可接受，直接回退该配置；该回退不影响 uint32 hard ceiling、WAL invariant 或 String field bytes 预算。
 
 监控:
 
@@ -502,6 +572,11 @@ WAL physical header 保存的是 Snappy 压缩后 payload 长度。若最终 `bi
 - `ErrValueTooLarge` 次数
 - `ErrWriteBatchTooLarge` 次数，按 HTTP、stream、内部 task、RPC 等来源区分
 - WAL `MaxEncodedLen` / uint32 可表示性内部 invariant 失败次数；正常运行应为零，命中即触发致命告警
+- `delta(WriteRowsCount) / delta(WriteRowsBatch)`，按拓扑、租户和 shard 分布观察实际 per-shard batch 点数
+- `scheduleUnmarshalDns`、`writeReqDurationNs`、`writeStoresDurationNs`，按输入 bytes / points 归一化观察 worker queue 背压和端到端写延迟
+- WAL physical record、文件 `write`、`fsync` 分别计数；默认 100ms sync 下不得用 record 数代替 `fsync` 数
+- `WriteWalDurationNs / WriteRowsBatch`、`WriteRowsDurationNs / WriteRowsBatch`、RPC 数/request 和 store write limiter 等待时间
+- parser / unmarshal work pool 的 retained bytes、heap/RSS 高水位、GC pause，按 `ReadBlockSize` 配置分组
 - source chunk meta range 校验失败次数
 - decode 后 `ColVal.Offset` 越界次数
 - 查询 per-segment fallback 次数
@@ -515,7 +590,9 @@ WAL physical header 保存的是 Snappy 压缩后 payload 长度。若最终 `bi
 
 - 主线保护 `ColVal.Offset`，通过 mutation 前预算、bounded append 和后台流程 byte-bounded，避免构造超阈值 String field `ColVal`。
 - 写入路径的 P0 聚焦 memtable `ColVal` 整批预算。预算失败发生在任何字段 append 前，通过 rotate/flush/retry 或拒写处理，不实现 mutation 回滚。
-- 普通 HTTP `/write` 已按 `ReadBlockSize` 拆成多个 parser batch，每个 batch 再按 shard / owner 形成写入 attempt；正常 WAL-enabled、非 Shelf 路径中，每个成功 `shard.WriteRows` attempt 对应一个 WAL record。HTTP request 和 parser block 都不是跨目标原子写入单元。
+- 普通 HTTP `/write` 已按完整行拆成多个目标大小约为 `ReadBlockSize` 的 parser batch，每个 batch 再按 shard / owner 形成写入 attempt；正常 WAL-enabled、非 Shelf 路径中，每个成功 `shard.WriteRows` attempt 对应一个 WAL record。`ReadBlockSize` 不是严格 payload 上限，HTTP request 和 parser block 也都不是跨目标原子写入单元。
+- 对 10KiB/点、1000 点/request，默认 64KiB 在单 shard / 单 owner 下约形成 167 个 parser batch 和 WAL record；多 shard 会进一步放大。默认 100ms WAL sync 会合并窗口内的 `fsync`，但不能消除每 record 的路由、RPC、Snappy 和文件 `write` 成本。
+- 本次安全修复不自动调整 64KiB 默认值，也不引入跨 parser block 的 storage coalesce。先以 64KiB~1MiB 做大点压测，并以 `WriteRowsCount / WriteRowsBatch`、p99、CPU/GB 和 heap 高水位决定配置；组合部署的 `LocalStore` 重复 marshal 与跨 block per-shard 聚合作为独立性能优化。
 - WAL 长度不作为主 P0，不做运行时拆 batch。最终 `binaryRows` 在 mutation 前校验 2GiB hard ceiling、可配置业务阈值和 WAL 可表示范围；WAL 层只检测前置校验不变量失守，命中时 fail-fast，不提供 mutation 后的一致性兜底。
 - 2GiB 是本方案选择且可由当前 WAL uint32 header 安全表示的不可配置 hard ceiling，不是 header 的理论极限，也不是建议运行阈值；可配置业务阈值不得超过它，现有非 gzip HTTP 25MB body 默认值和小 block 行为保持不变。
 - `ChunkMeta.size` 不再作为输出侧保护目标。compact / merge 等流程输出维持现状，允许 uint32 回绕继续存在。
