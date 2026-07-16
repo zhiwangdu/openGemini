@@ -37,6 +37,7 @@ type TsChunkDataImp struct {
 func (t *TsChunkDataImp) EncodeChunk(b *ChunkDataBuilder, id uint64, offset int64, rec *record.Record, dst []byte, timeSorted bool) ([]byte, error) {
 	var err error
 	b.reset(dst)
+	chunkStart := len(dst)
 	b.chunkMeta.sid = id
 	b.chunkMeta.offset = offset
 	b.chunkMeta.columnCount = uint32(rec.ColNums())
@@ -63,9 +64,9 @@ func (t *TsChunkDataImp) EncodeChunk(b *ChunkDataBuilder, id uint64, offset int6
 		crc := crc32.ChecksumIEEE(b.chunk[pos+crcSize:])
 		numberenc.MarshalUint32Copy(b.chunk[pos:pos+crcSize], crc)
 
-		size := uint32(len(b.chunk) - pos - crcSize)
-		b.chunkMeta.size += size
-		offset += int64(size)
+		actualColumnSize := int64(len(b.chunk) - pos - crcSize)
+		b.chunkMeta.size += uint32(actualColumnSize)
+		offset += actualColumnSize
 	}
 
 	pos := len(b.chunk)
@@ -77,6 +78,9 @@ func (t *TsChunkDataImp) EncodeChunk(b *ChunkDataBuilder, id uint64, offset int6
 	}
 	crc := crc32.ChecksumIEEE(b.chunk[pos+crcSize:])
 	numberenc.MarshalUint32Copy(b.chunk[pos:pos+crcSize], crc)
+	if err = setChunkMetaSize(b.chunkMeta, int64(len(b.chunk)-chunkStart)); err != nil {
+		return nil, err
+	}
 
 	return b.chunk, nil
 }

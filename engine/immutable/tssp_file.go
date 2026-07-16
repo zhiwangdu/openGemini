@@ -76,6 +76,7 @@ type tsspFileReader struct {
 
 	chunkMetaCompressMode uint8
 	hot                   bool
+	hotMemoryAccounted    bool
 }
 
 func CreateTSSPFileReader(size int64, fd fileops.File, trailer *Trailer, tb *TableData, ver uint64, tmp bool, lockPath *string) (*tsspFileReader, error) {
@@ -262,11 +263,12 @@ func (r *tsspFileReader) Open() error {
 }
 
 func (r *tsspFileReader) validate(offset, size int64) error {
-	if offset < r.trailer.dataOffset {
+	if size < 0 || offset < r.trailer.dataOffset || offset > math.MaxInt64-size {
 		return fmt.Errorf("invlaid read offset, %v < %v", offset, r.trailer.dataOffset)
 	}
 
-	if offset+size > r.trailer.dataOffset+r.trailer.dataSize {
+	if r.trailer.dataSize < 0 || r.trailer.dataOffset > math.MaxInt64-r.trailer.dataSize ||
+		offset+size > r.trailer.dataOffset+r.trailer.dataSize {
 		return fmt.Errorf("read offset size out of range, [%d, %d] [%d %d]", r.trailer.dataOffset, r.trailer.dataSize,
 			offset, size)
 	}
@@ -292,7 +294,7 @@ func (r *tsspFileReader) ReadData(cm *ChunkMeta, segment int, dst *record.Record
 	err := r.validate(cm.offset, int64(cm.size))
 	if err != nil {
 		log.Error(err.Error())
-		return nil, err
+		return nil, errno.NewError(errno.ErrCorruptTSSP, err.Error())
 	}
 
 	if len(decs.ops) > 0 {
@@ -361,16 +363,24 @@ func (r *tsspFileReader) readSegmentMetaRecord(cm *ChunkMeta, dst *record.Record
 	return nil, nil
 }
 
-func columnData(chunk []byte, baseOffset int64, segOff int64, segSize uint32) []byte {
+func columnData(chunk []byte, baseOffset int64, segOff int64, segSize uint32) ([]byte, error) {
 	off := segOff - baseOffset
-	return chunk[off : off+int64(segSize)]
+	if off < 0 || off > int64(len(chunk)) || int64(segSize) > int64(len(chunk))-off {
+		return nil, errno.NewError(errno.ErrCorruptTSSP,
+			fmt.Sprintf("segment slice out of range: base=%d offset=%d size=%d buffer=%d", baseOffset, segOff, segSize, len(chunk)))
+	}
+	return chunk[int(off):int(off+int64(segSize))], nil
 }
 
 func (r *tsspFileReader) readSegmentRecord(cm *ChunkMeta, segment int, dst *record.Record, decs *ReadContext, ioPriority int) (*record.Record, error) {
 	var err error
 	var chunkData []byte
 	var cachePage *readcache.CachePage
-	if cm.size < defaultIoSize {
+	preload, err := canPreloadSegmentRecord(cm, segment, dst.Schema)
+	if err != nil {
+		return nil, err
+	}
+	if preload {
 		chunkData, cachePage, err = r.ReadDataBlock(cm.offset, cm.size, &decs.readBuf, ioPriority)
 		if err != nil {
 			log.Error("read chunk data fail", zap.String("file", r.r.Name()), zap.Error(err))
@@ -404,9 +414,15 @@ func (r *tsspFileReader) readSegmentRecord(cm *ChunkMeta, segment int, dst *reco
 		var data []byte
 		segOff, segSize := seg.OffsetSize()
 		if len(chunkData) > 0 {
-			data = columnData(chunkData, cm.offset, segOff, segSize)
+			data, err = columnData(chunkData, cm.offset, segOff, segSize)
+			if err != nil {
+				return nil, err
+			}
 		} else {
 			r.UnrefCachePage(cachePage)
+			if err = r.validate(segOff, int64(segSize)); err != nil {
+				return nil, err
+			}
 			data, cachePage, err = r.ReadDataBlock(segOff, segSize, &decs.readBuf, ioPriority)
 			if err != nil {
 				log.Error("read column data fail", zap.String("file", r.FileName()), zap.String("col", cMeta.Name()), zap.Error(err))
@@ -444,8 +460,14 @@ func (r *tsspFileReader) decodeTimeColumn(cm *ChunkMeta, segment int, chunkData 
 	timeSeg := cm.timeMeta().entries[segment]
 	segOff, segSize := timeSeg.OffsetSize()
 	if len(chunkData) > 0 {
-		tmData = columnData(chunkData, cm.offset, segOff, segSize)
+		tmData, err = columnData(chunkData, cm.offset, segOff, segSize)
+		if err != nil {
+			return err
+		}
 	} else {
+		if err = r.validate(segOff, int64(segSize)); err != nil {
+			return err
+		}
 		tmData, cachePage, err = r.ReadDataBlock(segOff, segSize, &decs.readBuf, ioPriority)
 		defer r.UnrefCachePage(cachePage)
 		if err != nil {
@@ -567,6 +589,9 @@ func (r *tsspFileReader) UnrefMetaCachePage(cachePage *readcache.CachePage) {
 
 // for dataBlock read
 func (r *tsspFileReader) ReadDataBlock(offset int64, size uint32, dst *[]byte, ioPriority int) (rb []byte, unRefPageCache *readcache.CachePage, err error) {
+	if err = r.validate(offset, int64(size)); err != nil {
+		return nil, nil, errno.NewError(errno.ErrCorruptTSSP, err.Error())
+	}
 	var cachePage *readcache.CachePage
 	if fileops.ReadDataCacheEn && r.cacheEnable(ioPriority) {
 		rb, cachePage, err = r.pageCacheReader.Read(offset, size, dst, ioPriority)
@@ -1037,8 +1062,11 @@ func (r *tsspFileReader) FreeMemory() {
 	if hr, ok := r.r.(*HotFileReader); ok {
 		r.r = hr.BasicFileReader
 		hr.Release()
-		NewHotFileManager().IncrMemorySize(-hr.size)
+		if r.hotMemoryAccounted {
+			NewHotFileManager().IncrMemorySize(-hr.size)
+		}
 	}
+	r.hotMemoryAccounted = false
 }
 
 func (r *tsspFileReader) LoadIntoMemory() error {
@@ -1058,6 +1086,7 @@ func (r *tsspFileReader) LoadIntoMemory() error {
 	}
 
 	r.hot = true
+	r.hotMemoryAccounted = false
 	r.r = NewHotFileReader(r.r, buf)
 
 	return nil
@@ -1073,6 +1102,8 @@ func (r *tsspFileReader) reset() {
 	r.r = nil
 	r.avgChunkRows = 0
 	r.maxChunkRows = 0
+	r.hot = false
+	r.hotMemoryAccounted = false
 	atomic.StoreInt32(&r.inited, 0)
 }
 
@@ -1095,6 +1126,7 @@ func (r *tsspFileReader) ChunkMetaCompressMode() uint8 {
 func (r *tsspFileReader) ApplyHotReader(hotReader fileops.BasicFileReader) {
 	r.r = hotReader
 	r.hot = true
+	r.hotMemoryAccounted = false
 }
 
 func (r *tsspFileReader) cacheEnable(ioPriority int) bool {

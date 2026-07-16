@@ -64,6 +64,45 @@ func TestMergeSelf(t *testing.T) {
 	require.NoError(t, compareRecords(mh.readExpectRecord(), mh.readMergedRecord()))
 }
 
+func TestUint32MergeSelfRetry_RebuildsAsStream(t *testing.T) {
+	defer beforeTest(t, 10)()
+	storeConf := config.GetStoreConfig()
+	oldSelfOnly := storeConf.Merge.MergeSelfOnly
+	oldStreamLevel := storeConf.Merge.StreamMergeModeLevel
+	storeConf.Merge.MergeSelfOnly = true
+	storeConf.Merge.StreamMergeModeLevel = 1
+	t.Cleanup(func() {
+		storeConf.Merge.MergeSelfOnly = oldSelfOnly
+		storeConf.Merge.StreamMergeModeLevel = oldStreamLevel
+	})
+
+	oldLimit := record.GetMaxVarColValBytes()
+	require.NoError(t, record.SetMaxVarColValBytes(10))
+	t.Cleanup(func() { require.NoError(t, record.SetMaxVarColValBytes(oldLimit)) })
+
+	mh := NewMergeTestHelper(immutable.NewTsStoreConfig())
+	defer mh.store.Close()
+	schema := record.Schemas{
+		{Name: "value", Type: influx.Field_Type_String},
+		{Name: record.TimeField, Type: influx.Field_Type_Int},
+	}
+	makeRecord := func(value string, ts int64) *record.Record {
+		rec := record.NewRecordBuilder(schema)
+		rec.ColVals[0].AppendString(value)
+		rec.ColVals[1].AppendInteger(ts)
+		return rec
+	}
+
+	mh.addRecord(100, makeRecord("123456", 1))
+	require.NoError(t, mh.saveToUnordered())
+	mh.addRecord(100, makeRecord("abcdef", 2))
+	require.NoError(t, mh.saveToUnordered())
+
+	require.NoError(t, mh.store.MergeOutOfOrder(1, true, false))
+	mh.store.Wait()
+	require.Len(t, mh.store.OutOfOrder["mst"].Files(), 1)
+}
+
 func TestMergeSelf_Stop(t *testing.T) {
 	var begin int64 = 1e12
 	defer beforeTest(t, 0)()

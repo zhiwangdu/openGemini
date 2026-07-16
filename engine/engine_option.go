@@ -88,6 +88,7 @@ type EngineOptions struct {
 
 	MaxSeriesPerDatabase int
 	MaxRowsPerSegment    int
+	MaxVarColValBytes    int64
 
 	// for hierarchical storage
 	SkipRegisterColdShard bool

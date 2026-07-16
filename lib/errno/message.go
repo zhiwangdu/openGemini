@@ -225,6 +225,12 @@ var messageMap = map[Errno]*Message{
 	ShardMovingStopped:              newFatalMessage("shard moving is disabled, shardID %d", ModuleStorageEngine),
 	AlreadyHotFile:                  newNoticeMessage("already a hot file", ModuleStorageEngine),
 	ForbidIndexWrite:                newNoticeMessage("forbid index write, indexId:%d, indexTier:%d", ModuleStorageEngine),
+	ErrNeedFlush:                    newWarnMessage("record variable-length data needs flush: current=%d append=%d limit=%d", ModuleStorageEngine),
+	ErrValueTooLarge:                newWarnMessage("single variable-length value is too large: size=%d limit=%d", ModuleStorageEngine),
+	ErrRequireStream:                newWarnMessage("nonstream path exceeds variable-length data limit: current=%d append=%d limit=%d", ModuleCompact),
+	ErrCorruptColumn:                newFatalMessage("record column is corrupt: %s", ModuleStorageEngine),
+	ErrCorruptTSSP:                  newFatalMessage("tssp metadata or data range is corrupt: %s", ModuleTssp),
+	ErrSegmentTooLarge:              newFatalMessage("tssp segment is too large: size=%d limit=%d", ModuleTssp),
 
 	// wal error codes
 	ReadWalFileFailed:         newWarnMessage("read wal file failed", ModuleWal),

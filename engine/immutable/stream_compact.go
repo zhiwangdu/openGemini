@@ -208,17 +208,35 @@ func (c *StreamIterators) InitEvents(level uint16) *Events {
 	return c.events
 }
 
-func (c *StreamIterators) RemoveTmpFiles() {
+func (c *StreamIterators) RemoveTmpFiles() error {
+	var errs []error
 	if c.fd != nil {
 		name := c.fd.Name()
-		util.MustClose(c.fd)
-		util.MustRun(func() error {
-			return os.Remove(name)
-		})
+		if c.writer != nil {
+			writer := c.writer
+			if err := writer.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				errs = append(errs, err)
+			}
+			if hotWriter, ok := writer.(*HotFileWriter); ok {
+				hotWriter.Release()
+			}
+			c.writer = nil
+		}
+		if err := c.fd.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			errs = append(errs, err)
+		}
+		if err := os.Remove(name); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
+		c.fd = nil
 	}
 	for _, f := range c.files {
-		util.MustRun(f.Remove)
+		if err := RemoveTSSPFileOnAbort(f); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
 	}
+	c.files = nil
+	return errors.Join(errs...)
 }
 
 func (c *StreamIterators) WithLog(log *Log.Logger) {
@@ -420,18 +438,26 @@ func (c *StreamIterators) NewFile(addFileExt bool) error {
 	if addFileExt {
 		c.fileName.extent++
 	}
+	// A finalized file is owned by c.files. Do not leave its descriptor in the
+	// current-attempt slot if creating the next file fails before OpenFile.
+	c.fd = nil
 	c.reset()
 	c.trailer.name = append(c.trailer.name[:0], influx.GetOriginMstName(c.name)...)
 
 	lock := fileops.FileLockOption(*c.lock)
 	pri := fileops.FilePriorityOption(fileops.IO_PRIORITY_NORMAL)
 	dir := filepath.Join(c.dir, c.name)
-	_ = fileops.MkdirAll(dir, 0750, lock)
+	if err := fileops.MkdirAll(dir, 0750, lock); err != nil {
+		return err
+	}
 	filePath := c.fileName.Path(dir, true)
 	_, err := fileops.Stat(filePath)
 	if err == nil {
 		c.log.Error("file exist", zap.String("file", filePath))
 		return fmt.Errorf("file(%s) exist", filePath)
+	}
+	if !os.IsNotExist(err) {
+		return err
 	}
 
 	if c.tier == util.Cold {
@@ -498,7 +524,9 @@ func (c *StreamIterators) writeMetaToDisk() error {
 
 	c.events.TriggerWriteChunkMeta(cm)
 
-	cm.size = uint32(c.writer.DataSize() - cm.offset)
+	if err := setChunkMetaSize(cm, c.writer.DataSize()-cm.offset); err != nil {
+		return err
+	}
 	cm.columnCount = uint32(len(cm.colMeta))
 	cm.segCount = uint32(len(cm.timeRange))
 	minT, maxT := cm.MinMaxTime()
@@ -907,7 +935,7 @@ func (c *StreamIterators) compact(files []TSSPFile, level uint16, isOrder bool) 
 	_, seq := files[0].LevelAndSequence()
 	c.fileName = NewTSSPFileName(seq, level, 0, 0, isOrder, c.lock)
 	if err := c.NewFile(false); err != nil {
-		panic(err)
+		return nil, err
 	}
 
 	c.closeStat = false
@@ -976,7 +1004,7 @@ func (c *StreamIterators) compact(files []TSSPFile, level uint16, isOrder bool) 
 				c.files = append(c.files, f)
 				c.estimateSize -= int(f.FileSize())
 				if err = c.NewFile(true); err != nil {
-					panic(err)
+					return nil, err
 				}
 			}
 		}
@@ -1153,9 +1181,13 @@ func (b *ColumnBuilder) encodeTimeColumn(cols []record.ColVal, offset int64) err
 		}
 
 		m.setOffset(offset)
-		size := uint32(len(b.data) - pos)
+		actualSize := int64(len(b.data) - pos)
+		size, sizeErr := checkedSegmentSize(actualSize)
+		if sizeErr != nil {
+			return sizeErr
+		}
 		m.setSize(size)
-		offset += int64(size)
+		offset += actualSize
 	}
 
 	return nil
@@ -1201,9 +1233,13 @@ func (b *ColumnBuilder) encodeColumn(segCols []record.ColVal, tmCols []record.Co
 			b.log.Error("encode integer value fail", zap.Error(err))
 			return err
 		}
-		size := uint32(len(b.data) - pos)
+		actualSize := int64(len(b.data) - pos)
+		size, sizeErr := checkedSegmentSize(actualSize)
+		if sizeErr != nil {
+			return sizeErr
+		}
 		m.setSize(size)
-		offset += int64(size)
+		offset += actualSize
 	}
 
 	return err

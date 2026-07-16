@@ -147,6 +147,10 @@ func TestEqual(t *testing.T) {
 
 	assert.False(t, errno.Equal(err, errno.InvalidAddress))
 	assert.False(t, errno.Equal(fmt.Errorf("some error"), errno.InvalidBufferSize))
+	assert.True(t, errno.Equal(fmt.Errorf("wrapped: %w", err), errno.InvalidBufferSize))
+	assert.True(t, errno.Equal(errors.Join(
+		errno.NewError(errno.InvalidAddress), err,
+	), errno.InvalidBufferSize))
 
 	assert.False(t, errno.Equal(errno.NewError(0), errno.InvalidBufferSize))
 }

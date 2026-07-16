@@ -15,6 +15,9 @@
 package immutable
 
 import (
+	"fmt"
+	"math"
+
 	"github.com/openGemini/openGemini/lib/bufferpool"
 	"github.com/openGemini/openGemini/lib/errno"
 	"github.com/openGemini/openGemini/lib/fileops"
@@ -70,6 +73,13 @@ func NewFileIterator(r TSSPFile, log *Log.Logger) *FileIterator {
 
 	fi.timeReader.Reset(r)
 	fi.dataReader.Reset(r)
+	if fi.dataSize < 0 || fi.dataOffset < 0 || fi.dataOffset > math.MaxInt64-fi.dataSize {
+		fi.err = errno.NewError(errno.ErrCorruptTSSP, "invalid file data range")
+	} else {
+		dataEnd := fi.dataOffset + fi.dataSize
+		fi.timeReader.fileSize = dataEnd
+		fi.dataReader.fileSize = dataEnd
+	}
 
 	return fi
 }
@@ -91,15 +101,34 @@ func (itr *FileIterator) reset() {
 }
 
 func (itr *FileIterator) ReadData(offset int64, size uint32) ([]byte, error) {
+	if err := itr.validateDataRange(offset, size); err != nil {
+		return nil, err
+	}
 	return itr.dataReader.Read(offset, size)
 }
 
 func (itr *FileIterator) readData(offset int64, size uint32) ([]byte, error) {
+	if err := itr.validateDataRange(offset, size); err != nil {
+		return nil, err
+	}
 	return itr.dataReader.Read(offset, size)
 }
 
 func (itr *FileIterator) readTimeData(offset int64, size uint32) ([]byte, error) {
+	if err := itr.validateDataRange(offset, size); err != nil {
+		return nil, err
+	}
 	return itr.timeReader.Read(offset, size)
+}
+
+func (itr *FileIterator) validateDataRange(offset int64, size uint32) error {
+	if itr == nil || itr.dataSize < 0 || itr.dataOffset < 0 || offset < itr.dataOffset ||
+		itr.dataOffset > math.MaxInt64-itr.dataSize || offset > math.MaxInt64-int64(size) ||
+		offset+int64(size) > itr.dataOffset+itr.dataSize {
+		return errno.NewError(errno.ErrCorruptTSSP,
+			fmt.Sprintf("read range outside file data: offset=%d size=%d", offset, size))
+	}
+	return nil
 }
 
 func (itr *FileIterator) Close() {
@@ -134,6 +163,9 @@ func (itr *FileIterator) GetCurtChunkMeta() *ChunkMeta {
 }
 
 func (itr *FileIterator) NextChunkMeta() bool {
+	if itr.err != nil {
+		return false
+	}
 	if itr.chunkUsed >= itr.chunkN {
 		return false
 	}

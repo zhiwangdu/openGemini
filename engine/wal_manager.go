@@ -18,6 +18,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"os"
 	"path"
 	"regexp"
 	"runtime/debug"
@@ -235,7 +236,7 @@ func removeWalFiles(files *WalFiles) error {
 	lock := fileops.FileLockOption(*files.lock)
 	for _, f := range files.files {
 		e := fileops.Remove(f, lock)
-		if e != nil {
+		if e != nil && !os.IsNotExist(e) {
 			err = e
 			logger.NewLogger(errno.ModuleWal).Error("failed to remove wal file", zap.String("file", f), zap.Error(err))
 		}

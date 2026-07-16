@@ -682,6 +682,17 @@ func (f *tsspFile) InMemSize() int64 {
 	return f.reader.InMemSize()
 }
 
+func (f *tsspFile) markHotMemoryAccounted() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.reader.(*tsspFileReader)
+	if !ok || !r.hot || r.hotMemoryAccounted {
+		return false
+	}
+	r.hotMemoryAccounted = true
+	return true
+}
+
 func (f *tsspFile) FileSize() int64 {
 	f.mu.RLock()
 	defer f.mu.RUnlock()

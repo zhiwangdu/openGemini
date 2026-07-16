@@ -358,8 +358,12 @@ func (s *Shard) convertWalToTSSP(wal *Wal) {
 	itr := NewWalRecordIterator(wal)
 	itr.WalMeasurements(func(mst string) {
 		tsMemTable := mutable.NewTsMemTableImpl()
-		orderFiles, unorderedFiles := tsMemTable.FlushRecords(s.info.tbStore, itr, mst,
+		orderFiles, unorderedFiles, err := tsMemTable.FlushRecords(s.info.tbStore, itr, mst,
 			s.info.filePath, s.info.lock, s.info.fileInfos)
+		if err != nil {
+			logger.GetLogger().Error("flush WAL records failed", zap.String("mst", mst), zap.Error(err))
+			return
+		}
 
 		wal.AddTargetTSSPFiles(orderFiles...)
 		wal.AddTargetTSSPFiles(unorderedFiles...)

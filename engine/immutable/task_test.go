@@ -24,7 +24,9 @@ import (
 	"github.com/influxdata/influxdb/toml"
 	"github.com/openGemini/openGemini/engine/immutable"
 	"github.com/openGemini/openGemini/lib/config"
+	"github.com/openGemini/openGemini/lib/record"
 	"github.com/openGemini/openGemini/lib/scheduler"
+	"github.com/openGemini/openGemini/lib/util"
 	"github.com/openGemini/openGemini/lib/util/lifted/influx/influxql"
 	"github.com/openGemini/openGemini/lib/util/lifted/vm/protoparser/influx"
 	"github.com/stretchr/testify/require"
@@ -70,6 +72,39 @@ func TestFullCompactOneFile(t *testing.T) {
 	require.NoError(t, mh.store.FullCompact(1))
 	mh.store.Wait()
 	require.Equal(t, 1, len(mh.store.Order["mst"].Files()))
+}
+
+func TestUint32NonstreamRetry_RebuildsPlanAndRunsStream(t *testing.T) {
+	defer beforeTest(t, 10)()
+	oldLimit := record.GetMaxVarColValBytes()
+	require.NoError(t, record.SetMaxVarColValBytes(10))
+	t.Cleanup(func() { require.NoError(t, record.SetMaxVarColValBytes(oldLimit)) })
+
+	oldMode := immutable.GetMergeFlag4TsStore()
+	immutable.SetMergeFlag4TsStore(util.NonStreamingCompact)
+	t.Cleanup(func() { immutable.SetMergeFlag4TsStore(oldMode) })
+
+	mh := NewMergeTestHelper(immutable.NewTsStoreConfig())
+	defer mh.store.Close()
+	schema := record.Schemas{
+		{Name: "value", Type: influx.Field_Type_String},
+		{Name: record.TimeField, Type: influx.Field_Type_Int},
+	}
+	makeRecord := func(value string, ts int64) *record.Record {
+		rec := record.NewRecordBuilder(schema)
+		rec.ColVals[0].AppendString(value)
+		rec.ColVals[1].AppendInteger(ts)
+		return rec
+	}
+
+	mh.addRecord(100, makeRecord("123456", 1))
+	require.NoError(t, mh.saveToOrder())
+	mh.addRecord(100, makeRecord("abcdef", 2))
+	require.NoError(t, mh.saveToOrder())
+
+	require.NoError(t, mh.store.FullCompact(1))
+	mh.store.Wait()
+	require.Len(t, mh.store.Order["mst"].Files(), 1)
 }
 
 func TestMergeWithParquetTask(t *testing.T) {

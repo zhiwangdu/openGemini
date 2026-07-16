@@ -92,7 +92,7 @@ var (
 
 type Storage interface {
 	waitSnapshot()
-	writeSnapshot(s *shard)
+	writeSnapshot(s *shard) error
 	WriteCols(s *shard, cols *record.Record, mst string, binaryCols []byte) error // native protocol
 	WriteIndex(idx *tsi.IndexBuilder, mw *mstWriteCtx) func() error
 	shouldSnapshot(s *shard) bool
@@ -100,7 +100,7 @@ type Storage interface {
 	getAllFiles(s *shard, mstName string) ([]immutable.TSSPFile, []string, error)
 	executeShardMove(s *shard) error
 	SetAccumulateMetaIndex(name string, detachedMetaInfo *immutable.AccumulateMetaIndex)
-	ForceFlush(s *shard)
+	ForceFlush(s *shard) error
 }
 
 func findTagIndex(schema record.Schemas, metaSchema *meta.CleanSchema) []int {
@@ -223,6 +223,12 @@ type shard struct {
 	replayingWal       bool
 	wal                *WAL // for cases: 1. write 2. replay
 	snapshotLock       sync.RWMutex
+	snapshotCommitMu   sync.Mutex
+	snapshotErr        error
+	snapshotWalFiles   *WalFiles
+	snapshotSize       int64
+	snapshotCommitted  bool
+	snapshotPrepared   []preparedSnapshotMeasurement
 	memDataReadEnabled bool
 	activeTbl          *mutable.MemTable
 	snapshotTbl        *mutable.MemTable
@@ -588,9 +594,9 @@ func (s *shard) writeRowsShelfMode(rows []influx.Row) error {
 }
 
 // write data to mem table and write wal
-func (s *shard) writeRows(mw *mstWriteCtx, binaryRows []byte, curSize int64) error {
+func (s *shard) writeRows(mw *mstWriteCtx, binaryRows []byte, curSize int64) (*mutable.MemTable, bool, error) {
 	if s.closed.Closed() {
-		return errno.NewError(errno.ErrShardClosed, s.ident.ShardID)
+		return nil, true, errno.NewError(errno.ErrShardClosed, s.ident.ShardID)
 	}
 
 	if s.engineType == config.TSSTORE {
@@ -605,25 +611,33 @@ func (s *shard) writeRows(mw *mstWriteCtx, binaryRows []byte, curSize int64) err
 
 	s.snapshotLock.RLock()
 	defer s.snapshotLock.RUnlock()
+	generation := s.activeTbl
+	if s.snapshotErr != nil {
+		return generation, true, s.snapshotErr
+	}
 
 	failpoint.Inject("SlowDownActiveTblWrite", nil)
 
-	s.activeTbl.AddMemSize(curSize)
+	generation.AddMemSize(curSize)
 	// write data to mem table
-	err := s.activeTbl.MTable.WriteRows(s.activeTbl, mmPoints, ctx)
+	err := generation.MTable.WriteRows(generation, mmPoints, ctx)
 	if err != nil {
 		log.Error("write rows to memory table fail", zap.Uint64("shard", s.ident.ShardID), zap.Error(err))
-		return err
+		safeToRelease := errno.Equal(err, errno.ErrNeedFlush, errno.ErrValueTooLarge, errno.ErrCorruptColumn)
+		if safeToRelease {
+			generation.AddMemSize(-curSize)
+		}
+		return generation, safeToRelease, err
 	}
 
 	atomic.AddInt64(&statistics.PerfStat.WriteRowsDurationNs, time.Since(start).Nanoseconds())
 
 	if err = s.wal.Write(binaryRows, WriteWalLineProtocol, mw.maxTime); err != nil {
 		log.Error("write rows to wal fail", zap.Uint64("shard", s.ident.ShardID), zap.Error(err))
-		return err
+		return generation, false, err
 	}
 
-	return nil
+	return generation, false, nil
 }
 
 func (s *shard) WriteCols(mst string, cols *record.Record, binaryCols []byte) error {
@@ -655,6 +669,10 @@ func (s *shard) shouldSnapshot() bool {
 
 	if !s.storage.shouldSnapshot(s) {
 		return false
+	}
+	if s.snapshotTbl != nil {
+		s.prepareSnapshot()
+		return true
 	}
 
 	if s.activeTbl != nil && s.activeTbl.GetMemSize() > 0 {
@@ -742,7 +760,9 @@ func (s *shard) Snapshot() {
 			if !s.shouldSnapshot() {
 				continue
 			}
-			s.storage.writeSnapshot(s)
+			if err := s.storage.writeSnapshot(s); err != nil {
+				s.log.Error("snapshot failed", zap.Error(err))
+			}
 			s.endSnapshot()
 		}
 	}
@@ -946,12 +966,30 @@ func (s *shard) writeRowsToTable(rows influx.Rows, binaryRows []byte) error {
 	}
 
 	wait := s.storage.WriteIndex(s.indexBuilder, mw)
-	err = s.writeRows(mw, binaryRows, curSize)
+	safeToRelease := false
+	for attempt := 0; ; attempt++ {
+		var generation *mutable.MemTable
+		generation, safeToRelease, err = s.writeRows(mw, binaryRows, curSize)
+		if !errno.Equal(err, errno.ErrNeedFlush) || attempt >= MaxRetryUpdateOnShardNum {
+			break
+		}
+		storage, ok := s.storage.(*tsstoreImpl)
+		if !ok {
+			break
+		}
+		if err = storage.writeSnapshotGeneration(s, generation); err != nil {
+			safeToRelease = true
+			break
+		}
+	}
 
 	if err == nil {
 		err = wait()
 	}
 	if err != nil {
+		if safeToRelease {
+			nodeMutableLimit.freeResource(curSize)
+		}
 		return err
 	}
 
@@ -1002,27 +1040,142 @@ func (s *shard) ForceFlush() {
 	if config.ShelfModeEnabled() {
 		shelf.NewRunner().ForceFlush(s.ident.ShardID)
 	}
-	s.storage.ForceFlush(s)
+	if err := s.storage.ForceFlush(s); err != nil {
+		s.log.Error("force flush failed", zap.Error(err))
+	}
 }
 
-func (s *shard) commitSnapshot(snapshot *mutable.MemTable) {
-	snapshot.ApplyConcurrency(func(msName string) {
+type preparedSnapshotMeasurement struct {
+	name          string
+	count         int64
+	hasCount      bool
+	flush         *mutable.FlushResult
+	flushDuration int64
+}
+
+type snapshotAbortError struct {
+	err error
+}
+
+func (e *snapshotAbortError) Error() string { return e.err.Error() }
+func (e *snapshotAbortError) Unwrap() error { return e.err }
+
+func joinSnapshotAbortError(primary, cleanup error) error {
+	if cleanup == nil {
+		return primary
+	}
+	return errors.Join(primary, &snapshotAbortError{err: cleanup})
+}
+
+func snapshotRetryBlocked(err error) bool {
+	if errno.Equal(err, errno.ErrCorruptColumn, errno.ErrCorruptTSSP, errno.ErrSegmentTooLarge, errno.ErrValueTooLarge) {
+		return true
+	}
+	var localAbort *snapshotAbortError
+	if errors.As(err, &localAbort) {
+		return true
+	}
+	var workerAbort *mutable.SnapshotAbortError
+	return errors.As(err, &workerAbort)
+}
+
+func abortSnapshotMeasurements(prepared []preparedSnapshotMeasurement) error {
+	var errs []error
+	for i := range prepared {
+		if err := prepared[i].flush.Abort(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (s *shard) commitSnapshot(snapshot *mutable.MemTable) error {
+	if s.engineType == config.TSSTORE && s.snapshotPrepared != nil {
+		return s.publishSnapshotMeasurements(s.snapshotPrepared, true)
+	}
+
+	var mu sync.Mutex
+	prepared := make([]preparedSnapshotMeasurement, 0)
+	err := snapshot.ApplyConcurrencyErr(func(msName string) error {
 		// do not flush measurement that is deleting
 		if s.checkMstDeleting(msName) {
-			return
+			return nil
 		}
 		start := time.Now()
 		count, ok := s.getRowCount(msName)
-		snapshot.MTable.FlushChunks(snapshot, s.filesPath, msName, s.ident.OwnerDb, s.ident.Policy, s.lock, s.immTables, count, s.fileInfos)
+		flush, flushErr := snapshot.MTable.FlushChunks(snapshot, s.filesPath, msName, s.ident.OwnerDb, s.ident.Policy, s.lock, s.immTables, count, s.fileInfos)
+		if flushErr != nil {
+			return flushErr
+		}
+		mu.Lock()
+		prepared = append(prepared, preparedSnapshotMeasurement{
+			name: msName, count: count, hasCount: ok, flush: flush,
+			flushDuration: time.Since(start).Nanoseconds(),
+		})
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		return joinSnapshotAbortError(err, abortSnapshotMeasurements(prepared))
+	}
+	if s.engineType == config.TSSTORE {
+		manifest, manifestErr := s.newSnapshotCommitManifest(prepared, s.snapshotWalFiles)
+		if manifestErr != nil {
+			return joinSnapshotAbortError(manifestErr, abortSnapshotMeasurements(prepared))
+		}
+		if manifestErr = s.writeSnapshotManifest(manifest); manifestErr != nil {
+			return joinSnapshotAbortError(manifestErr, abortSnapshotMeasurements(prepared))
+		}
+		s.snapshotPrepared = prepared
+		return s.publishSnapshotMeasurements(prepared, true)
+	}
+	return s.publishSnapshotMeasurements(prepared, false)
+}
 
-		// store the row count of each measurement.
-		if ok {
-			if err := mutable.StoreMstRowCount(path.Join(s.dataPath, immutable.ColumnStoreDirName, msName, immutable.CountBinFile), int(count)); err != nil {
-				s.log.Error(fmt.Sprintf("shard: %s, mst: %s, flush row count failed", s.dataPath, msName))
+func (s *shard) publishSnapshotMeasurements(prepared []preparedSnapshotMeasurement, durable bool) error {
+	for i := range prepared {
+		if err := prepared[i].flush.Rename(); err != nil {
+			if durable {
+				return err
+			}
+			return errors.Join(err, abortSnapshotMeasurements(prepared))
+		}
+	}
+	if durable {
+		manifest, err := s.readSnapshotManifest()
+		if err != nil {
+			return err
+		}
+		if manifest == nil || manifest.State != snapshotManifestPrepared {
+			return errors.New("prepared snapshot manifest is missing")
+		}
+		dirs := make(map[string]struct{}, len(manifest.Files))
+		for i := range manifest.Files {
+			dirs[filepath.Dir(manifest.Files[i].Final)] = struct{}{}
+		}
+		for dir := range dirs {
+			if err = syncDirectory(dir); err != nil {
+				return err
 			}
 		}
-		atomic.AddInt64(&statistics.PerfStat.SnapshotFlushChunksNs, time.Since(start).Nanoseconds())
-	})
+		if err = validateCommittedFiles(manifest.Files); err != nil {
+			return err
+		}
+		manifest.State = snapshotManifestCommitted
+		if err = s.writeSnapshotManifest(manifest); err != nil {
+			return err
+		}
+	}
+	for i := range prepared {
+		prepared[i].flush.Register(s.immTables)
+		atomic.AddInt64(&statistics.PerfStat.SnapshotFlushChunksNs, prepared[i].flushDuration)
+		if prepared[i].hasCount {
+			if countErr := mutable.StoreMstRowCount(path.Join(s.dataPath, immutable.ColumnStoreDirName, prepared[i].name, immutable.CountBinFile), int(prepared[i].count)); countErr != nil {
+				s.log.Error(fmt.Sprintf("shard: %s, mst: %s, flush row count failed", s.dataPath, prepared[i].name), zap.Error(countErr))
+			}
+		}
+	}
+	return nil
 }
 
 func (s *shard) getRowCount(msName string) (int64, bool) {
@@ -1245,7 +1398,9 @@ func (s *shard) syncReplayWal(ctx context.Context) error {
 	}
 	s.log.Info("replay wal files ok", zap.Uint64("id", s.ident.ShardID), zap.Uint64("opId", s.opId), zap.Duration("time used", time.Since(wStart)))
 
-	s.ForceFlush()
+	if err = s.storage.ForceFlush(s); err != nil {
+		return err
+	}
 	s.log.Info("force flush shard ok", zap.Uint64("id", s.ident.ShardID), zap.Uint64("opId", s.opId), zap.Any("wal filenames", walFileNames))
 	err = s.wal.Remove(walFileNames)
 	if err != nil {
@@ -1263,6 +1418,12 @@ func (s *shard) Open(client metaclient.MetaClient) error {
 	if s.indexBuilder != nil {
 		if err = s.indexBuilder.Open(); err != nil {
 			s.log.Error("open index failed", zap.Uint64("id", s.ident.ShardID), zap.Uint64("opId", s.opId), zap.Error(err))
+			return err
+		}
+	}
+	if s.engineType == config.TSSTORE {
+		if err = s.recoverSnapshotCommit(); err != nil {
+			s.log.Error("recover snapshot commit failed", zap.Uint64("id", s.ident.ShardID), zap.Error(err))
 			return err
 		}
 	}
@@ -1286,6 +1447,12 @@ func (s *shard) Open(client metaclient.MetaClient) error {
 	if err != nil {
 		s.log.Error("open shard failed", zap.Uint64("id", s.ident.ShardID), zap.Uint64("opId", s.opId), zap.Error(err))
 		return err
+	}
+	if s.engineType == config.TSSTORE {
+		if err = s.completeSnapshotCommitRecovery(); err != nil {
+			s.log.Error("complete snapshot commit recovery failed", zap.Uint64("id", s.ident.ShardID), zap.Error(err))
+			return err
+		}
 	}
 	s.setMaxTime(maxTime)
 	s.log.Info("open immutable done", zap.Uint64("id", s.ident.ShardID), zap.Duration("time used", time.Since(start)),

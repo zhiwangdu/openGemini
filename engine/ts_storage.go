@@ -18,12 +18,15 @@ package engine
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/openGemini/openGemini/engine/immutable"
 	"github.com/openGemini/openGemini/engine/index/tsi"
+	"github.com/openGemini/openGemini/engine/mutable"
 	"github.com/openGemini/openGemini/lib/errno"
 	"github.com/openGemini/openGemini/lib/record"
 	"github.com/openGemini/openGemini/lib/statisticsPusher/statistics"
@@ -102,7 +105,10 @@ func (storage *tsstoreImpl) SetAccumulateMetaIndex(name string, detachedMetaInfo
 }
 
 func (storage *tsstoreImpl) shouldSnapshot(s *shard) bool {
-	if s.activeTbl == nil || s.snapshotTbl != nil || s.forceFlushing() {
+	if s.snapshotTbl != nil {
+		return s.snapshotErr != nil && !snapshotRetryBlocked(s.snapshotErr) && !s.forceFlushing()
+	}
+	if s.activeTbl == nil || s.forceFlushing() {
 		return false
 	}
 	return true
@@ -112,68 +118,156 @@ func (storage *tsstoreImpl) timeToSnapshot(s *shard) bool {
 	return fasttime.UnixTimestamp() >= (atomic.LoadUint64(&s.lastWriteTime) + s.writeColdDuration)
 }
 
-func (storage *tsstoreImpl) ForceFlush(s *shard) {
+func (storage *tsstoreImpl) ForceFlush(s *shard) error {
 	if s.indexBuilder == nil {
-		return
+		return nil
 	}
 	s.enableForceFlush()
 	defer s.disableForceFlush()
 
 	s.waitSnapshot()
 	s.prepareSnapshot()
-	s.storage.writeSnapshot(s)
+	err := s.storage.writeSnapshot(s)
 	s.endSnapshot()
+	return err
 }
 
-func (storage *tsstoreImpl) writeSnapshot(s *shard) {
+func (storage *tsstoreImpl) writeSnapshot(s *shard) error {
+	return storage.writeSnapshotGeneration(s, nil)
+}
+
+func (storage *tsstoreImpl) writeSnapshotGeneration(s *shard, expected *mutable.MemTable) error {
+	s.snapshotCommitMu.Lock()
+	defer s.snapshotCommitMu.Unlock()
+
+	s.snapshotLock.RLock()
+	blockedErr := s.snapshotErr
+	s.snapshotLock.RUnlock()
+	if snapshotRetryBlocked(blockedErr) {
+		return blockedErr
+	}
+
 	if s.SnapShotter != nil {
 		atomic.StoreUint32(&s.SnapShotter.RaftFlag, 0)
 	}
+	start := time.Now()
+	rotated := false
 	s.snapshotLock.Lock()
-	if s.activeTbl == nil {
+	if expected != nil && s.snapshotTbl == nil && s.activeTbl != expected {
 		s.snapshotLock.Unlock()
-		return
+		return nil
 	}
-	walFiles, err := s.wal.Switch()
-	if err != nil {
+	if expected != nil && s.snapshotTbl != nil && s.snapshotTbl != expected {
+		err := s.snapshotErr
 		s.snapshotLock.Unlock()
-		panic("wal switch failed")
+		if err != nil {
+			return err
+		}
+		return nil
 	}
-
-	s.snapshotTbl = s.activeTbl
-	curSize := s.snapshotTbl.GetMemSize()
-
-	s.activeTbl = s.memTablePool.Get(s.engineType)
-	s.activeTbl.SetIdx(s.skIdx)
-	if s.SnapShotter != nil {
-		s.SnapShotter.RaftFlushC <- true
-		atomic.StoreUint32(&s.SnapShotter.RaftFlag, 1)
+	if s.snapshotTbl == nil && s.activeTbl == nil {
+		s.snapshotLock.Unlock()
+		return nil
 	}
+	if s.snapshotTbl == nil {
+		walFiles, err := s.wal.Switch()
+		if err != nil {
+			s.snapshotLock.Unlock()
+			return err
+		}
+
+		s.snapshotTbl = s.activeTbl
+		s.snapshotWalFiles = walFiles
+		s.snapshotSize = s.snapshotTbl.GetMemSize()
+		s.snapshotCommitted = false
+		s.snapshotErr = nil
+		s.activeTbl = s.memTablePool.Get(s.engineType)
+		s.activeTbl.SetIdx(s.skIdx)
+		rotated = true
+		if s.SnapShotter != nil {
+			s.SnapShotter.RaftFlushC <- true
+			atomic.StoreUint32(&s.SnapShotter.RaftFlag, 1)
+		}
+	}
+	snapshot := s.snapshotTbl
+	committed := s.snapshotCommitted
+	walFiles := s.snapshotWalFiles
 	s.snapshotLock.Unlock()
 
-	start := time.Now()
-	s.indexBuilder.Flush()
+	if rotated {
+		s.indexBuilder.Flush()
+	}
 
-	s.commitSnapshot(s.snapshotTbl)
-	nodeMutableLimit.freeResource(curSize)
+	if !committed {
+		if err := s.commitSnapshot(snapshot); err != nil {
+			s.snapshotLock.Lock()
+			s.snapshotErr = err
+			s.snapshotLock.Unlock()
+			return err
+		}
+		s.snapshotLock.Lock()
+		s.snapshotCommitted = true
+		s.snapshotLock.Unlock()
+	}
 
-	err = RemoveWalFiles(walFiles)
-	if err != nil {
-		panic("wal remove files failed: " + err.Error())
+	if err := RemoveWalFiles(walFiles); err != nil {
+		s.snapshotLock.Lock()
+		s.snapshotErr = err
+		s.snapshotLock.Unlock()
+		return err
+	}
+	if err := syncWalDirectories(walFiles); err != nil {
+		s.snapshotLock.Lock()
+		s.snapshotErr = err
+		s.snapshotLock.Unlock()
+		return err
+	}
+	if err := s.removeSnapshotManifest(); err != nil {
+		s.snapshotLock.Lock()
+		s.snapshotErr = err
+		s.snapshotLock.Unlock()
+		return err
 	}
 
 	//This fail point is used in scenarios where "s.snapshotTbl" is not recycled
-	failpoint.Inject("snapshot-table-reset-delay", func() {
-		time.Sleep(2 * time.Second)
-	})
+	failpoint.Inject("snapshot-table-reset-delay", func() { time.Sleep(2 * time.Second) })
 
 	s.snapshotLock.Lock()
-	s.snapshotTbl.UnRef()
-	s.snapshotTbl = nil
+	if s.snapshotTbl == snapshot {
+		nodeMutableLimit.freeResource(s.snapshotSize)
+		s.snapshotTbl.UnRef()
+		s.snapshotTbl = nil
+		s.snapshotWalFiles = nil
+		s.snapshotSize = 0
+		s.snapshotCommitted = false
+		s.snapshotPrepared = nil
+		s.snapshotErr = nil
+	}
 	s.snapshotLock.Unlock()
 
 	atomic.AddInt64(&statistics.PerfStat.FlushSnapshotDurationNs, time.Since(start).Nanoseconds())
 	atomic.AddInt64(&statistics.PerfStat.FlushSnapshotCount, 1)
+	return nil
+}
+
+func syncWalDirectories(files *WalFiles) error {
+	if files == nil {
+		return nil
+	}
+	files.mu.Lock()
+	dirs := make(map[string]struct{}, len(files.files))
+	for _, name := range files.files {
+		dirs[filepath.Dir(name)] = struct{}{}
+	}
+	files.mu.Unlock()
+
+	var errs []error
+	for dir := range dirs {
+		if err := syncDirectory(dir); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (storage *tsstoreImpl) executeShardMove(s *shard) error {

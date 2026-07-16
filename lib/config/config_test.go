@@ -54,6 +54,15 @@ func TestConfig_Parse(t *testing.T) {
 	assert.Equal(t, 150, conf.Subscriber.WriteBufferSize)
 }
 
+func TestStoreMaxVarColValBytes(t *testing.T) {
+	store := config.NewStore()
+	require.Equal(t, int64(config.DefaultMaxVarColValBytes), int64(store.MaxVarColValBytes))
+	require.NoError(t, store.Validate())
+
+	store.MaxVarColValBytes = toml.Size(config.MaxVarColValBytes + 1)
+	require.Error(t, store.Validate())
+}
+
 func TestLogger(t *testing.T) {
 	dir := t.TempDir()
 

@@ -17,9 +17,11 @@ package immutable
 import (
 	"container/heap"
 	"errors"
+	"math"
 	"strings"
 	"sync/atomic"
 
+	"github.com/openGemini/openGemini/lib/errno"
 	Log "github.com/openGemini/openGemini/lib/logger"
 	"github.com/openGemini/openGemini/lib/record"
 	"github.com/openGemini/openGemini/lib/util"
@@ -45,6 +47,7 @@ type ChunkIterators struct {
 	merged        *record.Record
 	estimateSize  int
 	maxN          int
+	initErr       error
 
 	log *Log.Logger
 }
@@ -65,8 +68,14 @@ func NewChunkIterators(files []TSSPFile, dropping int64, signal chan struct{}, l
 		itr.WithLog(lg)
 		itr.WithSchema(schema)
 		ok := itr.Next()
-		if !ok || itr.err != nil {
+		if !ok {
+			if itr.err != nil && itrs.initErr == nil {
+				itrs.initErr = itr.err
+			}
 			itr.Close()
+			if itrs.initErr != nil {
+				break
+			}
 			continue
 		}
 		itrs.itrs = append(itrs.itrs, itr)
@@ -129,6 +138,9 @@ func (c *ChunkIterators) stopCompact() bool {
 func (c *ChunkIterators) Next() (uint64, *record.Record, error) {
 	defer func() { c.id = 0 }()
 
+	if c.initErr != nil {
+		return 0, nil, c.initErr
+	}
 	if c.Len() == 0 {
 		return 0, nil, nil
 	}
@@ -146,7 +158,10 @@ func (c *ChunkIterators) Next() (uint64, *record.Record, error) {
 	c.merged.SetSchema(rec.Schema)
 	c.merged.ReserveColVal(len(rec.Schema))
 	c.merged.ReserveColumnRows(rec.RowNums())
-	c.merged.Merge(rec)
+	if err := c.merged.TryMerge(rec); err != nil {
+		itr.Close()
+		return 0, nil, err
+	}
 
 	if !itr.Next() {
 		itr.Close()
@@ -160,7 +175,10 @@ func (c *ChunkIterators) Next() (uint64, *record.Record, error) {
 	for c.Len() > 0 {
 		itr, _ = heap.Pop(c).(*ChunkIterator)
 		if c.id == itr.id {
-			c.merged.Merge(itr.merge)
+			if err := c.merged.TryMerge(itr.merge); err != nil {
+				itr.Close()
+				return 0, nil, err
+			}
 			itr.id = 0
 		} else {
 			heap.Push(c, itr)
@@ -260,7 +278,18 @@ func (c *ChunkIterator) readRecord() error {
 	c.merge.SetSchema(c.fields)
 	c.merge.ReserveColVal(len(c.fields))
 
-	buf, err := c.readData(cMeta.offset, cMeta.size)
+	if c.dataSize < 0 || c.dataOffset > math.MaxInt64-c.dataSize {
+		return errno.NewError(errno.ErrCorruptTSSP, "invalid file data range")
+	}
+	rangeStart, rangeEnd, err := ChunkEntryRange(cMeta, c.dataOffset, c.dataOffset+c.dataSize)
+	if err != nil {
+		return err
+	}
+	rangeSize := rangeEnd - rangeStart
+	if rangeSize > math.MaxUint32 {
+		return errno.NewError(errno.ErrRequireStream, 0, rangeSize, uint64(math.MaxUint32))
+	}
+	buf, err := c.readData(rangeStart, uint32(rangeSize))
 	if err != nil {
 		return err
 	}
@@ -306,7 +335,10 @@ func decodeRecord(ctx *ReadContext, chunkData []byte, cm *ChunkMeta, dst *record
 		col := dst.Column(i)
 
 		for n := range colMeta.entries {
-			buf := columnData(chunkData, cm.offset, colMeta.entries[n].offset, colMeta.entries[n].size)
+			buf, rangeErr := columnData(chunkData, cm.offset, colMeta.entries[n].offset, colMeta.entries[n].size)
+			if rangeErr != nil {
+				return rangeErr
+			}
 
 			if ref.Name == record.TimeField {
 				err = appendTimeColumnData(buf, swap, ctx, false)
@@ -317,7 +349,12 @@ func decodeRecord(ctx *ReadContext, chunkData []byte, cm *ChunkMeta, dst *record
 				return err
 			}
 
-			col.AppendColVal(swap, ref.Type, 0, swap.Len)
+			if err = col.TryAppendColVal(swap, ref.Type, 0, swap.Len); err != nil {
+				if errno.Equal(err, errno.ErrNeedFlush, errno.ErrValueTooLarge) {
+					return errno.NewError(errno.ErrRequireStream, int64(len(col.Val)), int64(len(swap.Val)), record.GetMaxVarColValBytes())
+				}
+				return err
+			}
 		}
 		return nil
 	}

@@ -25,14 +25,13 @@ import (
 
 	"github.com/openGemini/openGemini/engine/immutable"
 	"github.com/openGemini/openGemini/lib/config"
-	"github.com/openGemini/openGemini/lib/logger"
+	"github.com/openGemini/openGemini/lib/errno"
 	"github.com/openGemini/openGemini/lib/record"
 	Statistics "github.com/openGemini/openGemini/lib/statisticsPusher/statistics"
 	"github.com/openGemini/openGemini/lib/stringinterner"
 	"github.com/openGemini/openGemini/lib/util"
 	"github.com/openGemini/openGemini/lib/util/lifted/vm/protoparser/influx"
 	"github.com/savsgio/dictpool"
-	"go.uber.org/zap"
 )
 
 type RecordIterator interface {
@@ -46,26 +45,26 @@ func NewTsMemTableImpl() *tsMemTableImpl {
 	return &tsMemTableImpl{}
 }
 
-func (t *tsMemTableImpl) WriteRecordForFlush(rec *record.Record, msb *immutable.MsBuilder, tbStore immutable.TablesStore, id uint64) *immutable.MsBuilder {
-	var err error
-
+func (t *tsMemTableImpl) WriteRecordForFlush(rec *record.Record, msb *immutable.MsBuilder, tbStore immutable.TablesStore, id uint64) (*immutable.MsBuilder, error) {
+	if err := record.ValidateRecord(rec); err != nil {
+		return msb, err
+	}
+	if msb == nil || tbStore == nil {
+		return msb, errors.New("nil builder or table store")
+	}
 	msb.StoreTimes()
-	msb, err = msb.WriteRecord(id, rec, func(fn immutable.TSSPFileName) (seq uint64, lv uint16, merge uint16, ext uint16) {
+	return msb.WriteRecord(id, rec, func(fn immutable.TSSPFileName) (seq uint64, lv uint16, merge uint16, ext uint16) {
 		return tbStore.NextSequence(), 0, 0, 0
 	})
-	if err != nil {
-		logger.GetLogger().Error("failed to write record", zap.Error(err))
-	}
-
-	return msb
 }
 
-func (t *tsMemTableImpl) FlushChunks(table *MemTable, dataPath, msName, _, _ string, lock *string, tbStore immutable.TablesStore, _ int64, fileInfos chan []immutable.FileInfoExtend) {
+func (t *tsMemTableImpl) FlushChunks(table *MemTable, dataPath, msName, _, _ string, lock *string, tbStore immutable.TablesStore, _ int64, fileInfos chan []immutable.FileInfoExtend) (_ *FlushResult, retErr error) {
 	msInfo, ok := table.msInfoMap[msName]
 	if !ok || msInfo == nil {
-		return
+		return nil, nil
 	}
 	sids := msInfo.GetAllSid()
+	defer PutSidsImpl(sids)
 
 	sidMap := msInfo.sidMap
 	sidLen := len(sids)
@@ -74,8 +73,19 @@ func (t *tsMemTableImpl) FlushChunks(table *MemTable, dataPath, msName, _, _ str
 	defer hlp.Release()
 
 	var orderMsBuilder, unOrderMsBuilder *immutable.MsBuilder
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		abortErr := errors.Join(orderMsBuilder.Abort(), unOrderMsBuilder.Abort())
+		if abortErr != nil {
+			retErr = errors.Join(retErr, &SnapshotAbortError{Err: abortErr})
+		}
+	}()
 	var mmsIdTime *immutable.MmsIdTime
 	var flushTime int64 = math.MinInt64
+	var orderRowsTotal, unorderRowsTotal, rowsTotal int64
+	var oooTimeBins [11]int64
 
 	recPool := []record.Record{{}, {}}
 	hasOrderFile := tbStore.GetTableFileNum(msName, true) > 0
@@ -90,6 +100,9 @@ func (t *tsMemTableImpl) FlushChunks(table *MemTable, dataPath, msName, _, _ str
 
 	for i := range sids {
 		chunk := sidMap[sids[i]]
+		if err := record.ValidateRecord(chunk.WriteRec.GetRecord()); err != nil {
+			return nil, err
+		}
 		chunk.SortRecord(hlp)
 		rec := chunk.WriteRec.GetRecord()
 
@@ -103,44 +116,85 @@ func (t *tsMemTableImpl) FlushChunks(table *MemTable, dataPath, msName, _, _ str
 		orderRec, unOrderRec := SplitRecordByTime(rec, recPool, flushTime)
 		orderRows := orderRec.RowNums()
 		if orderRows > 0 {
+			var err error
 			if orderMsBuilder == nil {
 				conf := immutable.GetTsStoreConfig()
-				orderMsBuilder = createMsBuilder(tbStore, true, lock, dataPath, msName, sidLen, orderRows, conf, config.TSSTORE)
+				orderMsBuilder, err = createMsBuilder(tbStore, true, lock, dataPath, msName, sidLen, orderRows, conf, config.TSSTORE)
+				if err != nil {
+					return nil, err
+				}
+				orderMsBuilder.DeferSequencerUpdate()
 			}
-			orderMsBuilder = t.WriteRecordForFlush(orderRec, orderMsBuilder, tbStore, chunk.Sid)
-			atomic.AddInt64(&Statistics.PerfStat.FlushOrderRowsCount, int64(orderRows))
+			orderMsBuilder, err = t.WriteRecordForFlush(orderRec, orderMsBuilder, tbStore, chunk.Sid)
+			if err != nil {
+				return nil, err
+			}
+			orderRowsTotal += int64(orderRows)
 		}
 
 		unOrderRows := unOrderRec.RowNums()
 		if unOrderRows > 0 {
+			var err error
 			if unOrderMsBuilder == nil {
 				conf := immutable.GetTsStoreConfig()
-				unOrderMsBuilder = createMsBuilder(tbStore, false, lock, dataPath, msName, sidLen, unOrderRows, conf, config.TSSTORE)
+				unOrderMsBuilder, err = createMsBuilder(tbStore, false, lock, dataPath, msName, sidLen, unOrderRows, conf, config.TSSTORE)
+				if err != nil {
+					return nil, err
+				}
+				unOrderMsBuilder.DeferSequencerUpdate()
 			}
-			unOrderMsBuilder = t.WriteRecordForFlush(unOrderRec, unOrderMsBuilder, tbStore, chunk.Sid)
-			atomic.AddInt64(&Statistics.PerfStat.FlushUnOrderRowsCount, int64(unOrderRows))
-
-			t.statUnordered(unOrderRec.Times(), flushTime)
+			unOrderMsBuilder, err = t.WriteRecordForFlush(unOrderRec, unOrderMsBuilder, tbStore, chunk.Sid)
+			if err != nil {
+				return nil, err
+			}
+			unorderRowsTotal += int64(unOrderRows)
+			accumulateUnorderedStats(&oooTimeBins, unOrderRec.Times(), flushTime)
 		}
 
-		atomic.AddInt64(&Statistics.PerfStat.FlushRowsCount, int64(orderRows+unOrderRows))
+		rowsTotal += int64(orderRows + unOrderRows)
 	}
 
-	orderFiles := t.finish(orderMsBuilder, fileInfos)
-	unOrderFiles := t.finish(unOrderMsBuilder, fileInfos)
+	orderFiles, err := t.finish(orderMsBuilder)
+	if err != nil {
+		return nil, err
+	}
+	unOrderFiles, err := t.finish(unOrderMsBuilder)
+	if err != nil {
+		return nil, err
+	}
 
-	// add both ordered/unordered files to list
-	tbStore.AddBothTSSPFiles(msInfo.GetFlushed(), msName, orderFiles, unOrderFiles)
-	PutSidsImpl(sids)
+	infos := make([]immutable.FileInfoExtend, 0)
+	if orderMsBuilder != nil {
+		infos = append(infos, orderMsBuilder.FilesInfo...)
+	}
+	if unOrderMsBuilder != nil {
+		infos = append(infos, unOrderMsBuilder.FilesInfo...)
+	}
+	return &FlushResult{
+		measurement:  msName,
+		flushed:      msInfo.GetFlushed(),
+		orderFiles:   orderFiles,
+		unorderFiles: unOrderFiles,
+		fileInfos:    infos,
+		fileInfoCh:   fileInfos,
+		builders:     []*immutable.MsBuilder{orderMsBuilder, unOrderMsBuilder},
+		orderRows:    orderRowsTotal,
+		unorderRows:  unorderRowsTotal,
+		rows:         rowsTotal,
+		oooTimeBins:  oooTimeBins,
+	}, nil
 }
 
 func (t *tsMemTableImpl) FlushRecords(tbStore immutable.TablesStore, itr RecordIterator, msName, dataPath string,
-	lock *string, fileInfos chan []immutable.FileInfoExtend) ([]immutable.TSSPFile, []immutable.TSSPFile) {
+	lock *string, fileInfos chan []immutable.FileInfoExtend) ([]immutable.TSSPFile, []immutable.TSSPFile, error) {
 
 	hlp := record.NewColumnSortHelper()
 	defer hlp.Release()
 
 	var orderMsBuilder, unOrderMsBuilder *immutable.MsBuilder
+	abort := func(err error) ([]immutable.TSSPFile, []immutable.TSSPFile, error) {
+		return nil, nil, errors.Join(err, orderMsBuilder.Abort(), unOrderMsBuilder.Abort())
+	}
 	var mmsIdTime *immutable.MmsIdTime
 	var flushTime int64 = math.MinInt64
 
@@ -163,12 +217,13 @@ func (t *tsMemTableImpl) FlushRecords(tbStore immutable.TablesStore, itr RecordI
 			break
 		}
 		if err != nil {
-			logger.GetLogger().Error("failed to iterator record. skip it", zap.Error(err))
-			continue
+			return abort(err)
 		}
 		if sid == 0 {
-			logger.GetLogger().Error("invalid series id. skip it")
-			continue
+			return abort(errors.New("invalid series id"))
+		}
+		if err = record.ValidateRecord(rec); err != nil {
+			return abort(err)
 		}
 
 		rec = hlp.Sort(rec)
@@ -185,9 +240,15 @@ func (t *tsMemTableImpl) FlushRecords(tbStore immutable.TablesStore, itr RecordI
 		if orderRows > 0 {
 			if orderMsBuilder == nil {
 				conf := immutable.GetTsStoreConfig()
-				orderMsBuilder = createMsBuilder(tbStore, true, lock, dataPath, msName, 0, orderRows, conf, config.TSSTORE)
+				orderMsBuilder, err = createMsBuilder(tbStore, true, lock, dataPath, msName, 0, orderRows, conf, config.TSSTORE)
+				if err != nil {
+					return abort(err)
+				}
 			}
-			orderMsBuilder = t.WriteRecordForFlush(orderRec, orderMsBuilder, tbStore, sid)
+			orderMsBuilder, err = t.WriteRecordForFlush(orderRec, orderMsBuilder, tbStore, sid)
+			if err != nil {
+				return abort(err)
+			}
 			atomic.AddInt64(&Statistics.PerfStat.FlushOrderRowsCount, int64(orderRows))
 		}
 
@@ -195,9 +256,15 @@ func (t *tsMemTableImpl) FlushRecords(tbStore immutable.TablesStore, itr RecordI
 		if unOrderRows > 0 {
 			if unOrderMsBuilder == nil {
 				conf := immutable.GetTsStoreConfig()
-				unOrderMsBuilder = createMsBuilder(tbStore, false, lock, dataPath, msName, 0, unOrderRows, conf, config.TSSTORE)
+				unOrderMsBuilder, err = createMsBuilder(tbStore, false, lock, dataPath, msName, 0, unOrderRows, conf, config.TSSTORE)
+				if err != nil {
+					return abort(err)
+				}
 			}
-			unOrderMsBuilder = t.WriteRecordForFlush(unOrderRec, unOrderMsBuilder, tbStore, sid)
+			unOrderMsBuilder, err = t.WriteRecordForFlush(unOrderRec, unOrderMsBuilder, tbStore, sid)
+			if err != nil {
+				return abort(err)
+			}
 			atomic.AddInt64(&Statistics.PerfStat.FlushUnOrderRowsCount, int64(unOrderRows))
 
 			t.statUnordered(unOrderRec.Times(), flushTime)
@@ -206,10 +273,28 @@ func (t *tsMemTableImpl) FlushRecords(tbStore immutable.TablesStore, itr RecordI
 		atomic.AddInt64(&Statistics.PerfStat.FlushRowsCount, int64(orderRows+unOrderRows))
 	}
 
-	orderFiles := t.finish(orderMsBuilder, fileInfos)
-	unOrderFiles := t.finish(unOrderMsBuilder, fileInfos)
+	orderFiles, err := t.finishAndPublish(orderMsBuilder)
+	if err != nil {
+		return abort(err)
+	}
+	unOrderFiles, err := t.finishAndPublish(unOrderMsBuilder)
+	if err != nil {
+		return abort(err)
+	}
+	if fileInfos != nil {
+		infos := make([]immutable.FileInfoExtend, 0)
+		if orderMsBuilder != nil {
+			infos = append(infos, orderMsBuilder.FilesInfo...)
+		}
+		if unOrderMsBuilder != nil {
+			infos = append(infos, unOrderMsBuilder.FilesInfo...)
+		}
+		if len(infos) > 0 {
+			fileInfos <- infos
+		}
+	}
 
-	return orderFiles, unOrderFiles
+	return orderFiles, unOrderFiles, nil
 }
 
 func (t *tsMemTableImpl) statUnordered(times []int64, flushTime int64) {
@@ -223,20 +308,75 @@ func (t *tsMemTableImpl) statUnordered(times []int64, flushTime int64) {
 	}
 }
 
-func (t *tsMemTableImpl) finish(msb *immutable.MsBuilder, fileInfos chan []immutable.FileInfoExtend) []immutable.TSSPFile {
+var oooTimeBucketLowerBounds = [...]int64{
+	0,
+	15 * int64(time.Second),
+	30 * int64(time.Second),
+	60 * int64(time.Second),
+	120 * int64(time.Second),
+	240 * int64(time.Second),
+	480 * int64(time.Second),
+	960 * int64(time.Second),
+	3600 * int64(time.Second),
+	28800 * int64(time.Second),
+	86400 * int64(time.Second),
+}
+
+func accumulateUnorderedStats(bins *[11]int64, times []int64, flushTime int64) {
+	if flushTime == math.MaxInt64 {
+		return
+	}
+	for _, tm := range times {
+		delay := flushTime - tm
+		idx := len(oooTimeBucketLowerBounds) - 1
+		for i := 1; i < len(oooTimeBucketLowerBounds); i++ {
+			if delay < oooTimeBucketLowerBounds[i] {
+				idx = i - 1
+				break
+			}
+		}
+		bins[idx]++
+	}
+}
+
+func (r *FlushResult) publishStats() {
+	if r == nil {
+		return
+	}
+	atomic.AddInt64(&Statistics.PerfStat.FlushOrderRowsCount, r.orderRows)
+	atomic.AddInt64(&Statistics.PerfStat.FlushUnOrderRowsCount, r.unorderRows)
+	atomic.AddInt64(&Statistics.PerfStat.FlushRowsCount, r.rows)
+	stat := Statistics.NewOOOTimeDistribution()
+	for i, count := range r.oooTimeBins {
+		if count > 0 {
+			stat.Add(oooTimeBucketLowerBounds[i], count)
+		}
+	}
+}
+
+func (t *tsMemTableImpl) finish(msb *immutable.MsBuilder) ([]immutable.TSSPFile, error) {
 	if msb == nil {
-		return nil
+		return nil, nil
 	}
 
+	if err := immutable.FinalizeMsBuilder(msb, true); err != nil {
+		return nil, err
+	}
+	return msb.Files, nil
+}
+
+// finishAndPublish preserves the non-snapshot FlushRecords contract used by
+// Shelf WAL conversion: returned files must already have their final names.
+// Snapshot FlushChunks intentionally uses finish instead and publishes only
+// after every measurement has prepared successfully.
+func (t *tsMemTableImpl) finishAndPublish(msb *immutable.MsBuilder) ([]immutable.TSSPFile, error) {
+	if msb == nil {
+		return nil, nil
+	}
 	if err := immutable.WriteIntoFile(msb, true, false, nil); err != nil {
-		logger.GetLogger().Error("rename init file failed", zap.String("mstName", msb.Name()), zap.Error(err))
+		return nil, err
 	}
-
-	files := msb.Files
-	if fileInfos != nil {
-		fileInfos <- msb.FilesInfo
-	}
-	return files
+	return msb.Files, nil
 }
 
 func SplitRecordByTime(rec *record.Record, pool []record.Record, time int64) (*record.Record, *record.Record) {
@@ -293,6 +433,13 @@ func SplitRecordByTime(rec *record.Record, pool []record.Record, time int64) (*r
 }
 
 func (t *tsMemTableImpl) WriteRows(table *MemTable, rowsD *dictpool.Dict, wc WriteRowsCtx) error {
+	table.batchWriteMu.Lock()
+	defer table.batchWriteMu.Unlock()
+
+	if err := t.preflightVarBytesBatch(table, rowsD); err != nil {
+		return err
+	}
+
 	var err error
 	for _, mapp := range rowsD.D {
 		rows, ok := mapp.Value.(*[]influx.Row)
@@ -341,6 +488,94 @@ func (t *tsMemTableImpl) WriteRows(table *MemTable, rowsD *dictpool.Dict, wc Wri
 	}
 
 	return nil
+}
+
+type varBytesBatchKey struct {
+	measurement string
+	sid         uint64
+	field       string
+}
+
+func (t *tsMemTableImpl) preflightVarBytesBatch(table *MemTable, rowsD *dictpool.Dict) error {
+	limit := record.GetMaxVarColValBytes()
+	deltas := make(map[varBytesBatchKey]int64)
+
+	for _, mapp := range rowsD.D {
+		rows, ok := mapp.Value.(*[]influx.Row)
+		if !ok {
+			return errors.New("can't map mmPoints")
+		}
+		if len(*rows) == 0 {
+			return errors.New("empty measurement row batch")
+		}
+		for i := range *rows {
+			row := &(*rows)[i]
+			if row.PrimaryId == 0 {
+				continue
+			}
+			for j := range row.Fields {
+				field := &row.Fields[j]
+				if field.Type != influx.Field_Type_String && field.Type != influx.Field_Type_Tag {
+					continue
+				}
+				valueBytes := int64(len(field.StrValue))
+				if err := record.CanAppendVarBytes(0, valueBytes, limit); err != nil {
+					return err
+				}
+				key := varBytesBatchKey{measurement: mapp.Key, sid: row.PrimaryId, field: field.Key}
+				delta := deltas[key]
+				if valueBytes > limit-delta {
+					return errno.NewError(errno.ErrValueTooLarge, delta+valueBytes, limit)
+				}
+				deltas[key] = delta + valueBytes
+			}
+		}
+	}
+
+	for key, delta := range deltas {
+		current, err := currentVarBytes(table, key)
+		if err != nil {
+			return err
+		}
+		if err = record.CanAppendVarBytes(current, delta, limit); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func currentVarBytes(table *MemTable, key varBytesBatchKey) (int64, error) {
+	table.mu.RLock()
+	msInfo := table.msInfoMap[key.measurement]
+	table.mu.RUnlock()
+	if msInfo == nil {
+		return 0, nil
+	}
+
+	msInfo.mu.RLock()
+	chunk := msInfo.sidMap[key.sid]
+	msInfo.mu.RUnlock()
+	if chunk == nil {
+		return 0, nil
+	}
+
+	chunk.Mu.Lock()
+	defer chunk.Mu.Unlock()
+	rec := chunk.WriteRec.rec
+	if rec == nil {
+		return 0, nil
+	}
+	idx := rec.Schema.FieldIndex(key.field)
+	if idx < 0 {
+		return 0, nil
+	}
+	if rec.Schema[idx].Type != influx.Field_Type_String && rec.Schema[idx].Type != influx.Field_Type_Tag {
+		return 0, errno.NewError(errno.ErrCorruptColumn, "string field conflicts with existing non-string column")
+	}
+	if err := record.ValidateCol(&rec.ColVals[idx], rec.Schema[idx].Type); err != nil {
+		return 0, err
+	}
+	return rec.ColVals[idx].VarBytes(), nil
 }
 
 func (t *tsMemTableImpl) appendFields(msInfo *MsInfo, chunk *WriteChunk, time int64, fields []influx.Field) (int64, error) {

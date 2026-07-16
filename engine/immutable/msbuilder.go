@@ -80,10 +80,15 @@ type MsBuilder struct {
 
 	pair      IdTimePairs
 	sequencer *Sequencer
-	msName    string // measurement name with version.
-	lock      *string
-	tier      uint64
-	ShardID   uint64
+	// Snapshot builders defer publication side effects until durable commit.
+	// Each sequencer entry is a copy of the per-file pair written to disk; the
+	// same flag also delays HotFileManager registration.
+	deferSequencerUpdate   bool
+	pendingSequencerUpdate []IdTimePairs
+	msName                 string // measurement name with version.
+	lock                   *string
+	tier                   uint64
+	ShardID                uint64
 
 	tcLocation         int8 // time cluster
 	Files              []TSSPFile
@@ -107,6 +112,19 @@ type FileInfoExtend struct {
 
 func NewMsBuilder(dir, name string, lockPath *string, conf *Config, idCount int, fileName TSSPFileName, tier uint64,
 	sequencer *Sequencer, estimateSize int, engineType config.EngineType, obsOpt *obs.ObsOptions, shardID uint64) *MsBuilder {
+	msBuilder, err := NewMsBuilderWithError(dir, name, lockPath, conf, idCount, fileName, tier,
+		sequencer, estimateSize, engineType, obsOpt, shardID)
+	if err != nil {
+		panic(err)
+	}
+	return msBuilder
+}
+
+// NewMsBuilderWithError is used by TSStore snapshot/compact attempts, where a
+// known filesystem failure must propagate to the attempt owner instead of
+// bypassing cleanup through panic.
+func NewMsBuilderWithError(dir, name string, lockPath *string, conf *Config, idCount int, fileName TSSPFileName, tier uint64,
+	sequencer *Sequencer, estimateSize int, engineType config.EngineType, obsOpt *obs.ObsOptions, shardID uint64) (*MsBuilder, error) {
 	msBuilder := genMsBuilder(dir, name, lockPath, conf, idCount, tier, sequencer, estimateSize, engineType)
 	msBuilder.obsOpt = obsOpt
 	msBuilder.FileName = fileName
@@ -115,12 +133,20 @@ func NewMsBuilder(dir, name string, lockPath *string, conf *Config, idCount int,
 	lock := fileops.FileLockOption(*lockPath)
 	pri := fileops.FilePriorityOption(fileops.IO_PRIORITY_NORMAL)
 	dir = filepath.Join(dir, name)
-	_ = fileops.MkdirAll(dir, 0750, lock)
+	if err := fileops.MkdirAll(dir, 0750, lock); err != nil {
+		msBuilder.Reset()
+		return nil, err
+	}
 	filePath, fileName := genFilePath(dir, fileName, obsOpt, FlushRemoteEnabled(tier))
 	msBuilder.FileName = fileName
 	_, err := fileops.Stat(filePath)
 	if err == nil {
-		panic(fmt.Sprintf("file(%v) exist", filePath))
+		msBuilder.Reset()
+		return nil, fmt.Errorf("file(%v) exist", filePath)
+	}
+	if !os.IsNotExist(err) {
+		msBuilder.Reset()
+		return nil, err
 	}
 
 	if FlushRemoteEnabled(tier) {
@@ -130,7 +156,8 @@ func NewMsBuilder(dir, name string, lockPath *string, conf *Config, idCount int,
 	}
 	if err != nil {
 		log.Error("create file fail", zap.String("name", filePath), zap.Error(err))
-		panic(err)
+		msBuilder.Reset()
+		return nil, err
 	}
 
 	limit := fileName.level > 0
@@ -147,7 +174,7 @@ func NewMsBuilder(dir, name string, lockPath *string, conf *Config, idCount int,
 		msBuilder.chunkMetaCodecCtx = GetChunkMetaCodecCtx()
 	}
 
-	return msBuilder
+	return msBuilder, nil
 }
 
 func FlushRemoteEnabled(tier uint64) bool {
@@ -389,7 +416,13 @@ func switchTsspFile(msb *MsBuilder, rec, totalRec *record.Record, rowsLimit int,
 	msb.FileName.SetExtend(ext)
 	msb.FileName.SetLevel(lv)
 
-	builder := NewMsBuilder(msb.Path, msb.Name(), msb.lock, msb.Conf, msb.MaxIds, msb.FileName, msb.tier, msb.sequencer, rec.Len(), engineType, msb.obsOpt, msb.ShardID)
+	builder, err := NewMsBuilderWithError(msb.Path, msb.Name(), msb.lock, msb.Conf, msb.MaxIds, msb.FileName, msb.tier, msb.sequencer, rec.Len(), engineType, msb.obsOpt, msb.ShardID)
+	if err != nil {
+		return msb, err
+	}
+	builder.deferSequencerUpdate = msb.deferSequencerUpdate
+	builder.pendingSequencerUpdate = append(builder.pendingSequencerUpdate, msb.pendingSequencerUpdate...)
+	msb.pendingSequencerUpdate = nil
 	builder.Files = append(builder.Files, msb.Files...)
 	builder.FilesInfo = append(builder.FilesInfo, msb.FilesInfo...)
 	builder.pkRec = append(builder.pkRec, msb.pkRec...)
@@ -1214,7 +1247,9 @@ func (b *MsBuilder) NewTSSPFile(tmp bool) (TSSPFile, error) {
 	}
 	dr.avgChunkRows /= len(b.pair.Rows)
 
-	validateFileName(b.FileName, dr.FileName(), b.lock)
+	if err = validateFileName(b.FileName, dr.FileName(), b.lock); err != nil {
+		return nil, err
+	}
 	f := &tsspFile{
 		name:   b.FileName,
 		reader: dr,
@@ -1225,24 +1260,27 @@ func (b *MsBuilder) NewTSSPFile(tmp bool) (TSSPFile, error) {
 	hotWriter, hot := b.diskFileWriter.(*HotFileWriter)
 	if hot {
 		dr.ApplyHotReader(hotWriter.BuildHotFileReader(dr.GetBasicFileReader()))
-		NewHotFileManager().Add(f)
+		if !b.deferSequencerUpdate {
+			NewHotFileManager().Add(f)
+		}
 		hotWriter.Release()
 	}
 	b.diskFileWriter = nil
 	return f, nil
 }
 
-func validateFileName(msbFileName TSSPFileName, filePath string, lockPath *string) {
+func validateFileName(msbFileName TSSPFileName, filePath string, lockPath *string) error {
 	var fName TSSPFileName
 	if err := fName.ParseFileName(filePath); err != nil {
-		panic(err)
+		return err
 	}
 	fName.lock = lockPath
 	order := strings.Contains(filePath, "out-of-order")
 	fName.SetOrder(!order)
 	if fName != msbFileName {
-		panic(fmt.Sprintf("fName:%v, bFName:%v", fName, msbFileName))
+		return fmt.Errorf("fName:%v, bFName:%v", fName, msbFileName)
 	}
+	return nil
 }
 
 func (b *MsBuilder) WriteData(id uint64, data *record.Record) error {
@@ -1270,14 +1308,18 @@ func (b *MsBuilder) WriteData(id uint64, data *record.Record) error {
 		}
 	}
 
-	b.encodeChunk, err = b.EncodeChunkDataImp.EncodeChunk(b.chunkBuilder, id, b.dataOffset, data, b.encodeChunk, b.timeSorted)
+	chunkStart := b.dataOffset
+	b.encodeChunk, err = b.EncodeChunkDataImp.EncodeChunk(b.chunkBuilder, id, chunkStart, data, b.encodeChunk, b.timeSorted)
 	if err != nil {
 		b.log.Error("encode chunk fail", zap.Error(err))
 		return err
 	}
-	b.dataOffset += int64(b.chunkBuilder.chunkMeta.size)
 
 	if err = b.writeToDisk(int64(data.RowNums())); err != nil {
+		return err
+	}
+	b.dataOffset, err = nextChunkDataOffset(chunkStart, b.diskFileWriter.DataSize(), b.chunkBuilder.chunkMeta)
+	if err != nil {
 		return err
 	}
 
@@ -1396,7 +1438,11 @@ func (b *MsBuilder) Flush() error {
 	}
 
 	if b.sequencer != nil {
-		b.sequencer.BatchUpdateCheckTime(&b.pair, false)
+		if b.deferSequencerUpdate {
+			b.pendingSequencerUpdate = append(b.pendingSequencerUpdate, cloneIdTimePairs(&b.pair))
+		} else {
+			b.sequencer.BatchUpdateCheckTime(&b.pair, false)
+		}
 	}
 
 	b.encIdTime = b.pair.Marshal(true, b.encIdTime[:0], b.chunkBuilder.colBuilder.coder)
@@ -1427,6 +1473,7 @@ func (b *MsBuilder) Flush() error {
 	b.fileSize = b.diskFileWriter.DataSize()
 	if err := b.diskFileWriter.Close(); err != nil {
 		b.log.Error("close file fail", zap.String("name", b.fd.Name()), zap.Error(err))
+		return err
 	}
 
 	return nil
@@ -1460,6 +1507,91 @@ func (b *MsBuilder) removeEmptyFile() {
 		b.fd = nil
 		b.diskFileWriter = nil
 	}
+}
+
+// Abort closes and removes every output owned by this builder. It is safe to
+// call more than once and is used to discard a failed snapshot/compaction
+// attempt before another attempt is started.
+func (b *MsBuilder) Abort() error {
+	if b == nil {
+		return nil
+	}
+
+	var errs []error
+	for _, f := range b.Files {
+		if f == nil {
+			continue
+		}
+		if err := RemoveTSSPFileOnAbort(f); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
+	}
+	b.Files = nil
+	b.FilesInfo = nil
+	b.pendingSequencerUpdate = nil
+
+	if b.diskFileWriter != nil {
+		name := ""
+		if b.fd != nil {
+			name = b.fd.Name()
+		}
+		writer := b.diskFileWriter
+		if err := writer.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			errs = append(errs, err)
+		}
+		if hotWriter, ok := writer.(*HotFileWriter); ok {
+			hotWriter.Release()
+		}
+		b.diskFileWriter = nil
+		if b.fd != nil {
+			if err := b.fd.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				errs = append(errs, err)
+			}
+			b.fd = nil
+		}
+		if name != "" {
+			lockPath := ""
+			if b.lock != nil {
+				lockPath = *b.lock
+			}
+			lock := fileops.FileLockOption(lockPath)
+			if err := fileops.Remove(name, lock); err != nil && !os.IsNotExist(err) {
+				errs = append(errs, err)
+			}
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+func cloneIdTimePairs(src *IdTimePairs) IdTimePairs {
+	return IdTimePairs{
+		Name: src.Name,
+		Ids:  append([]uint64(nil), src.Ids...),
+		Tms:  append([]int64(nil), src.Tms...),
+		Rows: append([]int64(nil), src.Rows...),
+	}
+}
+
+// DeferSequencerUpdate makes snapshot file finalization side-effect free.
+// Snapshot coordination publishes the sequencer and hot-file registrations
+// only after the durable commit manifest has reached the committed state.
+func (b *MsBuilder) DeferSequencerUpdate() {
+	if b != nil {
+		b.deferSequencerUpdate = true
+	}
+}
+
+// PublishSequencerUpdate applies all deferred per-file updates exactly once.
+func (b *MsBuilder) PublishSequencerUpdate() {
+	if b == nil || b.sequencer == nil {
+		return
+	}
+	for i := range b.pendingSequencerUpdate {
+		b.sequencer.BatchUpdateCheckTime(&b.pendingSequencerUpdate[i], false)
+	}
+	b.pendingSequencerUpdate = nil
+	b.deferSequencerUpdate = false
 }
 
 func (b *MsBuilder) FileVersion() uint64 {

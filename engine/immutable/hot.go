@@ -42,6 +42,10 @@ type HotFile interface {
 	FreeMemory()
 }
 
+type hotMemoryAccountant interface {
+	markHotMemoryAccounted() bool
+}
+
 type HotFiles struct {
 	files []HotFile
 }
@@ -212,6 +216,9 @@ func (m *HotFileManager) AddAll(files []TSSPFile) {
 func (m *HotFileManager) Add(f HotFile) {
 	memSize := f.InMemSize()
 	if memSize == 0 {
+		return
+	}
+	if accountant, ok := f.(hotMemoryAccountant); ok && !accountant.markHotMemoryAccounted() {
 		return
 	}
 

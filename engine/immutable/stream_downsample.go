@@ -350,7 +350,9 @@ func (c *StreamWriteFile) WriteMeta(cm *ChunkMeta) error {
 	c.validation()
 
 	cm.DelEmptyColMeta()
-	cm.size = uint32(c.writer.DataSize() - cm.offset)
+	if err := setChunkMetaSize(cm, c.writer.DataSize()-cm.offset); err != nil {
+		return err
+	}
 	cm.columnCount = uint32(len(cm.colMeta))
 	cm.segCount = uint32(len(cm.timeRange))
 	minT, maxT := cm.MinMaxTime()

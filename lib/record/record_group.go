@@ -49,7 +49,41 @@ func AppendFieldToCol(col *ColVal, field *influx.Field, size *int64) error {
 	return nil
 }
 
+func preflightAppendFields(rec *Record, fields []influx.Field, sameSchema bool) error {
+	limit := GetMaxVarColValBytes()
+	for i := range fields {
+		field := &fields[i]
+		if field.Type != influx.Field_Type_String && field.Type != influx.Field_Type_Tag {
+			continue
+		}
+
+		current := int64(0)
+		if sameSchema {
+			if i >= len(rec.ColVals)-1 || rec.Schema[i].Name != field.Key {
+				return errno.NewError(errno.ErrCorruptColumn, "same-schema field does not match record schema")
+			}
+			current = int64(len(rec.ColVals[i].Val))
+		} else {
+			for j := 0; j < len(rec.Schema)-1; j++ {
+				if rec.Schema[j].Name == field.Key {
+					current = int64(len(rec.ColVals[j].Val))
+					break
+				}
+			}
+		}
+
+		if err := CanAppendVarBytes(current, int64(len(field.StrValue)), limit); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func AppendFieldsToRecord(rec *Record, fields []influx.Field, time int64, sameSchema bool) (int64, error) {
+	if err := preflightAppendFields(rec, fields, sameSchema); err != nil {
+		return 0, err
+	}
+
 	// fast path
 	var size int64
 	if sameSchema {
@@ -127,6 +161,16 @@ func AppendFieldsToRecordSlow(rec *Record, fields []influx.Field, time int64) (i
 }
 
 func AppendRowToRecord(rec *Record, row *influx.Row) error {
+	for i := range row.Fields {
+		field := &row.Fields[i]
+		if field.Type != influx.Field_Type_String && field.Type != influx.Field_Type_Tag {
+			continue
+		}
+		if err := CanAppendVarBytes(0, int64(len(field.StrValue)), GetMaxVarColValBytes()); err != nil {
+			return err
+		}
+	}
+
 	sameSchema := false
 	if rec.RowNums() == 0 {
 		sameSchema = true

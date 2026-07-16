@@ -149,6 +149,13 @@ func NewEngine(dataPath, walPath string, options EngineOptions, ctx *meta.LoadCt
 	immutable.SetDetachedFlushEnabled(options.CsDetachedFlushEnabled)
 	immutable.SetFragmentsNumPerFlush(options.FragmentsNumPerFlush)
 	immutable.SetMaxRowsPerSegment4TsStore(options.MaxRowsPerSegment)
+	maxVarColValBytes := options.MaxVarColValBytes
+	if maxVarColValBytes <= 0 {
+		maxVarColValBytes = record.DefaultMaxVarColValBytes
+	}
+	if err := record.SetMaxVarColValBytes(maxVarColValBytes); err != nil {
+		return nil, err
+	}
 	obs.SetPrefixDataPath(dataPath)
 	immutable.Init()
 

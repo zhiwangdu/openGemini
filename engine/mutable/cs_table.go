@@ -162,7 +162,7 @@ func (c *CSMemTableImpl) getFlushManager(detachedEnabled bool, writeMs *immutabl
 	return fManager
 }
 
-func (c *CSMemTableImpl) FlushChunks(table *MemTable, dataPath, msName, db, rp string, lock *string, tbStore immutable.TablesStore, msRowCount int64, fileInfos chan []immutable.FileInfoExtend) {
+func (c *CSMemTableImpl) FlushChunks(table *MemTable, dataPath, msName, db, rp string, lock *string, tbStore immutable.TablesStore, msRowCount int64, fileInfos chan []immutable.FileInfoExtend) (*FlushResult, error) {
 	mstIdent := colstore.NewMeasurementIdent(db, rp)
 	mstIdent.SetName(msName)
 
@@ -171,29 +171,30 @@ func (c *CSMemTableImpl) FlushChunks(table *MemTable, dataPath, msName, db, rp s
 
 	if immutable.GetDetachedFlushEnabled() || config.GetProductType() == config.LogKeeper {
 		c.FlushChunksDetached(table, dataPath, mstIdent, lock, tbStore, msRowCount, fileInfos)
-		return
+		return nil, nil
 	}
 
 	msInfo, ok := table.msInfoMap[msName]
 	if !ok {
-		return
+		return nil, nil
 	}
 
 	mst, ok := colstore.MstManagerIns().GetByIdent(mstIdent)
 	if !ok || mst == nil {
 		logger.GetLogger().Error("measurement is not exits", zap.String("mst", msName))
-		return
+		return nil, nil
 	}
 
 	chunk := msInfo.writeChunk
 	rec := chunk.WriteRec.GetRecord()
 	if rec.RowNums() == 0 {
-		return
+		return nil, nil
 	}
 
 	indexRelation := mst.IndexRelation()
 	at := NewWriteAttached(msName, mst.PrimaryKey(), mst.SortKey(), &indexRelation)
 	at.FlushRecord(tbStore, chunk.WriteRec.GetRecord())
+	return nil, nil
 }
 
 func (c *CSMemTableImpl) FlushChunksDetached(table *MemTable, dataPath string, ident colstore.MeasurementIdent, lock *string, tbStore immutable.TablesStore, msRowCount int64, fileInfos chan []immutable.FileInfoExtend) {

@@ -1,6 +1,6 @@
 module github.com/VictoriaMetrics/VictoriaMetrics
 
-go 1.24
+go 1.26
 
 require (
 	github.com/VictoriaMetrics/fastcache v1.12.2

@@ -17,6 +17,7 @@ limitations under the License.
 package immutable
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -82,6 +83,7 @@ func (t *tsImmTableImpl) compactToLevel(m *MmsTables, group FilesInfo, full, isN
 	var compactErr error
 	var events *Events
 	var success = false
+	retryStream := false
 
 	if isNonStream {
 		compItrs := m.NewChunkIterators(group)
@@ -93,7 +95,21 @@ func (t *tsImmTableImpl) compactToLevel(m *MmsTables, group FilesInfo, full, isN
 		oldFilesSize = compItrs.estimateSize
 		newFiles, compactErr = m.compact(compItrs, group.oldFiles, group.toLevel, true, lcLog)
 		compItrs.Close()
-	} else {
+		if shouldRetryWithStream(compactErr, config.GetStoreConfig().Compact.CorrectTimeDisorder) {
+			switch {
+			case m.isClosed() || m.isCompMergeStopped():
+				compactErr = ErrCompStopped
+			case atomic.LoadInt64(group.dropping) > 0:
+				compactErr = ErrDroppingMst
+			default:
+				group, compactErr = rebuildFilesInfoForAttempt(group, lcLog)
+				if compactErr == nil {
+					retryStream = true
+				}
+			}
+		}
+	}
+	if !isNonStream || retryStream {
 		compItrs := m.NewStreamIterators(group)
 		if compItrs == nil {
 			group.compIts.Close()
@@ -110,7 +126,9 @@ func (t *tsImmTableImpl) compactToLevel(m *MmsTables, group FilesInfo, full, isN
 		oldFilesSize = compItrs.estimateSize
 		newFiles, compactErr = compItrs.compact(group.oldFiles, group.toLevel, true)
 		if compactErr != nil {
-			compItrs.RemoveTmpFiles()
+			if abortErr := compItrs.RemoveTmpFiles(); abortErr != nil {
+				compactErr = errors.Join(compactErr, &attemptAbortError{err: abortErr})
+			}
 		}
 		compItrs.Close()
 	}
@@ -133,7 +151,7 @@ func (t *tsImmTableImpl) compactToLevel(m *MmsTables, group FilesInfo, full, isN
 		return err
 	}
 
-	if !isNonStream {
+	if !isNonStream || retryStream {
 		NewHotFileManager().AddAll(newFiles)
 	}
 
@@ -148,6 +166,29 @@ func (t *tsImmTableImpl) compactToLevel(m *MmsTables, group FilesInfo, full, isN
 		compactStatItem.CompactedFileSize = SumFilesSize(newFiles)
 	}
 	return nil
+}
+
+func rebuildFilesInfoForAttempt(plan FilesInfo, log *Log.Logger) (FilesInfo, error) {
+	rebuilt := plan
+	rebuilt.compIts = make(FileIterators, 0, len(plan.oldFiles))
+	for _, f := range plan.oldFiles {
+		itr := NewFileIterator(f, log)
+		if !itr.NextChunkMeta() {
+			err := itr.err
+			itr.Close()
+			rebuilt.compIts.Close()
+			if err != nil {
+				return rebuilt, err
+			}
+			return rebuilt, errno.NewError(errno.ErrCorruptTSSP, "source file has no chunk metadata")
+		}
+		rebuilt.compIts = append(rebuilt.compIts, itr)
+	}
+	if len(rebuilt.compIts) != len(plan.oldFiles) {
+		rebuilt.compIts.Close()
+		return rebuilt, errno.NewError(errno.ErrCorruptTSSP, "not every source file has an iterator")
+	}
+	return rebuilt, nil
 }
 
 func (t *tsImmTableImpl) LevelPlan(m *MmsTables, level uint16) []*CompactGroup {
@@ -331,7 +372,14 @@ func (t *tsImmTableImpl) NewFileIterators(m *MmsTables, group *CompactGroup) (Fi
 		if itr.NextChunkMeta() {
 			fi.compIts = append(fi.compIts, itr)
 		} else {
-			continue
+			err := itr.err
+			itr.Close()
+			if err != nil {
+				fi.compIts.Close()
+				return fi, err
+			}
+			fi.compIts.Close()
+			return fi, errno.NewError(errno.ErrCorruptTSSP, "source file has no chunk metadata")
 		}
 
 		fi.updatingFilesInfo(f, itr)

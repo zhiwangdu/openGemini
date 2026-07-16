@@ -177,6 +177,7 @@ func (m *ColumnMeta) Clone() ColumnMeta {
 	return ColumnMeta{
 		name:    m.Name(),
 		ty:      m.ty,
+		preAgg:  append([]byte(nil), m.preAgg...),
 		entries: append([]Segment{}, m.entries...),
 	}
 }
@@ -523,6 +524,7 @@ func (m *ChunkMeta) Clone() *ChunkMeta {
 		size:        m.size,
 		columnCount: m.columnCount,
 		segCount:    m.segCount,
+		timeRange:   append([]SegmentRange(nil), m.timeRange...),
 		colMeta:     make([]ColumnMeta, 0, len(m.colMeta)),
 	}
 

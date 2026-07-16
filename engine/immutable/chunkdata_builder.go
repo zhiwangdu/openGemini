@@ -102,10 +102,14 @@ func (b *ChunkDataBuilder) EncodeTime(offset int64, timeSorted bool) error {
 		if b.colBuilder.encodeMode != nil {
 			b.chunk = b.colBuilder.encodeMode.setCrc(b.chunk, pos)
 		}
-		size := uint32(len(b.chunk) - pos)
+		actualSize := int64(len(b.chunk) - pos)
+		size, sizeErr := checkedSegmentSize(actualSize)
+		if sizeErr != nil {
+			return sizeErr
+		}
 		m.setSize(size)
 		b.updateTimeRange(i, values, timeSorted)
-		offset += int64(size)
+		offset += actualSize
 		b.chunkMeta.size += size
 	}
 	tm.preAgg = tb.marshal(tm.preAgg[:0])

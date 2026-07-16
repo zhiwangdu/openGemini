@@ -264,11 +264,108 @@ func GetSortKeys(schema []record.Field, primaryKeys []string) []record.PrimaryKe
 
 type MTable interface {
 	initMsInfo(msInfo *MsInfo, row *influx.Row, rec *record.Record, name string) *MsInfo
-	FlushChunks(table *MemTable, dataPath, msName, db, rp string, lock *string, tbStore immutable.TablesStore, msRowCount int64, fileInfos chan []immutable.FileInfoExtend)
+	FlushChunks(table *MemTable, dataPath, msName, db, rp string, lock *string, tbStore immutable.TablesStore, msRowCount int64, fileInfos chan []immutable.FileInfoExtend) (*FlushResult, error)
 	WriteRows(table *MemTable, rowsD *dictpool.Dict, wc WriteRowsCtx) error
 	WriteCols(table *MemTable, rec *record.Record, mst string) error
 	SetFlushManagerInfo(manager map[string]FlushManager, accumulateMetaIndex *sync.Map)
 	Reset(table *MemTable)
+}
+
+// FlushResult owns one measurement's prepared TSStore files. The files remain
+// temporary until the snapshot coordinator has prepared every measurement.
+type FlushResult struct {
+	measurement  string
+	flushed      *bool
+	orderFiles   []immutable.TSSPFile
+	unorderFiles []immutable.TSSPFile
+	fileInfos    []immutable.FileInfoExtend
+	fileInfoCh   chan []immutable.FileInfoExtend
+	builders     []*immutable.MsBuilder
+	orderRows    int64
+	unorderRows  int64
+	rows         int64
+	oooTimeBins  [11]int64
+}
+
+type SnapshotFile struct {
+	Temporary string
+	Final     string
+	Size      int64
+}
+
+// SnapshotAbortError means a failed prepare attempt could not fully remove
+// its temporary outputs. The snapshot generation must remain blocked for
+// manual recovery instead of being prepared again on top of unknown state.
+type SnapshotAbortError struct {
+	Err error
+}
+
+func (e *SnapshotAbortError) Error() string { return e.Err.Error() }
+func (e *SnapshotAbortError) Unwrap() error { return e.Err }
+
+func (r *FlushResult) SnapshotFiles() []SnapshotFile {
+	files := r.files()
+	ret := make([]SnapshotFile, 0, len(files))
+	for _, f := range files {
+		if f == nil {
+			continue
+		}
+		temporary := f.Path()
+		final := temporary
+		if immutable.IsTempleFile(filepath.Base(temporary)) {
+			final = temporary[:len(temporary)-len(immutable.GetTmpFileSuffix())]
+		}
+		ret = append(ret, SnapshotFile{Temporary: temporary, Final: final, Size: f.FileSize()})
+	}
+	return ret
+}
+
+func (r *FlushResult) files() []immutable.TSSPFile {
+	if r == nil {
+		return nil
+	}
+	files := make([]immutable.TSSPFile, 0, len(r.orderFiles)+len(r.unorderFiles))
+	files = append(files, r.orderFiles...)
+	files = append(files, r.unorderFiles...)
+	return files
+}
+
+func (r *FlushResult) Rename() error {
+	return immutable.RenameTmpFiles(r.files())
+}
+
+func (r *FlushResult) Register(tbStore immutable.TablesStore) {
+	if r == nil {
+		return
+	}
+	for i := range r.builders {
+		r.builders[i].PublishSequencerUpdate()
+	}
+	immutable.NewHotFileManager().AddAll(r.files())
+	tbStore.AddBothTSSPFiles(r.flushed, r.measurement, r.orderFiles, r.unorderFiles)
+	r.publishStats()
+	if r.fileInfoCh != nil && len(r.fileInfos) > 0 {
+		r.fileInfoCh <- r.fileInfos
+	}
+}
+
+func (r *FlushResult) Abort() error {
+	if r == nil {
+		return nil
+	}
+	var errs []error
+	for _, f := range r.files() {
+		if f == nil {
+			continue
+		}
+		if err := immutable.RemoveTSSPFileOnAbort(f); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
+	}
+	r.orderFiles = nil
+	r.unorderFiles = nil
+	r.builders = nil
+	return errors.Join(errs...)
 }
 
 // StoreMstRowCount is used to persist the rowcount value for mst-level pre-aggregation.
@@ -292,21 +389,21 @@ func LoadMstRowCount(countFile string) (int, error) {
 	return rowCount, nil
 }
 
-func createMsBuilder(tbStore immutable.TablesStore, order bool, lockPath *string, dataPath string, msName string, totalChunks int, size int, conf *immutable.Config, engineType config.EngineType) *immutable.MsBuilder {
+func createMsBuilder(tbStore immutable.TablesStore, order bool, lockPath *string, dataPath string, msName string, totalChunks int, size int, conf *immutable.Config, engineType config.EngineType) (*immutable.MsBuilder, error) {
 	seq := tbStore.Sequencer()
 	defer seq.UnRef()
 
 	FileName := immutable.NewTSSPFileName(tbStore.NextSequence(), 0, 0, 0, order, lockPath)
-	msb := immutable.NewMsBuilder(dataPath, msName, lockPath, conf, totalChunks, FileName, util.Hot, seq, size, engineType, tbStore.GetObsOption(), tbStore.GetShardID())
-	return msb
+	return immutable.NewMsBuilderWithError(dataPath, msName, lockPath, conf, totalChunks, FileName, util.Hot, seq, size, engineType, tbStore.GetObsOption(), tbStore.GetShardID())
 }
 
 type MemTableReleaseHook func(t *MemTable)
 
 type MemTable struct {
-	mu  sync.RWMutex
-	ref int32
-	idx *ski.ShardKeyIndex
+	mu           sync.RWMutex
+	batchWriteMu sync.Mutex
+	ref          int32
+	idx          *ski.ShardKeyIndex
 
 	msInfoMap map[string]*MsInfo // measurements schemas, {"cpu_0001": *MsInfo}
 	msInfos   []MsInfo           // pre-allocation
@@ -399,6 +496,29 @@ func (t *MemTable) ApplyConcurrency(f func(msName string)) {
 		}(k)
 	}
 	wg.Wait()
+}
+
+func (t *MemTable) ApplyConcurrencyErr(f func(msName string) error) error {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var errs []error
+	wg.Add(len(t.msInfoMap))
+	for k := range t.msInfoMap {
+		concurLimiter <- struct{}{}
+		go func(msName string) {
+			defer func() {
+				concurLimiter.Release()
+				wg.Done()
+			}()
+			if err := f(msName); err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+			}
+		}(k)
+	}
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 func (t *MemTable) SetReleaseHook(hook MemTableReleaseHook) {

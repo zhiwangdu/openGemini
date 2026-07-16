@@ -62,16 +62,11 @@ func pow2(v uint64) uint64 {
 }
 
 func WriteIntoFile(msb *MsBuilder, tmp bool, withPKIndex bool, ir *influxql.IndexRelation) error {
-	f, err := msb.NewTSSPFile(tmp)
-	if err != nil {
-		panic(err)
-	}
-	if f != nil {
-		msb.Files = append(msb.Files, f)
-		fileInfo := genFileInfo(f, msb)
-		msb.FilesInfo = append(msb.FilesInfo, fileInfo)
+	if err := FinalizeMsBuilder(msb, tmp); err != nil {
+		return err
 	}
 
+	var err error
 	if !withPKIndex {
 		err = RenameTmpFiles(msb.Files)
 	} else {
@@ -83,4 +78,22 @@ func WriteIntoFile(msb *MsBuilder, tmp bool, withPKIndex bool, ir *influxql.Inde
 	}
 
 	return RenameTmpFullTextIdxFile(msb)
+}
+
+// FinalizeMsBuilder closes the current output and appends its reader and file
+// information to the builder without publishing (renaming) any temporary file.
+func FinalizeMsBuilder(msb *MsBuilder, tmp bool) error {
+	if msb == nil {
+		return nil
+	}
+	f, err := msb.NewTSSPFile(tmp)
+	if err != nil {
+		return err
+	}
+	if f == nil {
+		return nil
+	}
+	msb.Files = append(msb.Files, f)
+	msb.FilesInfo = append(msb.FilesInfo, genFileInfo(f, msb))
+	return nil
 }

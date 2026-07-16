@@ -1143,8 +1143,53 @@ func (rec *Record) PadRecord(other *Record) {
 	}
 }
 
-// Merge only for level compaction use
+func (rec *Record) canMergeVarBytes(newRec *Record) error {
+	limit := GetMaxVarColValBytes()
+	newRecRows := newRec.RowNums()
+	for newIdx := 0; newIdx < newRec.ColNums()-1; newIdx++ {
+		typ := newRec.Schema[newIdx].Type
+		if typ != influx.Field_Type_String && typ != influx.Field_Type_Tag {
+			continue
+		}
+
+		appendBytes, err := newRec.ColVals[newIdx].VarBytesRange(0, newRecRows)
+		if err != nil {
+			return err
+		}
+		current := int64(0)
+		for oldIdx := 0; oldIdx < rec.ColNums()-1; oldIdx++ {
+			if rec.Schema[oldIdx].Name == newRec.Schema[newIdx].Name {
+				current = int64(len(rec.ColVals[oldIdx].Val))
+				break
+			}
+		}
+		if err = CanAppendVarBytes(current, appendBytes, limit); err != nil {
+			if errno.Equal(err, errno.ErrNeedFlush, errno.ErrValueTooLarge) {
+				return errno.NewError(errno.ErrRequireStream, current, appendBytes, limit)
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// TryMerge is the checked TSStore merge path. The variable-length budget is
+// checked before PadRecord mutates either record.
+func (rec *Record) TryMerge(newRec *Record) error {
+	if err := rec.canMergeVarBytes(newRec); err != nil {
+		return err
+	}
+	rec.merge(newRec)
+	return nil
+}
+
+// Merge keeps the historical unchecked behavior used by ColumnStore and
+// callers that do not participate in the TSStore uint32 protection protocol.
 func (rec *Record) Merge(newRec *Record) {
+	rec.merge(newRec)
+}
+
+func (rec *Record) merge(newRec *Record) {
 	rec.PadRecord(newRec)
 	newRecRows := newRec.RowNums()
 	oldColumnN, newColumnN := rec.ColNums(), newRec.ColNums()

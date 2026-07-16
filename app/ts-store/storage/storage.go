@@ -299,6 +299,7 @@ func OpenStorage(path string, node *metaclient.Node, cli *metaclient.Client, con
 	opt.MaxDownSampleTaskConcurrency = conf.Data.MaxDownSampleTaskConcurrency
 	opt.MaxSeriesPerDatabase = conf.Data.MaxSeriesPerDatabase
 	opt.MaxRowsPerSegment = conf.Data.MaxRowsPerSegment
+	opt.MaxVarColValBytes = int64(conf.Data.MaxVarColValBytes)
 	opt.ShardMoveLayoutSwitchEnabled = conf.Data.ShardMoveLayoutSwitchEnabled
 
 	executor.InitNagtPool(conf.Data.NagtPoolCap)

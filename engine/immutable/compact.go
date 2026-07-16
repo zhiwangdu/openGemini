@@ -152,14 +152,21 @@ func (m *MmsTables) NewChunkIterators(group FilesInfo) *ChunkIterators {
 		merged:        &record.Record{},
 	}
 
-	for _, i := range group.compIts {
+	for idx, i := range group.compIts {
 		if m.isClosed() || m.isCompMergeStopped() {
 			return nil
 		}
 		itr := NewChunkIterator(i)
 		itr.WithLog(CLog)
 		if !itr.Next() {
+			if itr.err != nil && compItrs.initErr == nil {
+				compItrs.initErr = itr.err
+			}
 			itr.Close()
+			if compItrs.initErr != nil {
+				group.compIts[idx+1:].Close()
+				break
+			}
 			continue
 		}
 		compItrs.itrs = append(compItrs.itrs, itr)
@@ -172,12 +179,40 @@ func (m *MmsTables) NewChunkIterators(group FilesInfo) *ChunkIterators {
 	return compItrs
 }
 
-func (m *MmsTables) compact(itrs *ChunkIterators, files []TSSPFile, level uint16, isOrder bool, cLog *Log.Logger) ([]TSSPFile, error) {
+type attemptAbortError struct {
+	err error
+}
+
+func (e *attemptAbortError) Error() string {
+	return "failed to abort compact attempt: " + e.err.Error()
+}
+func (e *attemptAbortError) Unwrap() error { return e.err }
+
+func shouldRetryWithStream(err error, correctTimeDisorder bool) bool {
+	if correctTimeDisorder || !errno.Equal(err, errno.ErrRequireStream) {
+		return false
+	}
+	var abortErr *attemptAbortError
+	return !errors.As(err, &abortErr)
+}
+
+func (m *MmsTables) compact(itrs *ChunkIterators, files []TSSPFile, level uint16, isOrder bool, cLog *Log.Logger) (_ []TSSPFile, retErr error) {
 	_, seq := files[0].LevelAndSequence()
 	fileName := NewTSSPFileName(seq, level, 0, 0, isOrder, m.lock)
-	tableBuilder := NewMsBuilder(m.path, itrs.name, m.lock, m.Conf, itrs.maxN, fileName, FilesMergedTire(files),
+	tableBuilder, err := NewMsBuilderWithError(m.path, itrs.name, m.lock, m.Conf, itrs.maxN, fileName, FilesMergedTire(files),
 		nil, itrs.estimateSize, config.TSSTORE, m.obsOpt, m.GetShardID())
+	if err != nil {
+		return nil, err
+	}
 	tableBuilder.WithLog(cLog)
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		if abortErr := tableBuilder.Abort(); abortErr != nil {
+			retErr = errors.Join(retErr, &attemptAbortError{err: abortErr})
+		}
+	}()
 
 	correctTimeDisorder := config.GetStoreConfig().Compact.CorrectTimeDisorder
 
@@ -200,7 +235,9 @@ func (m *MmsTables) compact(itrs *ChunkIterators, files []TSSPFile, level uint16
 			break
 		}
 
-		record.CheckRecord(rec)
+		if err = record.ValidateRecord(rec); err != nil {
+			return nil, err
+		}
 		if correctTimeDisorder {
 			rec = record.SortRecordIfNeeded(rec)
 			itrs.merged = rec

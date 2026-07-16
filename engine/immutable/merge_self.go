@@ -16,6 +16,7 @@ package immutable
 
 import (
 	"container/heap"
+	"errors"
 	"sync"
 
 	"github.com/openGemini/openGemini/lib/config"
@@ -45,18 +46,29 @@ func (m *MergeSelf) InitEvents(ctx *MergeContext) *Events {
 	return m.events
 }
 
-func (m *MergeSelf) Merge(mst string, toLevel uint16, files []TSSPFile) (TSSPFile, error) {
-	builder := m.createMsBuilder(mst, toLevel, files[0].FileName(), FilesMergedTire(files))
+func (m *MergeSelf) Merge(mst string, toLevel uint16, files []TSSPFile) (_ TSSPFile, retErr error) {
+	builder, err := m.createMsBuilder(mst, toLevel, files[0].FileName(), FilesMergedTire(files))
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		if abortErr := builder.Abort(); abortErr != nil {
+			retErr = errors.Join(retErr, &attemptAbortError{err: abortErr})
+		}
+	}()
 
 	sh := record.NewColumnSortHelper()
 	defer sh.Release()
 
 	itrs := m.createIterators(files)
+	defer itrs.Close()
 
 	for {
 		sid, rec, err := itrs.Next()
 		if err != nil {
-			builder.Reset()
 			return nil, err
 		}
 
@@ -66,17 +78,16 @@ func (m *MergeSelf) Merge(mst string, toLevel uint16, files []TSSPFile) (TSSPFil
 
 		m.events.TriggerWriteRecord(rec)
 
-		record.CheckRecord(rec)
+		if err = record.ValidateRecord(rec); err != nil {
+			return nil, err
+		}
 		rec = sh.Sort(rec)
 		itrs.merged = rec
 		builder, err = builder.WriteRecord(sid, rec, nil)
 		if err != nil {
-			builder.Reset()
 			return nil, err
 		}
 	}
-
-	itrs.Close()
 
 	merged, err := builder.NewTSSPFile(true)
 	if err == nil {
@@ -101,8 +112,14 @@ func (m *MergeSelf) createIterators(files []TSSPFile) *ChunkIterators {
 		itr := NewChunkIterator(fi)
 		itr.WithLog(m.lg)
 		ok := itr.Next()
-		if !ok || itr.err != nil {
+		if !ok {
+			if itr.err != nil && itrs.initErr == nil {
+				itrs.initErr = itr.err
+			}
 			itr.Close()
+			if itrs.initErr != nil {
+				break
+			}
 			continue
 		}
 		itrs.itrs = append(itrs.itrs, itr)
@@ -112,12 +129,11 @@ func (m *MergeSelf) createIterators(files []TSSPFile) *ChunkIterators {
 	return itrs
 }
 
-func (m *MergeSelf) createMsBuilder(mst string, toLevel uint16, fileName TSSPFileName, tier uint64) *MsBuilder {
+func (m *MergeSelf) createMsBuilder(mst string, toLevel uint16, fileName TSSPFileName, tier uint64) (*MsBuilder, error) {
 	fileName.merge = toLevel
 	fileName.lock = m.mts.lock
-	builder := NewMsBuilder(m.mts.path, mst, m.mts.lock, m.mts.Conf,
+	return NewMsBuilderWithError(m.mts.path, mst, m.mts.lock, m.mts.Conf,
 		0, fileName, tier, nil, 0, config.TSSTORE, nil, m.mts.shardId)
-	return builder
 }
 
 func (m *MergeSelf) Stop() {

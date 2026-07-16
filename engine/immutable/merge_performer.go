@@ -338,51 +338,50 @@ func (p *mergePerformer) HasSeries(sid uint64) bool {
 
 func (p *mergePerformer) WriteOriginal(fi *FileIterator) error {
 	meta := fi.GetCurtChunkMeta()
-
-	limit := uint32(fileops.DefaultBufferSize * 2)
-	offset := meta.offset
-	readSize := uint32(0)
-
-	d := p.sw.writer.DataSize() - meta.offset
-	meta.offset = p.sw.writer.DataSize()
-
-	var cm *ColumnMeta
-	for i := range meta.colMeta {
-		cm = &meta.colMeta[i]
-		for j := range cm.entries {
-			cm.entries[j].offset += d
-		}
+	dataEnd, err := checkedAddInt64(fi.dataOffset, fi.dataSize)
+	if err != nil {
+		return err
+	}
+	rangeStart, rangeEnd, err := ChunkEntryRange(meta, fi.dataOffset, dataEnd)
+	if err != nil {
+		return err
 	}
 
-	var buf []byte
-	var err error
-	var n int
+	targetMeta, err := cloneChunkMetaForCopy(meta, rangeStart, rangeEnd, p.sw.writer.DataSize())
+	if err != nil {
+		return err
+	}
+	total := rangeEnd - rangeStart
+	limit := int64(fileops.DefaultBufferSize * 2)
 
-	for readSize < meta.size {
-		if readSize+limit > meta.size {
-			limit = meta.size - readSize
+	for copied := int64(0); copied < total; {
+		readSize, sizeErr := nextChunkCopySize(copied, total, limit)
+		if sizeErr != nil {
+			return sizeErr
 		}
-		readSize += limit
+		offset, offsetErr := checkedAddInt64(rangeStart, copied)
+		if offsetErr != nil {
+			return offsetErr
+		}
+		buf, readErr := fi.readData(offset, readSize)
+		if readErr != nil {
+			return readErr
+		}
+		if len(buf) != int(readSize) {
+			return errno.NewError(errno.ShortRead, len(buf), readSize)
+		}
 
-		buf, err = fi.readData(offset, limit)
-		if err != nil {
-			return err
-		}
-		if len(buf) != int(limit) {
-			return errno.NewError(errno.ShortRead, len(buf), limit)
-		}
-		offset += int64(limit)
-
-		n, err = p.sw.writer.WriteData(buf)
-		if err != nil {
-			return err
+		n, writeErr := p.sw.writer.WriteData(buf)
+		if writeErr != nil {
+			return writeErr
 		}
 		if n != len(buf) {
 			return errno.NewError(errno.ShortWrite, n, len(buf))
 		}
+		copied += int64(readSize)
 	}
 
-	return p.sw.WriteMeta(meta)
+	return p.sw.WriteMeta(targetMeta)
 }
 
 func (p *mergePerformer) Close() {

@@ -214,6 +214,12 @@ const (
 	AlreadyHotFile                  = 2138
 	IndexIsMoving                   = 2139
 	ForbidIndexWrite                = 2140
+	ErrNeedFlush                    = 2141
+	ErrValueTooLarge                = 2142
+	ErrRequireStream                = 2143
+	ErrCorruptColumn                = 2144
+	ErrCorruptTSSP                  = 2145
+	ErrSegmentTooLarge              = 2146
 )
 
 // merge out of order

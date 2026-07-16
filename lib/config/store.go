@@ -47,6 +47,8 @@ const (
 	DefaultSelectAddress   = "127.0.0.1:8401"
 
 	DefaultInterruptSqlMemPct = 85
+	DefaultMaxVarColValBytes  = 256 * MB
+	MaxVarColValBytes         = 512 * MB
 
 	CompressAlgoLZ4    = "lz4"
 	CompressAlgoSnappy = "snappy"
@@ -293,7 +295,8 @@ type Store struct {
 
 	Merge Merge `toml:"merge"`
 
-	MaxRowsPerSegment int `toml:"max-rows-per-segment"`
+	MaxRowsPerSegment int       `toml:"max-rows-per-segment"`
+	MaxVarColValBytes toml.Size `toml:"max-var-colval-bytes"`
 
 	// in some scenarios, it is allowed to write past time but ordered data(for examle, some scenarios allow to write the past 14 days data in order)
 	EnableWriteHistoryOrderedData bool `toml:"enable-write-history-ordered-data"`
@@ -356,6 +359,7 @@ func NewStore() Store {
 		StringCompressAlgo:           CompressAlgoSnappy,
 		Merge:                        defaultMerge(),
 		MaxRowsPerSegment:            util.DefaultMaxRowsPerSegment4TsStore,
+		MaxVarColValBytes:            toml.Size(DefaultMaxVarColValBytes),
 		ShardMoveLayoutSwitchEnabled: false,
 		SkipRegisterColdShard:        true,
 		ClearEntryLogTolerateTime:    toml.Duration(6 * time.Hour),
@@ -448,6 +452,10 @@ func (c Store) Validate() error {
 	}
 	iv := intValidator{0, math.MaxInt64}
 	if err := iv.Validate(ivItems); err != nil {
+		return err
+	}
+	varBytesValidator := intValidator{1, MaxVarColValBytes}
+	if err := varBytesValidator.Validate([]intValidatorItem{{"data max-var-colval-bytes", int64(c.MaxVarColValBytes), false}}); err != nil {
 		return err
 	}
 

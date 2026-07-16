@@ -188,9 +188,13 @@ func (b *ColumnBuilder) encIntegerColumn(timeCols []record.ColVal, segCols []rec
 		if b.encodeMode != nil {
 			b.data = b.encodeMode.setCrc(b.data, pos)
 		}
-		size := uint32(len(b.data) - pos)
+		actualSize := int64(len(b.data) - pos)
+		size, sizeErr := checkedSegmentSize(actualSize)
+		if sizeErr != nil {
+			return sizeErr
+		}
 		m.setSize(size)
-		offset += int64(size)
+		offset += actualSize
 	}
 
 	b.colMeta.preAgg = b.intPreAggBuilder.marshal(b.colMeta.preAgg[:0])
@@ -238,10 +242,14 @@ func (b *ColumnBuilder) encFloatColumn(timeCols []record.ColVal, segCols []recor
 		if b.encodeMode != nil {
 			b.data = b.encodeMode.setCrc(b.data, pos)
 		}
-		size := uint32(len(b.data) - pos)
+		actualSize := int64(len(b.data) - pos)
+		size, sizeErr := checkedSegmentSize(actualSize)
+		if sizeErr != nil {
+			return sizeErr
+		}
 		m.setSize(size)
 
-		offset += int64(size)
+		offset += actualSize
 	}
 
 	b.colMeta.preAgg = b.floatPreAggBuilder.marshal(b.colMeta.preAgg[:0])
@@ -289,10 +297,14 @@ func (b *ColumnBuilder) encStringColumn(timeCols []record.ColVal, segCols []reco
 		if b.encodeMode != nil {
 			b.data = b.encodeMode.setCrc(b.data, pos)
 		}
-		size := uint32(len(b.data) - pos)
+		actualSize := int64(len(b.data) - pos)
+		size, sizeErr := checkedSegmentSize(actualSize)
+		if sizeErr != nil {
+			return sizeErr
+		}
 		m.setSize(size)
 
-		offset += int64(size)
+		offset += actualSize
 	}
 
 	b.colMeta.preAgg = b.stringPreAggBuilder.marshal(b.colMeta.preAgg[:0])
@@ -339,9 +351,13 @@ func (b *ColumnBuilder) encBooleanColumn(timeCols []record.ColVal, segCols []rec
 		if b.encodeMode != nil {
 			b.data = b.encodeMode.setCrc(b.data, pos)
 		}
-		size := uint32(len(b.data) - pos)
+		actualSize := int64(len(b.data) - pos)
+		size, sizeErr := checkedSegmentSize(actualSize)
+		if sizeErr != nil {
+			return sizeErr
+		}
 		m.setSize(size)
-		offset += int64(size)
+		offset += actualSize
 	}
 
 	b.colMeta.preAgg = b.boolPreAggBuilder.marshal(b.colMeta.preAgg[:0])

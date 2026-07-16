@@ -169,17 +169,25 @@ func Equal(err error, errno ...Errno) bool {
 		return false
 	}
 
-	e, ok := err.(*Error)
-	if !ok || e == nil {
-		return false
-	}
-
-	for i := range errno {
-		if e.Errno() == errno[i] {
-			return true
+	if e, ok := err.(*Error); ok && e != nil {
+		for i := range errno {
+			if e.Errno() == errno[i] {
+				return true
+			}
 		}
 	}
 
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, inner := range joined.Unwrap() {
+			if Equal(inner, errno...) {
+				return true
+			}
+		}
+		return false
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return Equal(wrapped.Unwrap(), errno...)
+	}
 	return false
 }
 

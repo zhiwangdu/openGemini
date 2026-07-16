@@ -207,18 +207,21 @@ func (mt *mergeTool) mergeSelf(ctx *MergeContext) {
 	}
 
 	if ctx.MergeSelfFast() {
-		mt.mergeSelfFastMode(ctx)
+		if err := mt.mergeSelfFastMode(ctx); shouldRetryWithStream(err, false) &&
+			!mt.mts.isClosed() && !mt.mts.isCompMergeStopped() {
+			mt.mergeSelfStreamMode(ctx)
+		}
 		return
 	}
 
 	mt.mergeSelfStreamMode(ctx)
 }
 
-func (mt *mergeTool) mergeSelfFastMode(ctx *MergeContext) {
+func (mt *mergeTool) mergeSelfFastMode(ctx *MergeContext) error {
 	files, err := mt.mts.getFilesByPath(ctx.mst, ctx.unordered.path, false)
 	if err != nil {
 		mt.zlg.Error("failed to get files", zap.Error(err))
-		return
+		return err
 	}
 
 	ms := NewMergeSelf(mt.mts, mt.lg)
@@ -257,6 +260,7 @@ func (mt *mergeTool) mergeSelfFastMode(ctx *MergeContext) {
 		zap.Uint16("level", ctx.ToLevel()),
 		zap.Any("err", err),
 		zap.String("mst", ctx.mst))
+	return err
 }
 
 func (mt *mergeTool) mergeSelfStreamMode(ctx *MergeContext) {

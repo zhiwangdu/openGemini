@@ -61,14 +61,14 @@ func newColumnStoreImpl(db, rp string, snapshotTblNum int) *ColumnStoreImpl {
 	}
 }
 
-func (storage *ColumnStoreImpl) writeSnapshot(s *shard) {
+func (storage *ColumnStoreImpl) writeSnapshot(s *shard) error {
 	if s.SnapShotter != nil {
 		atomic.StoreUint32(&s.SnapShotter.RaftFlag, 0)
 	}
 	s.snapshotLock.Lock()
 	if s.activeTbl == nil {
 		s.snapshotLock.Unlock()
-		return
+		return nil
 	}
 	walFiles, err := s.wal.Switch()
 	if err != nil {
@@ -107,10 +107,14 @@ func (storage *ColumnStoreImpl) writeSnapshot(s *shard) {
 		defer storage.wg.Done()
 		storage.flush(s, idx, curSize, walFiles, start)
 	}()
+	return nil
 }
 
 func (storage *ColumnStoreImpl) flush(s *shard, idx int, curSize int64, walFiles *WalFiles, start time.Time) {
-	s.commitSnapshot(storage.snapshotContainer[idx])
+	if err := s.commitSnapshot(storage.snapshotContainer[idx]); err != nil {
+		s.log.Error("column-store snapshot commit failed", zap.Error(err))
+		return
+	}
 	nodeMutableLimit.freeResource(curSize)
 	err := removeWalFiles(walFiles)
 	if err != nil {
@@ -161,9 +165,9 @@ func (storage *ColumnStoreImpl) isSnapShotTblFree() bool {
 	return false
 }
 
-func (storage *ColumnStoreImpl) ForceFlush(s *shard) {
+func (storage *ColumnStoreImpl) ForceFlush(s *shard) error {
 	if s.indexBuilder == nil {
-		return
+		return nil
 	}
 	s.enableForceFlush()
 	defer s.disableForceFlush()
@@ -172,11 +176,12 @@ func (storage *ColumnStoreImpl) ForceFlush(s *shard) {
 	idx := storage.getFreeSnapShotTbl()
 	if idx == -1 {
 		log.Debug("there is no free snapshot table", zap.Uint64("shard id", s.ident.ShardID))
-		return
+		return nil
 	}
 	s.prepareSnapshot()
-	s.storage.writeSnapshot(s)
+	err := s.storage.writeSnapshot(s)
 	s.endSnapshot()
+	return err
 }
 
 func (storage *ColumnStoreImpl) getFreeSnapShotTbl() int {

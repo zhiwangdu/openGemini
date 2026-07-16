@@ -180,7 +180,9 @@ func (itr *SeriesIdIterator) readRecordFromTSSPFile(reader immutable.TSSPFile, d
 		if swap == nil || swap.RowNums() == 0 {
 			return nil
 		}
-		dst.Merge(swap)
+		if err = dst.TryMerge(swap); err != nil {
+			return err
+		}
 	}
 	return nil
 }
