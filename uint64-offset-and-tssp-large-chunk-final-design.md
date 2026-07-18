@@ -1,8 +1,8 @@
-# TSStore ColVal uint64、TSSP Large Chunk 与 TSI MergeSet 最终设计
+# TSStore ColVal uint64 与 TSSP Large Chunk 最终设计
 
 > 文档状态：评审稿。本文整合 ColVal 64 位内存偏移与 TSSP large chunk 两项设计，仅描述目标方案、设计约束和能力边界，不包含实施步骤与代码修改清单。
 
-本文只定义 `EngineType=TSSTORE` 的 ColVal/TSSP large-chunk 能力及 TSI（Primary MergeSet）兼容性。ColumnStore、TextIndex、Attached/Detached 及其他列存相关引擎或索引不在设计范围内，本文不对其行为与兼容性作结论。
+本文只定义 `EngineType=TSSTORE` 的 ColVal/TSSP large-chunk 数据链。其他系统不在设计范围内，本文不对其行为与兼容性作结论。
 
 ## 一、方案阐述
 
@@ -12,7 +12,7 @@
 
 方案同时满足以下目标：
 
-- 不改变 TSStore TSSP、Record、WAL 和 TSI MergeSet 的既有格式；
+- 不改变 TSStore TSSP、Record 和 WAL 的既有格式；
 - 不以 shard 级 4 GiB 限制作为常规写入背压，避免大流量场景出现显著性能退化；
 - large chunk 的写入、读取及下游消费均保持有界工作集；
 - 普通数据继续保持新旧版本双向兼容。
@@ -33,8 +33,6 @@
    - writer 根据实际物理写入范围确定 chunk 长度及后续位置，不依赖被截断的磁盘 size；
    - 小 chunk 保留整块处理能力，large chunk 采用 Segment 级流式写入、读取和消费。
 
-TSI（Primary MergeSet）保持既有格式与能力。它根据写入行的 measurement、series key 和 tags 构建主索引，不消费 String field 的累计 value buffer，因此 ColVal 64 位 offset 和 TSSP large chunk 不要求升级 MergeSet 格式。
-
 ### 1.3 能力范围
 
 | 范围 | 设计结论 |
@@ -43,11 +41,10 @@ TSI（Primary MergeSet）保持既有格式与能力。它根据写入行的 mea
 | TSStore TSSP chunk | 支持真实长度超过 4 GiB |
 | 单个 TSSP Segment | 继续受现有 32 位格式上限约束 |
 | TSStore Record/WAL 边界 | 格式不变，按现有边界受检转换 |
-| TSI（Primary MergeSet） | 主索引格式与查询语义不变，不扩展单个索引项上限 |
 | 运行架构 | 持久化写角色仅支持 64 位架构 |
 | 历史损坏文件 | 仅恢复 size 回绕且绝对 offset 正确的文件，不自动修复已污染的绝对 offset |
 
-本设计不扩展单 value、单 Segment、TSStore Record/WAL frame 或单个 MergeSet item 的既有上限，也不改变 TSSP 与 MergeSet 的文件版本、字段宽度和字段顺序。
+本设计不扩展单 value、单 Segment 或 TSStore Record/WAL frame 的既有上限，也不改变 TSSP 的文件版本、字段宽度和字段顺序。
 
 TSStore WAL replay 工作集优化和 merge streamMode 的 large chunk 流式能力属于独立工作项。在相应能力完成前，可能进入这些路径的 large chunk 写入必须保持关闭。
 
@@ -71,8 +68,6 @@ TSStore WAL replay 工作集优化和 merge streamMode 的 large chunk 流式能
 | ChunkMeta size | chunk 的 64 位真实物理长度 | 保留现有 32 位值域与编码 |
 | Segment offset | Segment 的 64 位物理起点 | 保持现有格式 |
 | Segment size | Segment 的真实编码长度，且可由 32 位表达 | 保持现有 32 位字段 |
-| MergeSet item range | 有界 block 内的局部位置 | 保持现有格式 |
-| MergeSet file offset | 索引文件中的物理位置 | 保持现有宽位表达 |
 
 其中：
 
@@ -99,7 +94,7 @@ String/Tag 的 offset 应满足以下不变量：
 
 ### 2.3 既有 32 位边界
 
-TSStore TSSP Segment、Record、WAL 以及 TSI MergeSet 保持原有布局、版本、字节序和数值语义。
+TSStore TSSP Segment、Record 和 WAL 保持原有布局、版本、字节序和数值语义。
 
 跨边界遵循以下规则：
 
@@ -153,20 +148,7 @@ TSStore compact、merge、snapshot、复制等整块消费者遵循统一能力�
 
 TSStore merge streamMode 在独立优化完成前属于不具备 large chunk 能力的路径，不参与 large writer 的可达范围。
 
-### 2.7 TSI（Primary MergeSet）兼容语义
-
-TSStore 数据链与 TSI 主索引链相互正交：前者以 ColVal 承载字段值并写入 TSSP，后者根据行级 measurement、series key 和 tags 维护 Series 身份与检索映射。两者不共享 ColVal offset、ChunkMeta size 或 Segment range 语义。
-
-MergeSet 维持以下约束：
-
-- item range 继续表示有界 block 内的局部范围，索引文件物理位置沿用既有宽位表达；
-- 持久化字节、查询语义及历史索引读取方式保持不变，不因本方案重建索引；
-- 多 Series 大字段使 TSSP chunk 累计超过 4 GiB，不等于单个 series key、tag 或 MergeSet item 可以突破既有上限；
-- 索引项超出现有能力时沿用既有拒绝语义，不截断，也不借用 ColVal 64 位能力规避。
-
-因此，TSI 不需要随 ColVal 扩宽自身 block-local offset；large-chunk 的 reader-first 门禁仅约束 TSStore TSSP 数据链。
-
-### 2.8 资源控制与异常语义
+### 2.7 资源控制与异常语义
 
 64 位表示解决的是格式表达上限，不代表放弃资源治理。资源控制应基于实际内存、I/O 和并发预算，而不是以 shard 级 4 GiB 格式上限统一拒绝写入。
 
@@ -174,12 +156,12 @@ large chunk 路径必须满足：
 
 - 峰值工作集由单 Segment、固定缓冲及必要元数据约束，不随完整 chunk 大小线性增长；
 - 资源不足、格式不可表达、能力未开放和数据损坏是不同的异常语义；
-- 所有长度加法、范围计算、索引转换和外部格式转换均受检；
+- 所有长度加法、范围计算、内存下标转换和外部格式转换均受检；
 - 异常以显式错误结束，不 panic、不静默继续、不产生部分输出。
 
 若历史文件仅发生磁盘 size 回绕且物理区间有效，可恢复真实 size 并记录可观测事件；若绝对 offset 污染、区间重叠或越界，则告警并隔离文件。
 
-### 2.9 兼容性与能力演进
+### 2.8 兼容性与能力演进
 
 | 场景 | 兼容结论 |
 | --- | --- |
@@ -187,8 +169,6 @@ large chunk 路径必须满足：
 | 新版本普通 TSSP 文件由旧 reader 读取 | 兼容，线格式不变 |
 | 新版本 large TSSP 文件由新 reader 读取 | 兼容 |
 | 新版本 large TSSP 文件由旧 reader 读取 | 不兼容，必须通过能力门禁隔离 |
-| 旧版本 MergeSet 文件由新版本读取 | 兼容 |
-| 新版本 MergeSet 文件由旧版本读取 | 兼容，格式不变 |
 
 由于 TSSP 不新增磁盘格式版本，large chunk 能力必须通过节点、角色和 TSStore 文件读写能力共同约束：
 
@@ -199,7 +179,7 @@ large chunk 路径必须满足：
 
 历史文件是否存在绝对 offset 污染，不能依靠单次随机查询证明。启用 large writer 前应完成文件级顺序审计；只对 size 回绕且绝对范围正确的文件进行自动恢复，其余文件进入告警和隔离流程。
 
-### 2.10 设计成立条件
+### 2.9 设计成立条件
 
 本设计通过评审与后续验收时，应至少满足以下条件：
 
@@ -209,6 +189,5 @@ large chunk 路径必须满足：
 - TSStore reader 能稳定恢复真实 size，并拒绝不连续、重叠或越界的物理范围；
 - large chunk 的写入、查询和已声明支持的消费者保持有界工作集；
 - 未声明支持的 TSStore 消费路径在产生副作用前失败；
-- 大字段累计 offset 不改变同批写入的 Series/tag 主索引结果，MergeSet 持久化格式保持不变；
 - reader-first 门禁能够阻止旧 reader 接管 large 文件；
 - 历史可恢复异常与物理 offset 损坏能够被明确区分。
