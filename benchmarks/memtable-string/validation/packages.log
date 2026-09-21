@@ -1,0 +1,4 @@
+ok  	github.com/openGemini/openGemini/lib/record	0.059s
+ok  	github.com/openGemini/openGemini/engine/mutable	3.026s
+ok  	github.com/openGemini/openGemini/lib/util/lifted/vm/protoparser/influx	0.010s
+ok  	github.com/openGemini/openGemini/coordinator	10.119s

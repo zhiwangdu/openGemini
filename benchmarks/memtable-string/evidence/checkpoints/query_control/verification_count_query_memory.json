@@ -1,0 +1,22 @@
+{
+  "results": [
+    {
+      "statement_id": 0,
+      "series": [
+        {
+          "name": "large_field",
+          "columns": [
+            "time",
+            "count"
+          ],
+          "values": [
+            [
+              0,
+              6554
+            ]
+          ]
+        }
+      ]
+    }
+  ]
+}

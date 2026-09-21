@@ -1,0 +1,154 @@
+diff --git a/engine/memory_diagnostic.go b/engine/memory_diagnostic.go
+new file mode 100644
+index 00000000..454c01da
+--- /dev/null
++++ b/engine/memory_diagnostic.go
+@@ -0,0 +1,84 @@
++//go:build memdiag
++
++package engine
++
++import (
++	"encoding/json"
++	"net"
++	"net/http"
++	"os"
++	"runtime"
++	"runtime/debug"
++	"sync/atomic"
++	"time"
++
++	"github.com/openGemini/openGemini/engine/mutable"
++	"github.com/openGemini/openGemini/lib/config"
++	"github.com/openGemini/openGemini/lib/statisticsPusher/statistics"
++)
++
++// This private listener is compiled only in experimental binaries. It is never
++// enabled without an explicit loopback address supplied by the experiment runner.
++func init() {
++	addr := os.Getenv("OG_MEMDIAG_ADDR")
++	if addr == "" {
++		return
++	}
++	host, _, err := net.SplitHostPort(addr)
++	if err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
++		panic("OG_MEMDIAG_ADDR must be a loopback IP address")
++	}
++	mux := http.NewServeMux()
++	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
++		var ms runtime.MemStats
++		runtime.ReadMemStats(&ms)
++		out := map[string]any{
++			"time_ns": time.Now().UnixNano(), "memstats": ms,
++			"flush_count":     atomic.LoadInt64(&statistics.PerfStat.FlushSnapshotCount),
++			"write_rows":      atomic.LoadInt64(&statistics.PerfStat.WriteRowsCount),
++			"gomaxprocs":      runtime.GOMAXPROCS(0),
++			"memtable_config": config.GetMemTableConfig(),
++		}
++		if r.URL.Query().Get("detail") == "1" {
++			type shardMemory struct {
++				ID       uint64
++				Active   mutable.DiagnosticMemory
++				Snapshot mutable.DiagnosticMemory
++			}
++			var shards []shardMemory
++			compWorker.mu.RLock()
++			for id, sh := range compWorker.sources {
++				sh.snapshotLock.RLock()
++				shards = append(shards, shardMemory{id, sh.activeTbl.DiagnosticMemory(), sh.snapshotTbl.DiagnosticMemory()})
++				sh.snapshotLock.RUnlock()
++			}
++			compWorker.mu.RUnlock()
++			out["shards"] = shards
++		}
++		w.Header().Set("Content-Type", "application/json")
++		_ = json.NewEncoder(w).Encode(out)
++	})
++	mux.HandleFunc("/gc", func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodPost {
++			w.WriteHeader(http.StatusMethodNotAllowed)
++			return
++		}
++		runtime.GC()
++		w.WriteHeader(http.StatusNoContent)
++	})
++	mux.HandleFunc("/free-os-memory", func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodPost {
++			w.WriteHeader(http.StatusMethodNotAllowed)
++			return
++		}
++		debug.FreeOSMemory()
++		w.WriteHeader(http.StatusNoContent)
++	})
++	ln, err := net.Listen("tcp", addr)
++	if err != nil {
++		panic(err)
++	}
++	go func() {
++		_ = (&http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}).Serve(ln)
++	}()
++}
+diff --git a/engine/mutable/memory_diagnostic.go b/engine/mutable/memory_diagnostic.go
+new file mode 100644
+index 00000000..8ae09df0
+--- /dev/null
++++ b/engine/mutable/memory_diagnostic.go
+@@ -0,0 +1,58 @@
++//go:build memdiag
++
++package mutable
++
++// DiagnosticMemory reports owned TSSTORE column buffers. Metadata, allocator
++// rounding and index memory are deliberately excluded; heap profiles cover them.
++type DiagnosticMemory struct {
++	LogicalBytes      int64
++	Measurements      int
++	Series            int
++	Rows              int
++	UnorderedRecords  int
++	ValueLen          int
++	ValueCap          int
++	OffsetLenBytes    int
++	OffsetCapBytes    int
++	BitmapLen         int
++	BitmapCap         int
++	MaxColumnValueCap int
++}
++
++func (t *MemTable) DiagnosticMemory() DiagnosticMemory {
++	var d DiagnosticMemory
++	if t == nil {
++		return d
++	}
++	t.mu.RLock()
++	defer t.mu.RUnlock()
++	d.LogicalBytes = t.GetMemSize()
++	d.Measurements = len(t.msInfoMap)
++	for _, ms := range t.msInfoMap {
++		ms.mu.RLock()
++		for _, chunk := range ms.sidMap {
++			chunk.Mu.Lock()
++			rec := chunk.WriteRec.rec
++			if rec != nil {
++				d.Series++
++				d.Rows += rec.RowNums()
++				if !chunk.WriteRec.timeAsd {
++					d.UnorderedRecords++
++				}
++				for i := range rec.ColVals {
++					col := &rec.ColVals[i]
++					d.ValueLen += len(col.Val)
++					d.ValueCap += cap(col.Val)
++					d.OffsetLenBytes += len(col.Offset) * 4
++					d.OffsetCapBytes += cap(col.Offset) * 4
++					d.BitmapLen += len(col.Bitmap)
++					d.BitmapCap += cap(col.Bitmap)
++					d.MaxColumnValueCap = max(d.MaxColumnValueCap, cap(col.Val))
++				}
++			}
++			chunk.Mu.Unlock()
++		}
++		ms.mu.RUnlock()
++	}
++	return d
++}

@@ -1,0 +1,8 @@
+# Keep new experiment output out of the investigation branch.
+/bin/
+/source/
+/runs/
+/.venv/
+__pycache__/
+*.heap
+*.tssp

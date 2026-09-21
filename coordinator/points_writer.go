@@ -31,6 +31,7 @@ import (
 	"github.com/openGemini/openGemini/lib/config"
 	"github.com/openGemini/openGemini/lib/errno"
 	"github.com/openGemini/openGemini/lib/logger"
+	"github.com/openGemini/openGemini/lib/memexperiment"
 	"github.com/openGemini/openGemini/lib/msgservice"
 	"github.com/openGemini/openGemini/lib/netstorage"
 	"github.com/openGemini/openGemini/lib/pointsdecoder"
@@ -989,9 +990,13 @@ func (s *LocalStore) WriteRows(ctx *netstorage.WriteContext, nodeID uint64, pt u
 		return fmt.Errorf("exp db: %v, rp: %v, but got: %v, %v", database, rp, db, rpName)
 	}
 	//
-	pBuf, err := netstorage.MarshalRows(ctx, db, rp, pt)
-	if err != nil {
-		return err
+	var pBuf []byte
+	var err error
+	if !memexperiment.SingleMarshal || len(ctx.StreamShards) > 0 {
+		pBuf, err = netstorage.MarshalRows(ctx, db, rp, pt)
+		if err != nil {
+			return err
+		}
 	}
 
 	if len(ctx.StreamShards) > 0 {

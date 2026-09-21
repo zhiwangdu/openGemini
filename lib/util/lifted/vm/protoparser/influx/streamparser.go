@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/openGemini/openGemini/lib/memexperiment"
 	"io"
 	"sync"
 	"time"
@@ -125,6 +126,14 @@ func (ctx *streamContext) reset() {
 	ctx.br.Reset(nil)
 	ctx.ReqBuf = ctx.ReqBuf[:0]
 	ctx.tailBuf = ctx.tailBuf[:0]
+	if memexperiment.PoolLimit >= 0 {
+		if cap(ctx.ReqBuf) > memexperiment.PoolLimit {
+			ctx.ReqBuf = nil
+		}
+		if cap(ctx.tailBuf) > memexperiment.PoolLimit {
+			ctx.tailBuf = nil
+		}
+	}
 	ctx.err = nil
 	ctx.CallbackErr = nil
 	ctx.UnmarshalErr = nil

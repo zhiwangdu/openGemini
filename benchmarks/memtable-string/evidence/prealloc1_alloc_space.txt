@@ -1,0 +1,66 @@
+File: ts-server-experiments
+Build ID: de9c2f60667fab844b2027028caa40304a0ca7d7
+Type: alloc_space
+Time: 2026-09-21 09:54:47 UTC
+Showing nodes accounting for 269.85MB, 97.21% of 277.60MB total
+Dropped 39 nodes (cum <= 1.39MB)
+      flat  flat%   sum%        cum   cum%
+  256.01MB 92.22% 92.22%   257.10MB 92.62%  github.com/openGemini/openGemini/lib/record.(*ColVal).AppendString
+    4.19MB  1.51% 93.73%     4.19MB  1.51%  github.com/openGemini/openGemini/lib/util/lifted/vm/protoparser/influx.(*Row).marshalFields
+       3MB  1.08% 94.81%        3MB  1.08%  github.com/openGemini/openGemini/coordinator.(*PointsWriter).writeShardMap
+    2.66MB  0.96% 95.77%     2.66MB  0.96%  github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil.Resize (inline)
+    1.61MB  0.58% 96.35%     1.61MB  0.58%  github.com/openGemini/openGemini/lib/bufferpool.Resize (inline)
+    0.88MB  0.32% 96.67%     1.41MB  0.51%  compress/flate.NewWriter (inline)
+    0.50MB  0.18% 96.85%     1.91MB  0.69%  runtime/pprof.(*profileBuilder).emitLocation
+    0.50MB  0.18% 97.03%     3.66MB  1.32%  github.com/openGemini/openGemini/lib/util/lifted/influx/httpd.(*Handler).serveWrite
+    0.50MB  0.18% 97.21%   259.82MB 93.60%  github.com/openGemini/openGemini/engine.(*shard).writeRows
+         0     0% 97.21%     1.41MB  0.51%  compress/gzip.(*Writer).Write
+         0     0% 97.21%     3.66MB  1.32%  github.com/gorilla/mux.(*Router).ServeHTTP
+         0     0% 97.21%   262.32MB 94.50%  github.com/openGemini/openGemini/app/ts-store/storage.(*Storage).Write
+         0     0% 97.21%   262.32MB 94.50%  github.com/openGemini/openGemini/app/ts-store/storage.(*Storage).WriteRows
+         0     0% 97.21%   262.32MB 94.50%  github.com/openGemini/openGemini/app/ts-store/storage.WriteRows
+         0     0% 97.21%   262.32MB 94.50%  github.com/openGemini/openGemini/app/ts-store/storage.WriteRows.func1
+         0     0% 97.21%   266.52MB 96.01%  github.com/openGemini/openGemini/coordinator.(*LocalStore).WriteRows
+         0     0% 97.21%        4MB  1.44%  github.com/openGemini/openGemini/coordinator.(*PointsWriter).RetryWritePointRows
+         0     0% 97.21%        4MB  1.44%  github.com/openGemini/openGemini/coordinator.(*PointsWriter).writePointRows
+         0     0% 97.21%   266.52MB 96.01%  github.com/openGemini/openGemini/coordinator.(*PointsWriter).writeRowToShard
+         0     0% 97.21%   266.52MB 96.01%  github.com/openGemini/openGemini/coordinator.(*PointsWriter).writeShardMap.func1
+         0     0% 97.21%   262.32MB 94.50%  github.com/openGemini/openGemini/engine.(*EngineImpl).WriteRows
+         0     0% 97.21%     1.61MB  0.58%  github.com/openGemini/openGemini/engine.(*WAL).Write
+         0     0% 97.21%     1.61MB  0.58%  github.com/openGemini/openGemini/engine.(*WAL).writeBinary
+         0     0% 97.21%   262.32MB 94.50%  github.com/openGemini/openGemini/engine.(*shard).WriteRows
+         0     0% 97.21%   262.32MB 94.50%  github.com/openGemini/openGemini/engine.(*shard).writeRowsToTable
+         0     0% 97.21%   257.71MB 92.84%  github.com/openGemini/openGemini/engine/mutable.(*tsMemTableImpl).WriteRows
+         0     0% 97.21%   257.71MB 92.84%  github.com/openGemini/openGemini/engine/mutable.(*tsMemTableImpl).appendFields
+         0     0% 97.21%     4.19MB  1.51%  github.com/openGemini/openGemini/lib/netstorage.MarshalRows
+         0     0% 97.21%   257.10MB 92.62%  github.com/openGemini/openGemini/lib/record.AppendFieldToCol
+         0     0% 97.21%   257.71MB 92.84%  github.com/openGemini/openGemini/lib/record.AppendFieldsToRecord
+         0     0% 97.21%     3.66MB  1.32%  github.com/openGemini/openGemini/lib/util/lifted/influx/httpd.(*Handler).AddRoutes.(*Handler).logging.func14
+         0     0% 97.21%     3.66MB  1.32%  github.com/openGemini/openGemini/lib/util/lifted/influx/httpd.(*Handler).AddRoutes.(*Handler).recovery.func15
+         0     0% 97.21%     3.66MB  1.32%  github.com/openGemini/openGemini/lib/util/lifted/influx/httpd.(*Handler).AddRoutes.(*Handler).responseWriter.func10
+         0     0% 97.21%     3.66MB  1.32%  github.com/openGemini/openGemini/lib/util/lifted/influx/httpd.(*Handler).AddRoutes.(*Throttler).Handler.func3
+         0     0% 97.21%     3.66MB  1.32%  github.com/openGemini/openGemini/lib/util/lifted/influx/httpd.(*Handler).AddRoutes.authenticate.func1
+         0     0% 97.21%     3.66MB  1.32%  github.com/openGemini/openGemini/lib/util/lifted/influx/httpd.(*Handler).AddRoutes.compressFilter.func11
+         0     0% 97.21%     3.66MB  1.32%  github.com/openGemini/openGemini/lib/util/lifted/influx/httpd.(*Handler).AddRoutes.cors.func12
+         0     0% 97.21%     3.66MB  1.32%  github.com/openGemini/openGemini/lib/util/lifted/influx/httpd.(*Handler).AddRoutes.requestID.func13
+         0     0% 97.21%     5.57MB  2.01%  github.com/openGemini/openGemini/lib/util/lifted/influx/httpd.(*Handler).ServeHTTP
+         0     0% 97.21%     1.91MB  0.69%  github.com/openGemini/openGemini/lib/util/lifted/influx/httpd.(*Handler).handleProfiles
+         0     0% 97.21%        4MB  1.44%  github.com/openGemini/openGemini/lib/util/lifted/influx/httpd.(*Handler).serveWrite.func2
+         0     0% 97.21%     3.66MB  1.32%  github.com/openGemini/openGemini/lib/util/lifted/influx/httpd.(*Handler).serveWriteV1
+         0     0% 97.21%     4.19MB  1.51%  github.com/openGemini/openGemini/lib/util/lifted/vm/protoparser/influx.(*Row).FastMarshalBinary
+         0     0% 97.21%     2.66MB  0.96%  github.com/openGemini/openGemini/lib/util/lifted/vm/protoparser/influx.(*streamContext).Read
+         0     0% 97.21%        4MB  1.44%  github.com/openGemini/openGemini/lib/util/lifted/vm/protoparser/influx.(*unmarshalWork).Unmarshal
+         0     0% 97.21%     4.19MB  1.51%  github.com/openGemini/openGemini/lib/util/lifted/vm/protoparser/influx.FastMarshalMultiRows
+         0     0% 97.21%     2.66MB  0.96%  github.com/openGemini/openGemini/lib/util/lifted/vm/protoparser/influx.ReadLinesBlockExt
+         0     0% 97.21%        4MB  1.44%  github.com/openGemini/openGemini/lib/util/lifted/vm/protoparser/influx.StartUnmarshalWorkers.func1
+         0     0% 97.21%     7.08MB  2.55%  net/http.(*conn).serve
+         0     0% 97.21%     4.67MB  1.68%  net/http.HandlerFunc.ServeHTTP
+         0     0% 97.21%     6.58MB  2.37%  net/http.serverHandler.ServeHTTP
+         0     0% 97.21%     1.91MB  0.69%  net/http/pprof.Index
+         0     0% 97.21%     1.91MB  0.69%  net/http/pprof.handler.ServeHTTP
+         0     0% 97.21%     1.91MB  0.69%  runtime/pprof.(*Profile).WriteTo
+         0     0% 97.21%     1.91MB  0.69%  runtime/pprof.(*profileBuilder).appendLocsForStack
+         0     0% 97.21%     1.41MB  0.51%  runtime/pprof.(*profileBuilder).flush
+         0     0% 97.21%     1.91MB  0.69%  runtime/pprof.writeHeap
+         0     0% 97.21%     1.91MB  0.69%  runtime/pprof.writeHeapInternal
+         0     0% 97.21%     1.91MB  0.69%  runtime/pprof.writeHeapProto

@@ -15,6 +15,7 @@
 package record
 
 import (
+	"github.com/openGemini/openGemini/lib/memexperiment"
 	"sort"
 	"sync"
 )
@@ -36,6 +37,14 @@ func NewColumnSortHelper() *ColumnSortHelper {
 }
 
 func (h *ColumnSortHelper) Release() {
+	if memexperiment.ReleaseSort && h.aux.SortRec != nil {
+		for _, col := range h.aux.SortRec.ColVals {
+			if cap(col.Val) > 1024*1024 {
+				h.aux.SortRec = nil
+				break
+			}
+		}
+	}
 	columnSortHelperPool.Put(h)
 }
 

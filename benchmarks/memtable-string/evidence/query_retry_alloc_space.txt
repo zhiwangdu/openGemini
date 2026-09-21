@@ -1,0 +1,45 @@
+File: ts-server-baseline
+Build ID: 9d19a63b076088926ab3fc8d339e9344179a1a15
+Type: alloc_space
+Time: 2026-09-21 09:52:23 UTC
+Showing nodes accounting for 330.07MB, 97.86% of 337.29MB total
+Dropped 42 nodes (cum <= 1.69MB)
+      flat  flat%   sum%        cum   cum%
+  322.96MB 95.75% 95.75%   322.96MB 95.75%  github.com/openGemini/openGemini/lib/record.reserveBytes (inline)
+    4.71MB  1.40% 97.15%     4.71MB  1.40%  github.com/openGemini/openGemini/lib/util/lifted/vm/protoparser/influx.(*Row).marshalFields
+    1.76MB  0.52% 97.67%     3.50MB  1.04%  compress/flate.NewWriter (inline)
+    0.64MB  0.19% 97.86%     1.74MB  0.51%  compress/flate.(*compressor).init
+         0     0% 97.86%     3.50MB  1.04%  compress/gzip.(*Writer).Write
+         0     0% 97.86%   325.57MB 96.52%  github.com/openGemini/openGemini/app/ts-store/storage.(*Storage).Write
+         0     0% 97.86%   325.57MB 96.52%  github.com/openGemini/openGemini/app/ts-store/storage.(*Storage).WriteRows
+         0     0% 97.86%   325.57MB 96.52%  github.com/openGemini/openGemini/app/ts-store/storage.WriteRows
+         0     0% 97.86%   325.57MB 96.52%  github.com/openGemini/openGemini/app/ts-store/storage.WriteRows.func1
+         0     0% 97.86%   330.28MB 97.92%  github.com/openGemini/openGemini/coordinator.(*LocalStore).WriteRows
+         0     0% 97.86%   330.28MB 97.92%  github.com/openGemini/openGemini/coordinator.(*PointsWriter).writeRowToShard
+         0     0% 97.86%   330.28MB 97.92%  github.com/openGemini/openGemini/coordinator.(*PointsWriter).writeShardMap.func1
+         0     0% 97.86%   325.57MB 96.52%  github.com/openGemini/openGemini/engine.(*EngineImpl).WriteRows
+         0     0% 97.86%   325.57MB 96.52%  github.com/openGemini/openGemini/engine.(*shard).WriteRows
+         0     0% 97.86%   324.57MB 96.23%  github.com/openGemini/openGemini/engine.(*shard).writeRows
+         0     0% 97.86%   325.07MB 96.38%  github.com/openGemini/openGemini/engine.(*shard).writeRowsToTable
+         0     0% 97.86%   322.96MB 95.75%  github.com/openGemini/openGemini/engine/mutable.(*tsMemTableImpl).WriteRows
+         0     0% 97.86%   322.96MB 95.75%  github.com/openGemini/openGemini/engine/mutable.(*tsMemTableImpl).appendFields
+         0     0% 97.86%     4.71MB  1.40%  github.com/openGemini/openGemini/lib/netstorage.MarshalRows
+         0     0% 97.86%   322.96MB 95.75%  github.com/openGemini/openGemini/lib/record.(*ColVal).AppendString
+         0     0% 97.86%   322.96MB 95.75%  github.com/openGemini/openGemini/lib/record.(*ColVal).reserveVal (inline)
+         0     0% 97.86%   322.96MB 95.75%  github.com/openGemini/openGemini/lib/record.AppendFieldToCol
+         0     0% 97.86%   322.96MB 95.75%  github.com/openGemini/openGemini/lib/record.AppendFieldsToRecord
+         0     0% 97.86%     5.01MB  1.48%  github.com/openGemini/openGemini/lib/util/lifted/influx/httpd.(*Handler).ServeHTTP
+         0     0% 97.86%     4.51MB  1.34%  github.com/openGemini/openGemini/lib/util/lifted/influx/httpd.(*Handler).handleProfiles
+         0     0% 97.86%     4.71MB  1.40%  github.com/openGemini/openGemini/lib/util/lifted/vm/protoparser/influx.(*Row).FastMarshalBinary
+         0     0% 97.86%     4.71MB  1.40%  github.com/openGemini/openGemini/lib/util/lifted/vm/protoparser/influx.FastMarshalMultiRows
+         0     0% 97.86%     6.01MB  1.78%  net/http.(*conn).serve
+         0     0% 97.86%     5.01MB  1.48%  net/http.serverHandler.ServeHTTP
+         0     0% 97.86%     4.51MB  1.34%  net/http/pprof.Index
+         0     0% 97.86%     4.51MB  1.34%  net/http/pprof.handler.ServeHTTP
+         0     0% 97.86%     4.51MB  1.34%  runtime/pprof.(*Profile).WriteTo
+         0     0% 97.86%        4MB  1.19%  runtime/pprof.(*profileBuilder).appendLocsForStack
+         0     0% 97.86%     3.50MB  1.04%  runtime/pprof.(*profileBuilder).emitLocation
+         0     0% 97.86%     3.50MB  1.04%  runtime/pprof.(*profileBuilder).flush
+         0     0% 97.86%     4.51MB  1.34%  runtime/pprof.writeHeap
+         0     0% 97.86%     4.51MB  1.34%  runtime/pprof.writeHeapInternal
+         0     0% 97.86%     4.51MB  1.34%  runtime/pprof.writeHeapProto

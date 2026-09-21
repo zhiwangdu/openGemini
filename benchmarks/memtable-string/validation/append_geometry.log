@@ -1,0 +1,48 @@
+2026-09-21 10:07:15.890663794 +0000 UTC m=+0.008454926 init logger, conf: {app:single Format:auto Level:info MaxSize:67108864 MaxNum:16 MaxAge:7 CompressEnabled:true Path:/home/duzhiwang/.openGemini/logs}
+=== RUN   TestMemoryGrowthGeometry
+    memory_experiment_test.go:56: row=1 len=10246 old_cap=8 new_cap=10880 cumulative_cap=10888
+    memory_experiment_test.go:56: row=2 len=20486 old_cap=10880 new_cap=24576 cumulative_cap=35464
+    memory_experiment_test.go:56: row=3 len=30726 old_cap=24576 new_cap=32768 cumulative_cap=68232
+    memory_experiment_test.go:56: row=4 len=40966 old_cap=32768 new_cap=49152 cumulative_cap=117384
+    memory_experiment_test.go:56: row=5 len=51206 old_cap=49152 new_cap=65536 cumulative_cap=182920
+    memory_experiment_test.go:56: row=7 len=71686 old_cap=65536 new_cap=90112 cumulative_cap=273032
+    memory_experiment_test.go:56: row=9 len=92166 old_cap=90112 new_cap=114688 cumulative_cap=387720
+    memory_experiment_test.go:56: row=12 len=122886 old_cap=114688 new_cap=147456 cumulative_cap=535176
+    memory_experiment_test.go:56: row=15 len=153606 old_cap=147456 new_cap=188416 cumulative_cap=723592
+    memory_experiment_test.go:56: row=19 len=194566 old_cap=188416 new_cap=237568 cumulative_cap=961160
+    memory_experiment_test.go:56: row=24 len=245766 old_cap=237568 new_cap=303104 cumulative_cap=1264264
+    memory_experiment_test.go:56: row=30 len=307206 old_cap=303104 new_cap=385024 cumulative_cap=1649288
+    memory_experiment_test.go:56: row=38 len=389126 old_cap=385024 new_cap=483328 cumulative_cap=2132616
+    memory_experiment_test.go:56: row=48 len=491526 old_cap=483328 new_cap=606208 cumulative_cap=2738824
+    memory_experiment_test.go:56: row=60 len=614406 old_cap=606208 new_cap=761856 cumulative_cap=3500680
+    memory_experiment_test.go:56: row=75 len=768006 old_cap=761856 new_cap=958464 cumulative_cap=4459144
+    memory_experiment_test.go:56: row=94 len=962566 old_cap=958464 new_cap=1204224 cumulative_cap=5663368
+    memory_experiment_test.go:56: row=118 len=1208326 old_cap=1204224 new_cap=1507328 cumulative_cap=7170696
+    memory_experiment_test.go:56: row=148 len=1515526 old_cap=1507328 new_cap=1892352 cumulative_cap=9063048
+    memory_experiment_test.go:56: row=185 len=1894406 old_cap=1892352 new_cap=2367488 cumulative_cap=11430536
+    memory_experiment_test.go:56: row=232 len=2375686 old_cap=2367488 new_cap=2965504 cumulative_cap=14396040
+    memory_experiment_test.go:56: row=290 len=2969606 old_cap=2965504 new_cap=3710976 cumulative_cap=18107016
+    memory_experiment_test.go:56: row=363 len=3717126 old_cap=3710976 new_cap=4644864 cumulative_cap=22751880
+    memory_experiment_test.go:56: row=454 len=4648966 old_cap=4644864 new_cap=5808128 cumulative_cap=28560008
+    memory_experiment_test.go:56: row=568 len=5816326 old_cap=5808128 new_cap=7266304 cumulative_cap=35826312
+    memory_experiment_test.go:56: row=710 len=7270406 old_cap=7266304 new_cap=9084928 cumulative_cap=44911240
+    memory_experiment_test.go:56: row=888 len=9093126 old_cap=9084928 new_cap=11362304 cumulative_cap=56273544
+    memory_experiment_test.go:56: row=1110 len=11366406 old_cap=11362304 new_cap=14204928 cumulative_cap=70478472
+    memory_experiment_test.go:56: row=1388 len=14213126 old_cap=14204928 new_cap=17760256 cumulative_cap=88238728
+    memory_experiment_test.go:56: row=1735 len=17766406 old_cap=17760256 new_cap=22208512 cumulative_cap=110447240
+    memory_experiment_test.go:56: row=2169 len=22210566 old_cap=22208512 new_cap=27762688 cumulative_cap=138209928
+    memory_experiment_test.go:56: row=2712 len=27770886 old_cap=27762688 new_cap=34709504 cumulative_cap=172919432
+    memory_experiment_test.go:56: row=3390 len=34713606 old_cap=34709504 new_cap=43393024 cumulative_cap=216312456
+    memory_experiment_test.go:56: row=4238 len=43397126 old_cap=43393024 new_cap=54247424 cumulative_cap=270559880
+    memory_experiment_test.go:56: row=5298 len=54251526 old_cap=54247424 new_cap=67813376 cumulative_cap=338373256
+    memory_experiment_test.go:56: row=6623 len=67819526 old_cap=67813376 new_cap=84770816 cumulative_cap=423144072
+    memory_experiment_test.go:56: row=8279 len=84776966 old_cap=84770816 new_cap=105971712 cumulative_cap=529115784
+    memory_experiment_test.go:56: row=10349 len=105973766 old_cap=105971712 new_cap=132472832 cumulative_cap=661588616
+    memory_experiment_test.go:56: row=12937 len=132474886 old_cap=132472832 new_cap=165593088 cumulative_cap=827181704
+    memory_experiment_test.go:56: row=16172 len=165601286 old_cap=165593088 new_cap=206995456 cumulative_cap=1034177160
+    memory_experiment_test.go:56: row=20215 len=207001606 old_cap=206995456 new_cap=258752512 cumulative_cap=1292929672
+    memory_experiment_test.go:56: row=25269 len=258754566 old_cap=258752512 new_cap=323444736 cumulative_cap=1616374408
+    memory_experiment_test.go:59: FINAL payload=268431360 len=268431366 cap=323444736 cumulative_cap=1616374408
+--- PASS: TestMemoryGrowthGeometry (0.42s)
+PASS
+ok  	github.com/openGemini/openGemini/lib/record	0.462s

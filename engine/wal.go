@@ -38,6 +38,7 @@ import (
 	"github.com/openGemini/openGemini/lib/errno"
 	"github.com/openGemini/openGemini/lib/fileops"
 	"github.com/openGemini/openGemini/lib/logger"
+	"github.com/openGemini/openGemini/lib/memexperiment"
 	"github.com/openGemini/openGemini/lib/statisticsPusher/statistics"
 	"github.com/openGemini/openGemini/lib/util"
 	"github.com/openGemini/openGemini/lib/util/lifted/vm/protoparser/influx"
@@ -218,6 +219,9 @@ func (l *WAL) writeBinary(walRecord *walRecord) error {
 	maxEncodeLen := snappy.MaxEncodedLen(len(walRecord.binary))
 	compBuf = bufferpool.Resize(compBuf, WalRecordHeadSize+maxEncodeLen)
 	defer func() {
+		if memexperiment.PoolLimit >= 0 && cap(compBuf) > memexperiment.PoolLimit {
+			return
+		}
 		if len(compBuf) <= WalCompMaxBufSize {
 			walCompBufPool.Put(compBuf)
 		}

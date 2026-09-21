@@ -1,0 +1,20 @@
+{
+  "name": "baseline1",
+  "binary": "/home/duzhiwang/workspace/data/openGeminiSingle/bin/ts-server-baseline",
+  "sizes": "256",
+  "field_size": 10240,
+  "series": 1,
+  "batch": 100,
+  "concurrency": 1,
+  "pattern": "random",
+  "cpus": 0,
+  "gogc": 100,
+  "read_block": 64,
+  "no_wal": false,
+  "no_flush": false,
+  "reverse": false,
+  "query_before_flush": false,
+  "timestamp_base": 1789981200000000000,
+  "source_commit": "7fded2ceaf17f70a0cfbd0f8753837c26b5858c5",
+  "go": "go1.26.4"
+}

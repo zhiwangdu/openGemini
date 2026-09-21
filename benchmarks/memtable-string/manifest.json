@@ -1,0 +1,108 @@
+{
+  "source_commit": "7fded2ceaf17f70a0cfbd0f8753837c26b5858c5",
+  "go_version": "go version go1.26.4 linux/amd64",
+  "go_root": "/opt/devkits/go126/go",
+  "binaries": {
+    "ts-server-baseline": {
+      "sha256": "f7886ed3df8aafff5a04615e619eeb6037032becec9184fe586713a08da4cc7c",
+      "size": 120082744
+    },
+    "ts-server-experiments": {
+      "sha256": "b10d294ea01499131fe27537b2075cae2dd9317c62b18e94f5b34e8acb58abbb",
+      "size": 120090904
+    },
+    "ts-server-original": {
+      "sha256": "7e30e545af2b199161849fd3abca84b7dc6c26c46d88a22a3dba0c5e7e84a2df",
+      "size": 120051864
+    },
+    "ts-server-validated": {
+      "sha256": "b10d294ea01499131fe27537b2075cae2dd9317c62b18e94f5b34e8acb58abbb",
+      "size": 120090904
+    }
+  },
+  "completed_runs": [
+    "append1",
+    "append2",
+    "append3",
+    "baseline1",
+    "baseline2",
+    "baseline3",
+    "baseline_boundaries",
+    "batch1",
+    "batch1000",
+    "concurrent8",
+    "control1",
+    "control2",
+    "control3",
+    "cpu1",
+    "doubling1",
+    "doubling2",
+    "doubling3",
+    "doubling_boundaries",
+    "doubling_growth",
+    "doubling_series128",
+    "equalrows_1k",
+    "equalrows_32k",
+    "escaped",
+    "field1k",
+    "field32k",
+    "flush32m",
+    "fullread_append",
+    "fullread_concurrent8",
+    "fullread_pool64k",
+    "gc50",
+    "gc50_2",
+    "gc50_3",
+    "growth",
+    "harness_final",
+    "memlimit512_1",
+    "memlimit512_2",
+    "memlimit512_3",
+    "nopools",
+    "nowal",
+    "pool64k",
+    "prealloc1",
+    "prealloc2",
+    "prealloc3",
+    "query_control",
+    "query_retry",
+    "repeated",
+    "reversed",
+    "scavenge256",
+    "series128",
+    "series8192",
+    "singlemarshal",
+    "smoke",
+    "trimsort",
+    "wal_recovery_baseline",
+    "wal_recovery_doubling",
+    "wal_recovery_singlemarshal"
+  ],
+  "failed_runs_preserved": [
+    "query"
+  ],
+  "environment_files": [
+    "kernel.txt",
+    "cpu.txt",
+    "memory.txt",
+    "python.txt",
+    "plot_dependencies.txt",
+    "source_status.txt"
+  ],
+  "artifact_sha256": {
+    "README.md": "7515b794039164cae1f3fb2cd7f9e4faf36b6d135ac0c5cd14e1f21f3ee2d168",
+    "REPORT.md": "682d069d1a0a0786621b2fae7f7a9c72f2646f95b2d3c6a7d0bfad7c6ab17b38",
+    "patches/experiments.patch": "6b69b2c8a68ef282be1fb8b0f211387b51f0349e7cf6c76549bc386b9a0cf930",
+    "patches/instrumentation.patch": "97c469879f2672a359a2068516be5cf741976050e2d3d7c0f579389c5c830359",
+    "scripts/analyze.py": "9fa163566a4e56c74c62d0c5ac7bfd6f1b3d481405aba6eb7a5df5ab6c6fe4a3",
+    "scripts/audit.py": "43712e263675d62db299d603e707270aae75ca5b8d3e82032ad57b6b8ea886a5",
+    "scripts/edges.py": "58a21c20cbbd73d35092d5ef655065b8930ce607b04d1a821794ec42520a76dc",
+    "scripts/evidence.py": "0eaea1f15aaad72de2e5cf623aafcc029e8f4f384ec8eb36f6771f5d5735e9c4",
+    "scripts/matrix.py": "c7858a45235364e157ac3063828205369333d744aeeb182b951542085fbf4173",
+    "scripts/operational.py": "c1215e715a86bafe4f1391354ad67d03bb0fe32300565db3220449f9052bf0d4",
+    "scripts/optimize.py": "e8acbf16c18476872bbe93b43cbbbb00907aadf2c0a5b2f040b803482a2fe0a5",
+    "scripts/plot.py": "031b159dd8a33ff1d0e454f0fee1044421954654e828a43fbee17bce82a507d1",
+    "scripts/run.py": "0deb45ade1c9ad226d36e4452a0001f9501651635dca07407792ffbf42d81878",
+    "scripts/validate.py": "7d26e4c30b9f46fd028e8cc2cfa4d91c477b2c6fd4af2b504da0046764f6a494"
+  }
+}

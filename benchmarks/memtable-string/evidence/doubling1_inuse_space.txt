@@ -1,0 +1,26 @@
+File: ts-server-experiments
+Build ID: de9c2f60667fab844b2027028caa40304a0ca7d7
+Type: inuse_space
+Time: 2026-09-21 09:54:43 UTC
+Showing nodes accounting for 295.61MB, 99.64% of 296.67MB total
+Dropped 18 nodes (cum <= 1.48MB)
+      flat  flat%   sum%        cum   cum%
+     294MB 99.10% 99.10%      294MB 99.10%  github.com/openGemini/openGemini/lib/record.(*ColVal).AppendString
+    1.61MB  0.54% 99.64%     1.61MB  0.54%  github.com/openGemini/openGemini/lib/bufferpool.Resize (inline)
+         0     0% 99.64%   295.61MB 99.64%  github.com/openGemini/openGemini/app/ts-store/storage.(*Storage).Write
+         0     0% 99.64%   295.61MB 99.64%  github.com/openGemini/openGemini/app/ts-store/storage.(*Storage).WriteRows
+         0     0% 99.64%   295.61MB 99.64%  github.com/openGemini/openGemini/app/ts-store/storage.WriteRows
+         0     0% 99.64%   295.61MB 99.64%  github.com/openGemini/openGemini/app/ts-store/storage.WriteRows.func1
+         0     0% 99.64%   295.61MB 99.64%  github.com/openGemini/openGemini/coordinator.(*LocalStore).WriteRows
+         0     0% 99.64%   295.61MB 99.64%  github.com/openGemini/openGemini/coordinator.(*PointsWriter).writeRowToShard
+         0     0% 99.64%   295.61MB 99.64%  github.com/openGemini/openGemini/coordinator.(*PointsWriter).writeShardMap.func1
+         0     0% 99.64%   295.61MB 99.64%  github.com/openGemini/openGemini/engine.(*EngineImpl).WriteRows
+         0     0% 99.64%     1.61MB  0.54%  github.com/openGemini/openGemini/engine.(*WAL).Write
+         0     0% 99.64%     1.61MB  0.54%  github.com/openGemini/openGemini/engine.(*WAL).writeBinary
+         0     0% 99.64%   295.61MB 99.64%  github.com/openGemini/openGemini/engine.(*shard).WriteRows
+         0     0% 99.64%   295.61MB 99.64%  github.com/openGemini/openGemini/engine.(*shard).writeRows
+         0     0% 99.64%   295.61MB 99.64%  github.com/openGemini/openGemini/engine.(*shard).writeRowsToTable
+         0     0% 99.64%      294MB 99.10%  github.com/openGemini/openGemini/engine/mutable.(*tsMemTableImpl).WriteRows
+         0     0% 99.64%      294MB 99.10%  github.com/openGemini/openGemini/engine/mutable.(*tsMemTableImpl).appendFields
+         0     0% 99.64%      294MB 99.10%  github.com/openGemini/openGemini/lib/record.AppendFieldToCol
+         0     0% 99.64%      294MB 99.10%  github.com/openGemini/openGemini/lib/record.AppendFieldsToRecord

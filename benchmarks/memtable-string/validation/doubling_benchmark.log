@@ -1,0 +1,22 @@
+2026-09-21 10:07:17.859103576 +0000 UTC m=+0.008443347 init logger, conf: {app:single Format:auto Level:info MaxSize:67108864 MaxNum:16 MaxAge:7 CompressEnabled:true Path:/home/duzhiwang/.openGemini/logs}
+goos: linux
+goarch: amd64
+pkg: github.com/openGemini/openGemini/lib/record
+cpu: Intel(R) Core(TM) i5-10600KF CPU @ 4.10GHz
+BenchmarkLargeStringLayout/growing-12         	       3	  14209847 ns/op	2360.77 MB/s	         1.063 capacity/payload	74285957 B/op	      42 allocs/op
+BenchmarkLargeStringLayout/growing-12         	       3	  15250002 ns/op	2199.75 MB/s	         1.063 capacity/payload	74285984 B/op	      43 allocs/op
+BenchmarkLargeStringLayout/growing-12         	       3	  13884110 ns/op	2416.16 MB/s	         1.063 capacity/payload	74285973 B/op	      42 allocs/op
+BenchmarkLargeStringLayout/batch_reserve_6-12 	       3	  37725899 ns/op	 889.21 MB/s	         1.173 capacity/payload	195757802 B/op	      48 allocs/op
+BenchmarkLargeStringLayout/batch_reserve_6-12 	       3	  37774977 ns/op	 888.05 MB/s	         1.173 capacity/payload	195757754 B/op	      47 allocs/op
+BenchmarkLargeStringLayout/batch_reserve_6-12 	       3	  38444602 ns/op	 872.59 MB/s	         1.173 capacity/payload	195757754 B/op	      47 allocs/op
+BenchmarkLargeStringLayout/batch_reserve_100-12         	       3	  32211178 ns/op	1041.45 MB/s	         1.094 capacity/payload	170362592 B/op	      35 allocs/op
+BenchmarkLargeStringLayout/batch_reserve_100-12         	       3	  31953470 ns/op	1049.85 MB/s	         1.094 capacity/payload	170362480 B/op	      34 allocs/op
+BenchmarkLargeStringLayout/batch_reserve_100-12         	       3	  33526721 ns/op	1000.58 MB/s	         1.094 capacity/payload	170362592 B/op	      35 allocs/op
+BenchmarkLargeStringLayout/reserve_exact-12             	       3	   4845242 ns/op	6923.54 MB/s	         1.000 capacity/payload	33597040 B/op	      22 allocs/op
+BenchmarkLargeStringLayout/reserve_exact-12             	       3	   6098347 ns/op	5500.87 MB/s	         1.000 capacity/payload	33597040 B/op	      22 allocs/op
+BenchmarkLargeStringLayout/reserve_exact-12             	       3	   6073712 ns/op	5523.19 MB/s	         1.000 capacity/payload	33597040 B/op	      22 allocs/op
+BenchmarkLargeStringLayout/blocks_4m-12                 	       3	   6556083 ns/op	5116.81 MB/s	         1.125 capacity/payload	37783904 B/op	     119 allocs/op
+BenchmarkLargeStringLayout/blocks_4m-12                 	       3	   6460209 ns/op	5192.75 MB/s	         1.125 capacity/payload	37783904 B/op	     119 allocs/op
+BenchmarkLargeStringLayout/blocks_4m-12                 	       3	   6211600 ns/op	5400.58 MB/s	         1.125 capacity/payload	37783904 B/op	     119 allocs/op
+PASS
+ok  	github.com/openGemini/openGemini/lib/record	1.263s

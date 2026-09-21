@@ -1,0 +1,8 @@
+# Preserve unified-diff context whitespace in replayable patches.
+patches/*.patch -whitespace linguist-generated=true
+# Archived measurements and generated figures are not hand-written source.
+evidence/** linguist-generated=true
+validation/** linguist-generated=true
+figures/** linguist-generated=true
+results.csv linguist-generated=true
+manifest.json linguist-generated=true

@@ -1,0 +1,398 @@
+diff --git a/coordinator/context.go b/coordinator/context.go
+index b46ac7e7..e7bf992c 100644
+--- a/coordinator/context.go
++++ b/coordinator/context.go
+@@ -19,6 +19,7 @@ import (
+ 	"sync"
+ 
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
++	"github.com/openGemini/openGemini/lib/memexperiment"
+ 	"github.com/openGemini/openGemini/lib/netstorage"
+ 	"github.com/openGemini/openGemini/lib/util/lifted/influx/meta"
+ 	"github.com/openGemini/openGemini/lib/util/lifted/influx/meta/proto"
+@@ -84,6 +85,15 @@ func (s *injestionCtx) setShardRow(shardInfo *meta.ShardInfo, row *influx.Row) {
+ }
+ 
+ func (s *injestionCtx) Reset() {
++	if memexperiment.PoolLimit >= 0 {
++		for _, ctx := range s.writeCtx {
++			clear(ctx.Rows[:cap(ctx.Rows)])
++			ctx.Rows = ctx.Rows[:0]
++			if cap(ctx.Buf) > memexperiment.PoolLimit {
++				ctx.Buf = nil
++			}
++		}
++	}
+ 	s.fieldToCreatePool = s.fieldToCreatePool[:0]
+ 	s.shardRowMap = s.shardRowMap[:0]
+ 	s.writeCtx = s.writeCtx[:0]
+diff --git a/coordinator/points_writer.go b/coordinator/points_writer.go
+index 14724a0c..0e3ebe40 100644
+--- a/coordinator/points_writer.go
++++ b/coordinator/points_writer.go
+@@ -31,6 +31,7 @@ import (
+ 	"github.com/openGemini/openGemini/lib/config"
+ 	"github.com/openGemini/openGemini/lib/errno"
+ 	"github.com/openGemini/openGemini/lib/logger"
++	"github.com/openGemini/openGemini/lib/memexperiment"
+ 	"github.com/openGemini/openGemini/lib/msgservice"
+ 	"github.com/openGemini/openGemini/lib/netstorage"
+ 	"github.com/openGemini/openGemini/lib/pointsdecoder"
+@@ -989,9 +990,13 @@ func (s *LocalStore) WriteRows(ctx *netstorage.WriteContext, nodeID uint64, pt u
+ 		return fmt.Errorf("exp db: %v, rp: %v, but got: %v, %v", database, rp, db, rpName)
+ 	}
+ 	//
+-	pBuf, err := netstorage.MarshalRows(ctx, db, rp, pt)
+-	if err != nil {
+-		return err
++	var pBuf []byte
++	var err error
++	if !memexperiment.SingleMarshal || len(ctx.StreamShards) > 0 {
++		pBuf, err = netstorage.MarshalRows(ctx, db, rp, pt)
++		if err != nil {
++			return err
++		}
+ 	}
+ 
+ 	if len(ctx.StreamShards) > 0 {
+diff --git a/engine/wal.go b/engine/wal.go
+index cf7c15a3..d6ac2be2 100644
+--- a/engine/wal.go
++++ b/engine/wal.go
+@@ -38,6 +38,7 @@ import (
+ 	"github.com/openGemini/openGemini/lib/errno"
+ 	"github.com/openGemini/openGemini/lib/fileops"
+ 	"github.com/openGemini/openGemini/lib/logger"
++	"github.com/openGemini/openGemini/lib/memexperiment"
+ 	"github.com/openGemini/openGemini/lib/statisticsPusher/statistics"
+ 	"github.com/openGemini/openGemini/lib/util"
+ 	"github.com/openGemini/openGemini/lib/util/lifted/vm/protoparser/influx"
+@@ -218,6 +219,9 @@ func (l *WAL) writeBinary(walRecord *walRecord) error {
+ 	maxEncodeLen := snappy.MaxEncodedLen(len(walRecord.binary))
+ 	compBuf = bufferpool.Resize(compBuf, WalRecordHeadSize+maxEncodeLen)
+ 	defer func() {
++		if memexperiment.PoolLimit >= 0 && cap(compBuf) > memexperiment.PoolLimit {
++			return
++		}
+ 		if len(compBuf) <= WalCompMaxBufSize {
+ 			walCompBufPool.Put(compBuf)
+ 		}
+diff --git a/lib/record/column_sort.go b/lib/record/column_sort.go
+index 22e787b1..36c1c806 100644
+--- a/lib/record/column_sort.go
++++ b/lib/record/column_sort.go
+@@ -15,6 +15,7 @@
+ package record
+ 
+ import (
++	"github.com/openGemini/openGemini/lib/memexperiment"
+ 	"sort"
+ 	"sync"
+ )
+@@ -36,6 +37,14 @@ func NewColumnSortHelper() *ColumnSortHelper {
+ }
+ 
+ func (h *ColumnSortHelper) Release() {
++	if memexperiment.ReleaseSort && h.aux.SortRec != nil {
++		for _, col := range h.aux.SortRec.ColVals {
++			if cap(col.Val) > 1024*1024 {
++				h.aux.SortRec = nil
++				break
++			}
++		}
++	}
+ 	columnSortHelperPool.Put(h)
+ }
+ 
+diff --git a/lib/record/column_string.go b/lib/record/column_string.go
+index 5481e9dd..9b497ed3 100644
+--- a/lib/record/column_string.go
++++ b/lib/record/column_string.go
+@@ -14,7 +14,10 @@
+ 
+ package record
+ 
+-import "github.com/openGemini/openGemini/lib/util"
++import (
++	"github.com/openGemini/openGemini/lib/memexperiment"
++	"github.com/openGemini/openGemini/lib/util"
++)
+ 
+ func (cv *ColVal) AppendStrings(values ...string) {
+ 	for _, v := range values {
+@@ -24,8 +27,25 @@ func (cv *ColVal) AppendStrings(values ...string) {
+ 
+ func (cv *ColVal) AppendString(v string) {
+ 	index := len(cv.Val)
+-	cv.reserveVal(len(v))
+-	copy(cv.Val[index:], v)
++	if memexperiment.DirectAppend {
++		needed := index + len(v)
++		if memexperiment.DoubleGrowth && needed > cap(cv.Val) && cap(cv.Val) >= 1024*1024 {
++			val := make([]byte, index, max(needed, cap(cv.Val)*2))
++			copy(val, cv.Val)
++			cv.Val = val
++		}
++		// This oracle-sized reservation is only a causal lower-bound experiment.
++		// It is intentionally not advertised as a general-purpose optimization.
++		if memexperiment.Preallocate > cap(cv.Val) && index < 1024 && len(v) >= 1024 {
++			val := make([]byte, index, max(needed, memexperiment.Preallocate))
++			copy(val, cv.Val)
++			cv.Val = val
++		}
++		cv.Val = append(cv.Val, v...)
++	} else {
++		cv.reserveVal(len(v))
++		copy(cv.Val[index:], v)
++	}
+ 	cv.reserveOffset(1)
+ 	cv.Offset[cv.Len] = uint32(index)
+ 	cv.setBitMap(cv.Len)
+diff --git a/lib/util/lifted/vm/protoparser/influx/streamparser.go b/lib/util/lifted/vm/protoparser/influx/streamparser.go
+index 17ab4007..cc13b8c5 100644
+--- a/lib/util/lifted/vm/protoparser/influx/streamparser.go
++++ b/lib/util/lifted/vm/protoparser/influx/streamparser.go
+@@ -13,6 +13,7 @@ import (
+ 	"bytes"
+ 	"errors"
+ 	"fmt"
++	"github.com/openGemini/openGemini/lib/memexperiment"
+ 	"io"
+ 	"sync"
+ 	"time"
+@@ -125,6 +126,14 @@ func (ctx *streamContext) reset() {
+ 	ctx.br.Reset(nil)
+ 	ctx.ReqBuf = ctx.ReqBuf[:0]
+ 	ctx.tailBuf = ctx.tailBuf[:0]
++	if memexperiment.PoolLimit >= 0 {
++		if cap(ctx.ReqBuf) > memexperiment.PoolLimit {
++			ctx.ReqBuf = nil
++		}
++		if cap(ctx.tailBuf) > memexperiment.PoolLimit {
++			ctx.tailBuf = nil
++		}
++	}
+ 	ctx.err = nil
+ 	ctx.CallbackErr = nil
+ 	ctx.UnmarshalErr = nil
+diff --git a/lib/util/lifted/vm/protoparser/influx/work_pool.go b/lib/util/lifted/vm/protoparser/influx/work_pool.go
+index 56eddf6e..d18e4cd5 100644
+--- a/lib/util/lifted/vm/protoparser/influx/work_pool.go
++++ b/lib/util/lifted/vm/protoparser/influx/work_pool.go
+@@ -1,5 +1,7 @@
+ package influx
+ 
++import "github.com/openGemini/openGemini/lib/memexperiment"
++
+ var unmarshalWorkPool chan *unmarshalWork
+ 
+ func GetUnmarshalWork() *unmarshalWork {
+@@ -13,6 +15,9 @@ func GetUnmarshalWork() *unmarshalWork {
+ 
+ func putUnmarshalWork(uw *unmarshalWork) {
+ 	uw.reset()
++	if memexperiment.PoolLimit >= 0 && cap(uw.ReqBuf) > memexperiment.PoolLimit {
++		uw.ReqBuf = nil
++	}
+ 	select {
+ 	case unmarshalWorkPool <- uw:
+ 	default:
+diff --git a/lib/memexperiment/options.go b/lib/memexperiment/options.go
+new file mode 100644
+index 00000000..91ac4a8f
+--- /dev/null
++++ b/lib/memexperiment/options.go
+@@ -0,0 +1,37 @@
++//go:build memdiag
++
++// Package memexperiment controls isolated investigation builds, not production.
++package memexperiment
++
++import (
++	"os"
++	"strconv"
++	"strings"
++)
++
++var variants = "," + os.Getenv("OG_MEMLAB_VARIANT") + ","
++
++func enabled(name string) bool { return strings.Contains(variants, ","+name+",") }
++
++var (
++	DoubleGrowth  = enabled("doubling")
++	DirectAppend  = enabled("append") || DoubleGrowth || enabled("prealloc")
++	SingleMarshal = enabled("singlemarshal")
++	ReleaseSort   = enabled("trimsort")
++	Preallocate   = func() int {
++		if !enabled("prealloc") {
++			return 0
++		}
++		n, _ := strconv.Atoi(os.Getenv("OG_MEMLAB_PREALLOC"))
++		return n
++	}()
++	PoolLimit = func() int {
++		if enabled("nopools") {
++			return 0
++		}
++		if enabled("pool64k") {
++			return 64 * 1024
++		}
++		return -1
++	}()
++)
+diff --git a/lib/memexperiment/options_disabled.go b/lib/memexperiment/options_disabled.go
+new file mode 100644
+index 00000000..66ef9975
+--- /dev/null
++++ b/lib/memexperiment/options_disabled.go
+@@ -0,0 +1,12 @@
++//go:build !memdiag
++
++package memexperiment
++
++const (
++	DoubleGrowth  = false
++	DirectAppend  = false
++	SingleMarshal = false
++	ReleaseSort   = false
++	Preallocate   = 0
++	PoolLimit     = -1
++)
+diff --git a/lib/record/memory_experiment_test.go b/lib/record/memory_experiment_test.go
+new file mode 100644
+index 00000000..6bead3d8
+--- /dev/null
++++ b/lib/record/memory_experiment_test.go
+@@ -0,0 +1,132 @@
++//go:build memdiag
++
++package record
++
++import (
++	"fmt"
++	"runtime"
++	"slices"
++	"strings"
++	"testing"
++
++	"github.com/openGemini/openGemini/lib/util/lifted/vm/protoparser/influx"
++)
++
++func TestLargeStringExperiment(t *testing.T) {
++	var col ColVal
++	values := []string{"", "a", strings.Repeat("x", 1023), strings.Repeat("a", 1024),
++		strings.Repeat("q\"\\", 4096), strings.Repeat("b", 32768), strings.Repeat("c", 1048577)}
++	for i := 0; i < 16; i++ {
++		for _, value := range values {
++			col.AppendString(value)
++			col.AppendStringNull()
++		}
++	}
++	for i := 0; i < col.Len; i += 2 {
++		got, isNil := col.StringValueUnsafe(i)
++		if isNil || got != values[(i/2)%len(values)] || !col.IsNil(i+1) {
++			t.Fatalf("value or null changed at row %d", i)
++		}
++	}
++	copyCol := ColVal{}
++	copyCol.AppendColVal(&col, influx.Field_Type_String, 0, col.Len)
++	col.Init()
++	col.AppendString("overwrite old source")
++	for i := 0; i < copyCol.Len; i += 2 {
++		got, isNil := copyCol.StringValueUnsafe(i)
++		if isNil || got != values[(i/2)%len(values)] {
++			t.Fatalf("copy was not independent at row %d", i)
++		}
++	}
++}
++
++func TestMemoryGrowthGeometry(t *testing.T) {
++	if testing.Short() {
++		t.Skip("explicit allocation investigation")
++	}
++	value := strings.Repeat("x", 10240)
++	var col ColVal
++	col.AppendString("warmup")
++	total := cap(col.Val)
++	for i := 0; i < 26214; i++ {
++		oldCap := cap(col.Val)
++		col.AppendString(value)
++		if cap(col.Val) != oldCap {
++			total += cap(col.Val)
++			t.Logf("row=%d len=%d old_cap=%d new_cap=%d cumulative_cap=%d", i+1, len(col.Val), oldCap, cap(col.Val), total)
++		}
++	}
++	t.Logf("FINAL payload=%d len=%d cap=%d cumulative_cap=%d", 26214*10240, len(col.Val), cap(col.Val), total)
++	runtime.KeepAlive(col)
++}
++
++// Blocks is a layout microbenchmark, not a complete implementation of segmented
++// memtable records. It intentionally excludes sorting, queries and flush.
++func BenchmarkLargeStringLayout(b *testing.B) {
++	const rows = 3276
++	const valueSize = 10240
++	const blockBytes = 4 * 1024 * 1024
++	value := strings.Repeat("x", valueSize)
++	for _, layout := range []string{"growing", "batch_reserve_6", "batch_reserve_100", "reserve_exact", "blocks_4m"} {
++		b.Run(layout, func(b *testing.B) {
++			b.ReportAllocs()
++			b.SetBytes(rows * valueSize)
++			for n := 0; n < b.N; n++ {
++				cols := make([]ColVal, 1)
++				if layout == "reserve_exact" {
++					cols[0].Val = make([]byte, 0, rows*valueSize)
++				} else if layout == "blocks_4m" {
++					cols[0].Val = make([]byte, 0, blockBytes)
++				}
++				for i := 0; i < rows; i++ {
++					col := &cols[len(cols)-1]
++					batchSize := 0
++					if layout == "batch_reserve_6" {
++						batchSize = 6
++					} else if layout == "batch_reserve_100" {
++						batchSize = 100
++					}
++					if batchSize > 0 && i%batchSize == 0 {
++						col.Val = slices.Grow(col.Val, min(batchSize, rows-i)*valueSize)
++					}
++					if layout == "blocks_4m" && len(col.Val)+valueSize > blockBytes {
++						cols = append(cols, ColVal{Val: make([]byte, 0, blockBytes)})
++						col = &cols[len(cols)-1]
++					}
++					col.AppendString(value)
++				}
++				capacity := 0
++				for _, col := range cols {
++					capacity += cap(col.Val)
++				}
++				b.ReportMetric(float64(capacity)/float64(rows*valueSize), "capacity/payload")
++				runtime.KeepAlive(cols)
++			}
++		})
++	}
++}
++
++func TestLargeStringSortDeduplicate(t *testing.T) {
++	rec := NewRecordBuilder(Schemas{
++		{Type: influx.Field_Type_String, Name: "payload"},
++		{Type: influx.Field_Type_Int, Name: TimeField},
++	})
++	times := []int64{3, 1, 2, 2, 4}
++	for i, tm := range times {
++		rec.ColVals[0].AppendString(strings.Repeat(fmt.Sprint(i), 10240))
++		rec.AppendTime(tm)
++	}
++	hlp := NewColumnSortHelper()
++	sorted := hlp.Sort(rec)
++	defer hlp.Release()
++	want := []int{1, 3, 0, 4}
++	if sorted.RowNums() != len(want) {
++		t.Fatalf("rows=%d", sorted.RowNums())
++	}
++	for i, index := range want {
++		value, nilValue := sorted.ColVals[0].StringValueUnsafe(i)
++		if nilValue || value != strings.Repeat(fmt.Sprint(index), 10240) {
++			t.Fatalf("wrong duplicate resolution at row %d", i)
++		}
++	}
++}

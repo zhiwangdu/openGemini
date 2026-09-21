@@ -19,6 +19,7 @@ import (
 	"sync"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
+	"github.com/openGemini/openGemini/lib/memexperiment"
 	"github.com/openGemini/openGemini/lib/netstorage"
 	"github.com/openGemini/openGemini/lib/util/lifted/influx/meta"
 	"github.com/openGemini/openGemini/lib/util/lifted/influx/meta/proto"
@@ -84,6 +85,15 @@ func (s *injestionCtx) setShardRow(shardInfo *meta.ShardInfo, row *influx.Row) {
 }
 
 func (s *injestionCtx) Reset() {
+	if memexperiment.PoolLimit >= 0 {
+		for _, ctx := range s.writeCtx {
+			clear(ctx.Rows[:cap(ctx.Rows)])
+			ctx.Rows = ctx.Rows[:0]
+			if cap(ctx.Buf) > memexperiment.PoolLimit {
+				ctx.Buf = nil
+			}
+		}
+	}
 	s.fieldToCreatePool = s.fieldToCreatePool[:0]
 	s.shardRowMap = s.shardRowMap[:0]
 	s.writeCtx = s.writeCtx[:0]

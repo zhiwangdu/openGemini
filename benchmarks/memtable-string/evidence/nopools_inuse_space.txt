@@ -1,0 +1,25 @@
+File: ts-server-experiments
+Build ID: de9c2f60667fab844b2027028caa40304a0ca7d7
+Type: inuse_space
+Time: 2026-09-21 09:55:26 UTC
+Showing nodes accounting for 308.46MB, 99.52% of 309.96MB total
+Dropped 18 nodes (cum <= 1.55MB)
+      flat  flat%   sum%        cum   cum%
+  308.46MB 99.52% 99.52%   308.46MB 99.52%  github.com/openGemini/openGemini/lib/record.reserveBytes (inline)
+         0     0% 99.52%   308.96MB 99.68%  github.com/openGemini/openGemini/app/ts-store/storage.(*Storage).Write
+         0     0% 99.52%   308.96MB 99.68%  github.com/openGemini/openGemini/app/ts-store/storage.(*Storage).WriteRows
+         0     0% 99.52%   308.96MB 99.68%  github.com/openGemini/openGemini/app/ts-store/storage.WriteRows
+         0     0% 99.52%   308.96MB 99.68%  github.com/openGemini/openGemini/app/ts-store/storage.WriteRows.func1
+         0     0% 99.52%   308.96MB 99.68%  github.com/openGemini/openGemini/coordinator.(*LocalStore).WriteRows
+         0     0% 99.52%   308.96MB 99.68%  github.com/openGemini/openGemini/coordinator.(*PointsWriter).writeRowToShard
+         0     0% 99.52%   308.96MB 99.68%  github.com/openGemini/openGemini/coordinator.(*PointsWriter).writeShardMap.func1
+         0     0% 99.52%   308.96MB 99.68%  github.com/openGemini/openGemini/engine.(*EngineImpl).WriteRows
+         0     0% 99.52%   308.96MB 99.68%  github.com/openGemini/openGemini/engine.(*shard).WriteRows
+         0     0% 99.52%   308.96MB 99.68%  github.com/openGemini/openGemini/engine.(*shard).writeRows
+         0     0% 99.52%   308.96MB 99.68%  github.com/openGemini/openGemini/engine.(*shard).writeRowsToTable
+         0     0% 99.52%   308.46MB 99.52%  github.com/openGemini/openGemini/engine/mutable.(*tsMemTableImpl).WriteRows
+         0     0% 99.52%   308.46MB 99.52%  github.com/openGemini/openGemini/engine/mutable.(*tsMemTableImpl).appendFields
+         0     0% 99.52%   308.46MB 99.52%  github.com/openGemini/openGemini/lib/record.(*ColVal).AppendString
+         0     0% 99.52%   308.46MB 99.52%  github.com/openGemini/openGemini/lib/record.(*ColVal).reserveVal (inline)
+         0     0% 99.52%   308.46MB 99.52%  github.com/openGemini/openGemini/lib/record.AppendFieldToCol
+         0     0% 99.52%   308.46MB 99.52%  github.com/openGemini/openGemini/lib/record.AppendFieldsToRecord

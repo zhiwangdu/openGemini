@@ -1,0 +1,238 @@
+[
+  {
+    "name": "packages",
+    "variant": "",
+    "command": [
+      "go",
+      "test",
+      "-mod=readonly",
+      "-gcflags=all=-l",
+      "-tags",
+      "memdiag",
+      "-count=1",
+      "-p",
+      "2",
+      "-timeout",
+      "5m",
+      "-short",
+      "./lib/record",
+      "./engine/mutable",
+      "./lib/util/lifted/vm/protoparser/influx",
+      "./coordinator"
+    ],
+    "returncode": 0,
+    "seconds": 63.5242538577877
+  },
+  {
+    "name": "doubling",
+    "variant": "doubling",
+    "command": [
+      "go",
+      "test",
+      "-mod=readonly",
+      "-gcflags=all=-l",
+      "-tags",
+      "memdiag",
+      "-count=1",
+      "-p",
+      "2",
+      "-timeout",
+      "5m",
+      "-short",
+      "./lib/record",
+      "./engine/mutable"
+    ],
+    "returncode": 0,
+    "seconds": 4.534899604972452
+  },
+  {
+    "name": "pool64k",
+    "variant": "pool64k",
+    "command": [
+      "go",
+      "test",
+      "-mod=readonly",
+      "-gcflags=all=-l",
+      "-tags",
+      "memdiag",
+      "-count=1",
+      "-p",
+      "2",
+      "-timeout",
+      "5m",
+      "-short",
+      "./lib/util/lifted/vm/protoparser/influx",
+      "./coordinator"
+    ],
+    "returncode": 0,
+    "seconds": 12.11206379905343
+  },
+  {
+    "name": "singlemarshal",
+    "variant": "singlemarshal",
+    "command": [
+      "go",
+      "test",
+      "-mod=readonly",
+      "-gcflags=all=-l",
+      "-tags",
+      "memdiag",
+      "-count=1",
+      "-p",
+      "2",
+      "-timeout",
+      "5m",
+      "-short",
+      "./coordinator"
+    ],
+    "returncode": 0,
+    "seconds": 12.070923172868788
+  },
+  {
+    "name": "wal_mutable",
+    "variant": "doubling",
+    "command": [
+      "go",
+      "test",
+      "-mod=readonly",
+      "-gcflags=all=-l",
+      "-tags",
+      "memdiag",
+      "-count=1",
+      "-p",
+      "2",
+      "-timeout",
+      "5m",
+      "-short",
+      "./engine",
+      "-run",
+      "^(TestWalReplayParallel|TestWalReplaySerial|TestQueryOnlyInMutableTable)$"
+    ],
+    "returncode": 0,
+    "seconds": 4.525288979988545
+  },
+  {
+    "name": "normal_build",
+    "variant": "",
+    "command": [
+      "go",
+      "test",
+      "-mod=readonly",
+      "-gcflags=all=-l",
+      "-short",
+      "./lib/record",
+      "./engine/mutable",
+      "-count=1"
+    ],
+    "returncode": 0,
+    "seconds": 8.663250867743045
+  },
+  {
+    "name": "baseline_benchmark",
+    "variant": "",
+    "command": [
+      "go",
+      "test",
+      "-mod=readonly",
+      "-tags",
+      "memdiag",
+      "./lib/record",
+      "-run",
+      "^$",
+      "-bench",
+      "BenchmarkLargeStringLayout",
+      "-benchtime=3x",
+      "-count=3"
+    ],
+    "returncode": 0
+  },
+  {
+    "name": "baseline_geometry",
+    "variant": "",
+    "command": [
+      "go",
+      "test",
+      "-mod=readonly",
+      "-tags",
+      "memdiag",
+      "./lib/record",
+      "-run",
+      "^TestMemoryGrowthGeometry$",
+      "-v",
+      "-count=1"
+    ],
+    "returncode": 0
+  },
+  {
+    "name": "append_benchmark",
+    "variant": "append",
+    "command": [
+      "go",
+      "test",
+      "-mod=readonly",
+      "-tags",
+      "memdiag",
+      "./lib/record",
+      "-run",
+      "^$",
+      "-bench",
+      "BenchmarkLargeStringLayout",
+      "-benchtime=3x",
+      "-count=3"
+    ],
+    "returncode": 0
+  },
+  {
+    "name": "append_geometry",
+    "variant": "append",
+    "command": [
+      "go",
+      "test",
+      "-mod=readonly",
+      "-tags",
+      "memdiag",
+      "./lib/record",
+      "-run",
+      "^TestMemoryGrowthGeometry$",
+      "-v",
+      "-count=1"
+    ],
+    "returncode": 0
+  },
+  {
+    "name": "doubling_benchmark",
+    "variant": "doubling",
+    "command": [
+      "go",
+      "test",
+      "-mod=readonly",
+      "-tags",
+      "memdiag",
+      "./lib/record",
+      "-run",
+      "^$",
+      "-bench",
+      "BenchmarkLargeStringLayout",
+      "-benchtime=3x",
+      "-count=3"
+    ],
+    "returncode": 0
+  },
+  {
+    "name": "doubling_geometry",
+    "variant": "doubling",
+    "command": [
+      "go",
+      "test",
+      "-mod=readonly",
+      "-tags",
+      "memdiag",
+      "./lib/record",
+      "-run",
+      "^TestMemoryGrowthGeometry$",
+      "-v",
+      "-count=1"
+    ],
+    "returncode": 0
+  }
+]

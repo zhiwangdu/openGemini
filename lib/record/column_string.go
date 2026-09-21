@@ -14,7 +14,10 @@
 
 package record
 
-import "github.com/openGemini/openGemini/lib/util"
+import (
+	"github.com/openGemini/openGemini/lib/memexperiment"
+	"github.com/openGemini/openGemini/lib/util"
+)
 
 func (cv *ColVal) AppendStrings(values ...string) {
 	for _, v := range values {
@@ -24,8 +27,25 @@ func (cv *ColVal) AppendStrings(values ...string) {
 
 func (cv *ColVal) AppendString(v string) {
 	index := len(cv.Val)
-	cv.reserveVal(len(v))
-	copy(cv.Val[index:], v)
+	if memexperiment.DirectAppend {
+		needed := index + len(v)
+		if memexperiment.DoubleGrowth && needed > cap(cv.Val) && cap(cv.Val) >= 1024*1024 {
+			val := make([]byte, index, max(needed, cap(cv.Val)*2))
+			copy(val, cv.Val)
+			cv.Val = val
+		}
+		// This oracle-sized reservation is only a causal lower-bound experiment.
+		// It is intentionally not advertised as a general-purpose optimization.
+		if memexperiment.Preallocate > cap(cv.Val) && index < 1024 && len(v) >= 1024 {
+			val := make([]byte, index, max(needed, memexperiment.Preallocate))
+			copy(val, cv.Val)
+			cv.Val = val
+		}
+		cv.Val = append(cv.Val, v...)
+	} else {
+		cv.reserveVal(len(v))
+		copy(cv.Val[index:], v)
+	}
 	cv.reserveOffset(1)
 	cv.Offset[cv.Len] = uint32(index)
 	cv.setBitMap(cv.Len)
